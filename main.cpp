@@ -32,7 +32,7 @@ std::uint64_t RandomWalk(const std::vector<std::uint32_t> &ring) {
 
 void HotLoop(std::vector<std::uint64_t> &values) {
   for (std::size_t iter = 0; iter < 200'000; ++iter) {
-    PerfScope guard("hot_loop", CYCLES | L1_MISS, 1024);
+    PERF_SCOPE_SAMPLED("hot_loop", CYCLES | L1_MISS, 1024);
     values[iter % values.size()] += iter;
   }
 }

@@ -138,6 +138,10 @@ struct Threshold {
   u64 max_value = 0;
 };
 
+struct SampleSite {
+  u64 counter = 0;
+};
+
 inline constexpr Counter CYCLES = Counter::Named("FIXED_CYCLES", true);
 inline constexpr Counter INSTRUCTIONS = Counter::Named("FIXED_INSTRUCTIONS", true);
 inline constexpr Counter BRANCHES = Counter::Named("INST_BRANCH");
@@ -512,6 +516,14 @@ class Backend {
     u64 &counter = state.sample_counters[site_hash];
     ++counter;
     return (counter % sample_every) == 0;
+  }
+
+  static bool ShouldSample(u32 sample_every, SampleSite &site) {
+    if (sample_every <= 1) {
+      return true;
+    }
+    ++site.counter;
+    return (site.counter % sample_every) == 0;
   }
 
   bool PrimeThread(CounterSet requested, std::string &error) {
@@ -1151,6 +1163,25 @@ class PerfScope {
     active_ = frame_.active || frame_.dropped;
   }
 
+  PerfScope(const char *label, CounterSet counters, u32 sample_every, SampleSite &site,
+            std::initializer_list<Threshold> thresholds = {})
+      : label_(label),
+        counters_(counters),
+        sample_every_(sample_every == 0 ? 1 : sample_every) {
+    if (label_ == nullptr || label_[0] == '\0') {
+      return;
+    }
+    if (!detail::Backend::ShouldSample(sample_every_, site)) {
+      return;
+    }
+    frame_.label = label_;
+    frame_.requested = counters_;
+    frame_.sample_every = sample_every_;
+    frame_.thresholds.assign(thresholds.begin(), thresholds.end());
+    detail::Backend::Instance().Enter(frame_);
+    active_ = frame_.active || frame_.dropped;
+  }
+
   ~PerfScope() {
     if (!active_) {
       return;
@@ -1248,6 +1279,7 @@ using PerfPointDelta = perf::PerfPointDelta;
 using PerfCounter = perf::Counter;
 using PerfCounterSet = perf::CounterSet;
 using PerfThreshold = perf::Threshold;
+using PerfSampleSite = perf::SampleSite;
 
 inline constexpr auto CYCLES = perf::CYCLES;
 inline constexpr auto INSTRUCTIONS = perf::INSTRUCTIONS;
@@ -1290,6 +1322,10 @@ struct Threshold {
   std::uint64_t max_value = 0;
 };
 
+struct SampleSite {
+  std::uint64_t counter = 0;
+};
+
 constexpr CounterSet operator|(CounterSet lhs, CounterSet) { return lhs; }
 constexpr CounterSet operator|(CounterSet lhs, Counter) { return lhs; }
 constexpr CounterSet operator|(Counter, CounterSet rhs) { return rhs; }
@@ -1318,6 +1354,8 @@ class PerfScope {
   explicit PerfScope(const char *, CounterSet = CounterSet{}, std::uint32_t = 1,
                      std::initializer_list<Threshold> = {},
                      std::source_location = std::source_location::current()) {}
+  PerfScope(const char *, CounterSet, std::uint32_t, SampleSite &,
+            std::initializer_list<Threshold> = {}) {}
 };
 
 struct PerfPointDelta {
@@ -1345,6 +1383,7 @@ using PerfPointDelta = perf::PerfPointDelta;
 using PerfCounter = perf::Counter;
 using PerfCounterSet = perf::CounterSet;
 using PerfThreshold = perf::Threshold;
+using PerfSampleSite = perf::SampleSite;
 
 inline constexpr auto CYCLES = perf::CYCLES;
 inline constexpr auto INSTRUCTIONS = perf::INSTRUCTIONS;
@@ -1365,5 +1404,14 @@ inline bool PerfPrimeThread(PerfCounterSet counters, std::string *error = nullpt
 }
 
 #endif
+
+#define PERF_DETAIL_CONCAT_INNER_(a, b) a##b
+#define PERF_DETAIL_CONCAT_(a, b) PERF_DETAIL_CONCAT_INNER_(a, b)
+#define PERF_SCOPE(label, counters) \
+  ::PerfScope PERF_DETAIL_CONCAT_(_perf_scope_, __LINE__)((label), (counters))
+#define PERF_SCOPE_SAMPLED(label, counters, sample_every)                                  \
+  static thread_local ::PerfSampleSite PERF_DETAIL_CONCAT_(_perf_site_, __LINE__);         \
+  ::PerfScope PERF_DETAIL_CONCAT_(_perf_scope_, __LINE__)(                                 \
+      (label), (counters), (sample_every), PERF_DETAIL_CONCAT_(_perf_site_, __LINE__))
 
 #endif  // PERF_H_

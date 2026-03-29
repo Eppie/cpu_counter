@@ -62,6 +62,14 @@ Sampling:
 PerfScope guard("hot_path", CYCLES | L1_MISS, 1024);
 ```
 
+Fast sampled hot-loop path:
+
+```cpp
+PERF_SCOPE_SAMPLED("hot_path", CYCLES | L1_MISS, 1024);
+```
+
+`PERF_SCOPE_SAMPLED(...)` uses a `static thread_local` site counter, so it avoids the per-site TLS hash-map lookup used by the plain constructor form. For very hot loops, use the macro.
+
 Thresholds:
 
 ```cpp
