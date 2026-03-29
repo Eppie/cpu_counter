@@ -205,6 +205,7 @@ struct Api {
   int (*kpc_get_config)(u32 classes, kpc_config_t *config) = nullptr;
   int (*kpc_set_config)(u32 classes, kpc_config_t *config) = nullptr;
   u32 (*kpc_get_counter_count)(u32 classes) = nullptr;
+  int (*kpc_get_cpu_counters)(bool all_cpus, u32 classes, int *curcpu, u64 *buf) = nullptr;
   int (*kpc_get_thread_counters)(u32 tid, u32 buf_count, u64 *buf) = nullptr;
   int (*kpc_force_all_ctrs_set)(int val) = nullptr;
   int (*kpc_force_all_ctrs_get)(int *val_out) = nullptr;
@@ -286,6 +287,7 @@ struct Api {
            load_kperf("kpc_get_config", kpc_get_config) &&
            load_kperf("kpc_set_config", kpc_set_config) &&
            load_kperf("kpc_get_counter_count", kpc_get_counter_count) &&
+           load_kperf("kpc_get_cpu_counters", kpc_get_cpu_counters) &&
            load_kperf("kpc_get_thread_counters", kpc_get_thread_counters) &&
            load_kperf("kpc_force_all_ctrs_set", kpc_force_all_ctrs_set) &&
            load_kperf("kpc_force_all_ctrs_get", kpc_force_all_ctrs_get) &&
@@ -336,6 +338,14 @@ struct CleanupState {
     }
   }
   return accumulator;
+}
+
+void PrintCounterArray(const std::string &label, const std::array<u64, KPC_MAX_COUNTERS> &values,
+                       usize count) {
+  std::cout << label << '\n';
+  for (usize i = 0; i < count; ++i) {
+    std::cout << "  [" << i << "] " << values[i] << '\n';
+  }
 }
 
 int main() {
@@ -432,6 +442,8 @@ int main() {
   std::array<usize, KPC_MAX_COUNTERS> counter_map{};
   std::array<u64, KPC_MAX_COUNTERS> before{};
   std::array<u64, KPC_MAX_COUNTERS> after{};
+  std::array<u64, KPC_MAX_COUNTERS> cpu_before{};
+  std::array<u64, KPC_MAX_COUNTERS> cpu_after{};
 
   ret = api.kpep_config_kpc_classes(config, &classes);
   if (ret != 0) {
@@ -472,10 +484,19 @@ int main() {
 
   std::cout << "requested class mask: " << HexString(classes) << '\n';
   std::cout << "register count: " << reg_count << '\n';
-  std::cout << "thread counter buffer size: "
-            << api.kpc_get_counter_count(classes | KPC_CLASS_FIXED_MASK |
-                                         KPC_CLASS_CONFIGURABLE_MASK)
-            << '\n';
+  const u32 fixed_count = api.kpc_get_counter_count(KPC_CLASS_FIXED_MASK);
+  const u32 configurable_count = api.kpc_get_counter_count(KPC_CLASS_CONFIGURABLE_MASK);
+  const u32 active_count = api.kpc_get_counter_count(classes);
+  std::cout << "fixed counter count: " << fixed_count << '\n';
+  std::cout << "configurable counter count: " << configurable_count << '\n';
+  std::cout << "active counter count: " << active_count << '\n';
+  std::cout << "event map:\n";
+  for (usize i = 0; i < events.size(); ++i) {
+    const char *name = nullptr;
+    api.kpep_event_name(events[i], &name);
+    std::cout << "  event[" << i << "] " << (name != nullptr ? name : "(null)")
+              << " -> slot " << counter_map[i] << '\n';
+  }
 
   CleanupState cleanup{api};
 
@@ -528,6 +549,15 @@ int main() {
     return 1;
   }
 
+  int curcpu = -1;
+  ret = api.kpc_get_cpu_counters(false, classes, &curcpu, cpu_before.data());
+  if (ret < 0) {
+    std::cerr << "kpc_get_cpu_counters(before) failed: " << ret << '\n';
+    api.kpep_config_free(config);
+    api.kpep_db_free(db);
+    return 1;
+  }
+
   const u64 accumulator = RunWorkload();
 
   ret = api.kpc_get_thread_counters(0, static_cast<u32>(after.size()), after.data());
@@ -538,7 +568,20 @@ int main() {
     return 1;
   }
 
+  ret = api.kpc_get_cpu_counters(false, classes, &curcpu, cpu_after.data());
+  if (ret < 0) {
+    std::cerr << "kpc_get_cpu_counters(after) failed: " << ret << '\n';
+    api.kpep_config_free(config);
+    api.kpep_db_free(db);
+    return 1;
+  }
+
   std::cout << "loop complete, accumulator=" << accumulator << '\n';
+  std::cout << "current cpu: " << curcpu << '\n';
+  PrintCounterArray("thread counters before", before, active_count);
+  PrintCounterArray("thread counters after", after, active_count);
+  PrintCounterArray("cpu counters before", cpu_before, active_count);
+  PrintCounterArray("cpu counters after", cpu_after, active_count);
   std::cout << "counter deltas:\n";
 
   std::optional<u64> cycles;
@@ -546,7 +589,8 @@ int main() {
 
   for (usize i = 0; i < events.size(); ++i) {
     const usize slot = counter_map[i];
-    const u64 delta = after[slot] - before[slot];
+    const u64 thread_delta = after[slot] - before[slot];
+    const u64 cpu_delta = cpu_after[slot] - cpu_before[slot];
 
     const char *name = nullptr;
     const char *alias = nullptr;
@@ -557,13 +601,13 @@ int main() {
     if (alias != nullptr && std::strlen(alias) != 0) {
       std::cout << " alias=" << alias;
     }
-    std::cout << " delta=" << delta << '\n';
+    std::cout << " thread_delta=" << thread_delta << " cpu_delta=" << cpu_delta << '\n';
 
     if (name != nullptr && std::strcmp(name, "FIXED_CYCLES") == 0) {
-      cycles = delta;
+      cycles = thread_delta;
     }
     if (name != nullptr && std::strcmp(name, "FIXED_INSTRUCTIONS") == 0) {
-      instructions = delta;
+      instructions = thread_delta;
     }
   }
 
