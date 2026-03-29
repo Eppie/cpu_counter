@@ -1,96 +1,141 @@
-# CPU Counter Probe
+# perf.h
 
-This project is a rough proof of concept for accessing Apple Silicon PMU counters from C++ on macOS and then using them to characterize specific code patterns.
+`perf.h` is a single-header Apple Silicon PMU profiling helper aimed at instrumenting real C++ code with minimal ceremony:
 
-Current host:
+```cpp
+#include "perf.h"
 
-- Chip: `Apple M4 Max`
-- `hw.cpufamily`: `0x17d5b93a`
-- `hw.cachelinesize`: `128`
-- `kpc_cpu_string()`: `cpu_100000c_2_17d5b93a`
-- Local PMU database: `/usr/share/kpep/cpu_100000c_2_17d5b93a.plist -> as4-1.plist`
+void MixerUpdate() {
+  PerfScope guard("mixer_update", CYCLES | INSTRUCTIONS | L1_MISS | DTLB_MISS);
+  // production work here
+}
+```
 
-The code uses:
+It is header-only in the normal build sense: no extra `.cpp`, no extra link flags, no explicit init/teardown call. The first sampled use lazily initializes the private `kperf` / `kperfdata` backend, and process shutdown writes JSONL output.
 
-- `kperf.framework` for the private `kpc_*` control/read APIs
-- `kperfdata.framework` for the private `kpep_*` event database/config helpers
+## Caveat First
 
-Build:
+- This uses private Apple APIs.
+- Counter programming on this machine still requires `root` or a blessed pid.
+- Without privilege, the process still runs, but the JSONL output records dropped scopes with a clear error instead of crashing.
+
+## Build
 
 ```sh
 make
 ```
 
-Run:
+The example binary is `cpu_counter`.
+
+## Run
 
 ```sh
 sudo ./cpu_counter
 ```
 
-Optional focused sampling controls:
+By default the library writes `perf.jsonl` in the current directory. Override with:
 
 ```sh
-sudo ./cpu_counter --prefer-cpu 14 --max-attempts 25 --require-stable-cpu
-sudo ./cpu_counter --scan-cpus --max-attempts 25
-sudo ./cpu_counter --prefer-pcore --require-stable-cpu --require-active-pmu --max-attempts 40
+PERF_OUTPUT=/tmp/my_profile.jsonl sudo ./cpu_counter
+PERF_OUTPUT=- sudo ./cpu_counter
 ```
 
-Useful flags:
+## API
 
-- `--prefer-cpu N`: keep retrying each workload until it runs entirely on CPU `N`
-- `--prefer-pcore`: best-effort performance-core mode
-  - requests `QOS_CLASS_USER_INTERACTIVE` on the measuring thread
-  - accepts only samples whose `cpu_before` and `cpu_after` fall in the heuristic performance-core range inferred from `hw.perflevel*`
-- `--prefer-ecore`: best-effort efficiency-core mode using a lower-QoS bias
-- `--max-attempts N`: cap retries per workload
-- `--require-stable-cpu`: reject samples that migrate during the measurement window
-- `--require-active-pmu`: reject samples whose configurable counters are all zero
-- `--allow-migration`: accept migrated samples again
-- `--scan-cpus`: run a compact per-CPU sweep with representative workloads to see which logical CPUs produce live counts
+Basic scope:
 
-The current binary is a cache/TLB/I-side expansion suite. It reprograms the configurable PMCs at runtime and currently focuses on the remaining memory-side nonspec counters plus instruction-side cache/TLB counters.
+```cpp
+PerfScope guard("mixer_update", CYCLES | INSTRUCTIONS | L1_MISS);
+```
 
-- scalar streaming reads
-- random pointer chasing
-- scalar streaming writes
-- random page writes
-- hot-code loop for low instruction-side pressure
-- sequential executable-page sweep
-- randomized executable-page sweep
+Sampling:
 
-The suite is intentionally split into multiple passes because Apple only exposes a small number of configurable PMCs at once, and some event combinations interact badly. The current focused groups are:
+```cpp
+PerfScope guard("hot_path", CYCLES | L1_MISS, 1024);
+```
 
-- extra L1D cache counters:
-  - `L1D_CACHE_MISS_LD`
-  - `L1D_CACHE_MISS_LD_NONSPEC`
-  - `L1D_CACHE_MISS_ST`
-  - `L1D_CACHE_MISS_ST_NONSPEC`
-- extra DTLB counters:
-  - `L1D_TLB_ACCESS`
-  - `L1D_TLB_FILL`
-  - `L1D_TLB_MISS`
-  - `L1D_TLB_MISS_NONSPEC`
-  - `MMU_TABLE_WALK_DATA`
-- instruction-side counters:
-  - `L1I_CACHE_MISS_DEMAND`
-  - `L1I_TLB_FILL`
-  - `L1I_TLB_MISS_DEMAND`
-  - `L2_TLB_MISS_INSTRUCTION`
-  - `MMU_TABLE_WALK_INSTRUCTION`
+Thresholds:
+
+```cpp
+PerfScope guard("cache_sensitive",
+                CYCLES | L2_TLB_MISS,
+                1,
+                {MaxThreshold(L2_TLB_MISS, 1000)});
+```
+
+Manual snapshots:
+
+```cpp
+PerfPoint a(CYCLES | L1_MISS);
+// weird control flow
+PerfPoint b(CYCLES | L1_MISS);
+PerfPointDelta d = b - a;
+```
+
+Compile out everything:
+
+```cpp
+#define PERF_DISABLE
+#include "perf.h"
+```
+
+## Built-in Counters
+
+Currently exposed built-ins:
+
+- `CYCLES`
+- `INSTRUCTIONS`
+- `BRANCHES`
+- `BRANCH_MISS`
+- `L1_LOAD_MISS`
+- `L1_STORE_MISS`
+- `L1_MISS`
+- `DTLB_MISS`
+- `ITLB_MISS`
+- `TLB_MISS`
+- `L2_TLB_MISS`
+- `L2_MISS`
 
 Notes:
 
-- Counter programming still requires privileged access on this machine.
-- This relies on private Apple interfaces, not public SDK APIs.
-- The code stays intentionally direct and single-file so it is easy to keep iterating during reverse engineering.
-- There is no clean public macOS API here for exact logical-CPU pinning. The new `--prefer-pcore` and `--prefer-ecore` modes are best-effort:
-  - they bias scheduling through thread QoS
-  - they filter accepted samples by the heuristic logical-CPU ranges derived from `hw.perflevel*`
-- Instruction-side workloads use generated executable stubs in an RX mapping. A standalone local smoke test confirmed that the `mmap` + `mprotect(PROT_EXEC)` + `sys_icache_invalidate()` path works on this host.
-- If a requested event group cannot be programmed together on this machine, the tool prints that group as skipped and continues with the rest of the suite.
-- `LDST_X64_UOP` is a 64-byte split-access counter. On this M4 Max, `hw.cachelinesize` is `128`, so the X64 workloads are about 64-byte boundaries, not full L1 cache lines.
-- Each benchmark sample now records the current CPU before and after the workload so scheduler migration can be correlated with suspicious all-zero measurements.
-- Several debug-only workload variants use `optnone` so the optimizer can be ruled out without dropping the whole binary to `-O0`.
-- The current startup log prints the inferred perflevel layout, for example:
-  - `hw.perflevel0.name: Performance logicalcpu=12 heuristic_cpu_range=0-11`
-  - `hw.perflevel1.name: Efficiency logicalcpu=4 heuristic_cpu_range=12-15`
+- `L1_MISS` currently aliases `L1_LOAD_MISS`.
+- `L2_MISS` currently aliases `L2_TLB_MISS_DATA`, not a generic L2 cache miss. That is a convenience alias, not a fully validated semantic name.
+
+Raw configurable events are also supported:
+
+```cpp
+PerfScope guard("raw_probe", CYCLES | RawEvent(0x1234, "my_raw_event"));
+```
+
+## Output
+
+The library writes one JSON object per aggregate.
+
+Each object contains:
+
+- `label`
+- `sample_every`
+- `sampled_count`
+- `dropped_count`
+- `wall_ns`: `total`, `min`, `max`, `mean`
+- `counters`: per-counter `total`, `min`, `max`, `mean`
+- `threshold_violations`
+- `last_error` when scopes were dropped
+
+## Nesting and Thread Safety
+
+- Active scopes are thread-local.
+- Aggregation is process-global and mutex-protected.
+- Nested scopes are supported by reprogramming to the union of counters requested by the active stack on that thread.
+
+Important caveat:
+
+- Nested scopes only work while the union fits what the PMU can program simultaneously.
+- If a scope or nested union requests too many counters, or requests a conflicting combination, that scope is dropped and the JSONL output records the failure.
+- This implementation reports that as a runtime error, not a compile-time error.
+
+## Files
+
+- [perf.h](/Users/eppie/codex_projects/cpu_counter/perf.h): single-header library
+- [main.cpp](/Users/eppie/codex_projects/cpu_counter/main.cpp): tiny usage example
+- [Makefile](/Users/eppie/codex_projects/cpu_counter/Makefile): builds the example
