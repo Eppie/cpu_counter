@@ -1,11 +1,13 @@
 #include <arm_neon.h>
 #include <dlfcn.h>
+#include <pthread/qos.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -73,6 +75,49 @@ constexpr std::array<const char *, 2> kFixedEvents = {
 };
 
 volatile u64 g_sink = 0;
+
+struct LogicalCpuRange {
+  int first = 0;
+  int last = -1;
+  std::string label;
+
+  [[nodiscard]] bool Contains(int cpu) const { return cpu >= first && cpu <= last; }
+
+  [[nodiscard]] std::string Description() const {
+    std::ostringstream oss;
+    oss << label << '[' << first << '-' << last << ']';
+    return oss.str();
+  }
+};
+
+struct PerfLevelLayout {
+  struct Entry {
+    int index = 0;
+    std::string name;
+    int logical_cpus = 0;
+    LogicalCpuRange heuristic_range;
+  };
+
+  std::vector<Entry> entries;
+  std::optional<LogicalCpuRange> performance_range;
+  std::optional<LogicalCpuRange> efficiency_range;
+};
+
+enum class CorePreference {
+  kAny,
+  kPerformance,
+  kEfficiency,
+};
+
+struct RunOptions {
+  std::optional<int> prefer_cpu;
+  CorePreference prefer_core_type = CorePreference::kAny;
+  std::optional<LogicalCpuRange> prefer_cpu_range;
+  usize max_attempts = 1;
+  bool require_stable_cpu = false;
+  bool require_active_pmu = false;
+  bool scan_cpus = false;
+};
 
 const char *PmuVersionString(u32 version) {
   switch (version) {
@@ -175,6 +220,135 @@ std::optional<T> ReadSysctlIntegral(const char *name) {
     return std::nullopt;
   }
   return value;
+}
+
+std::string LowerAscii(std::string value) {
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return value;
+}
+
+PerfLevelLayout ReadPerfLevelLayout() {
+  PerfLevelLayout layout;
+  const auto perf_levels = ReadSysctlIntegral<u32>("hw.nperflevels").value_or(0);
+  int next_cpu = 0;
+  for (u32 index = 0; index < perf_levels; ++index) {
+    const std::string prefix = "hw.perflevel" + std::to_string(index);
+    const std::string name = ReadSysctlString((prefix + ".name").c_str());
+    const int logical_cpus =
+        static_cast<int>(ReadSysctlIntegral<u32>((prefix + ".logicalcpu").c_str()).value_or(0));
+    if (logical_cpus <= 0) {
+      continue;
+    }
+
+    PerfLevelLayout::Entry entry;
+    entry.index = static_cast<int>(index);
+    entry.name = name.empty() ? ("perflevel" + std::to_string(index)) : name;
+    entry.logical_cpus = logical_cpus;
+    entry.heuristic_range = {
+        next_cpu,
+        next_cpu + logical_cpus - 1,
+        entry.name,
+    };
+    layout.entries.push_back(entry);
+
+    const std::string lowered_name = LowerAscii(entry.name);
+    if (lowered_name == "performance") {
+      layout.performance_range = entry.heuristic_range;
+    } else if (lowered_name == "efficiency") {
+      layout.efficiency_range = entry.heuristic_range;
+    }
+    next_cpu += logical_cpus;
+  }
+  return layout;
+}
+
+const char *CorePreferenceName(CorePreference preference) {
+  switch (preference) {
+    case CorePreference::kPerformance:
+      return "performance";
+    case CorePreference::kEfficiency:
+      return "efficiency";
+    case CorePreference::kAny:
+    default:
+      return "any";
+  }
+}
+
+const char *QosClassName(qos_class_t qos) {
+  switch (qos) {
+    case QOS_CLASS_USER_INTERACTIVE:
+      return "USER_INTERACTIVE";
+    case QOS_CLASS_USER_INITIATED:
+      return "USER_INITIATED";
+    case QOS_CLASS_DEFAULT:
+      return "DEFAULT";
+    case QOS_CLASS_UTILITY:
+      return "UTILITY";
+    case QOS_CLASS_BACKGROUND:
+      return "BACKGROUND";
+    case QOS_CLASS_UNSPECIFIED:
+    default:
+      return "UNSPECIFIED";
+  }
+}
+
+bool ResolveCorePreference(RunOptions &options, const PerfLevelLayout &layout,
+                           std::string &error) {
+  if (options.prefer_cpu.has_value() && options.prefer_core_type != CorePreference::kAny) {
+    error = "cannot combine --prefer-cpu with --prefer-pcore or --prefer-ecore";
+    return false;
+  }
+
+  switch (options.prefer_core_type) {
+    case CorePreference::kPerformance:
+      if (!layout.performance_range.has_value()) {
+        error = "failed to resolve a performance-core range from hw.perflevel*";
+        return false;
+      }
+      options.prefer_cpu_range = layout.performance_range;
+      break;
+    case CorePreference::kEfficiency:
+      if (!layout.efficiency_range.has_value()) {
+        error = "failed to resolve an efficiency-core range from hw.perflevel*";
+        return false;
+      }
+      options.prefer_cpu_range = layout.efficiency_range;
+      break;
+    case CorePreference::kAny:
+      options.prefer_cpu_range.reset();
+      break;
+  }
+
+  if ((options.prefer_cpu.has_value() || options.prefer_cpu_range.has_value() ||
+       options.require_active_pmu) &&
+      options.max_attempts == 1) {
+    options.max_attempts = 25;
+  }
+  return true;
+}
+
+bool ApplySchedulerPreference(const RunOptions &options, std::string &error) {
+  qos_class_t qos = QOS_CLASS_UNSPECIFIED;
+  switch (options.prefer_core_type) {
+    case CorePreference::kPerformance:
+      qos = QOS_CLASS_USER_INTERACTIVE;
+      break;
+    case CorePreference::kEfficiency:
+      qos = QOS_CLASS_UTILITY;
+      break;
+    case CorePreference::kAny:
+      return true;
+  }
+
+  const int ret = pthread_set_qos_class_self_np(qos, 0);
+  if (ret != 0) {
+    error = std::string("pthread_set_qos_class_self_np(") + QosClassName(qos) +
+            ") failed: " + std::to_string(ret) + " (" + std::strerror(ret) + ")";
+    return false;
+  }
+  return true;
 }
 
 void *OpenLibrary(const std::vector<const char *> &paths, std::string &chosen_path,
@@ -783,13 +957,6 @@ struct SampleResult {
   int cpu_after = -1;
 };
 
-struct RunOptions {
-  std::optional<int> prefer_cpu;
-  usize max_attempts = 1;
-  bool require_stable_cpu = false;
-  bool scan_cpus = false;
-};
-
 class Profiler {
  public:
   ~Profiler() {
@@ -1182,10 +1349,24 @@ void PrintSkippedWorkload(const WorkloadDefinition &workload, usize attempts,
   if (options.prefer_cpu.has_value()) {
     std::cout << " prefer_cpu=" << *options.prefer_cpu;
   }
+  if (options.prefer_cpu_range.has_value()) {
+    std::cout << " prefer_core_range=" << options.prefer_cpu_range->Description();
+  }
   if (options.require_stable_cpu) {
     std::cout << " require_stable_cpu=yes";
   }
+  if (options.require_active_pmu) {
+    std::cout << " require_active_pmu=yes";
+  }
   std::cout << '\n';
+}
+
+bool HasActiveConfigurableCounters(const SampleResult &result) {
+  if (result.deltas.size() <= kFixedEvents.size()) {
+    return false;
+  }
+  return std::any_of(result.deltas.begin() + static_cast<std::ptrdiff_t>(kFixedEvents.size()),
+                     result.deltas.end(), [](u64 value) { return value != 0; });
 }
 
 bool SampleMatches(const SampleResult &result, const RunOptions &options) {
@@ -1196,6 +1377,15 @@ bool SampleMatches(const SampleResult &result, const RunOptions &options) {
     if (result.cpu_before != *options.prefer_cpu || result.cpu_after != *options.prefer_cpu) {
       return false;
     }
+  }
+  if (options.prefer_cpu_range.has_value()) {
+    if (!options.prefer_cpu_range->Contains(result.cpu_before) ||
+        !options.prefer_cpu_range->Contains(result.cpu_after)) {
+      return false;
+    }
+  }
+  if (options.require_active_pmu && !HasActiveConfigurableCounters(result)) {
+    return false;
   }
   return true;
 }
@@ -1217,6 +1407,14 @@ bool ParsePositiveInt(const char *text, int &value) {
 bool ParseRunOptions(int argc, char **argv, RunOptions &options, std::string &error) {
   for (int i = 1; i < argc; ++i) {
     const std::string_view arg = argv[i];
+    if (arg == "--prefer-pcore") {
+      options.prefer_core_type = CorePreference::kPerformance;
+      continue;
+    }
+    if (arg == "--prefer-ecore") {
+      options.prefer_core_type = CorePreference::kEfficiency;
+      continue;
+    }
     if (arg == "--prefer-cpu") {
       if (i + 1 >= argc) {
         error = "--prefer-cpu requires a CPU number";
@@ -1247,6 +1445,10 @@ bool ParseRunOptions(int argc, char **argv, RunOptions &options, std::string &er
       options.require_stable_cpu = true;
       continue;
     }
+    if (arg == "--require-active-pmu") {
+      options.require_active_pmu = true;
+      continue;
+    }
     if (arg == "--allow-migration") {
       options.require_stable_cpu = false;
       continue;
@@ -1258,7 +1460,9 @@ bool ParseRunOptions(int argc, char **argv, RunOptions &options, std::string &er
     error = "unknown argument: " + std::string(arg);
     return false;
   }
-  if (options.prefer_cpu.has_value() && options.max_attempts == 1) {
+  if ((options.prefer_cpu.has_value() || options.prefer_core_type != CorePreference::kAny ||
+       options.require_active_pmu) &&
+      options.max_attempts == 1) {
     options.max_attempts = 25;
   }
   return true;
@@ -1311,6 +1515,24 @@ int main(int argc, char **argv) {
   if (const auto page_size = ReadSysctlIntegral<u32>("hw.pagesize")) {
     std::cout << "hw.pagesize: " << *page_size << '\n';
   }
+
+  const PerfLevelLayout perf_layout = ReadPerfLevelLayout();
+  for (const auto &entry : perf_layout.entries) {
+    std::cout << "hw.perflevel" << entry.index << ".name: " << entry.name
+              << " logicalcpu=" << entry.logical_cpus
+              << " heuristic_cpu_range=" << entry.heuristic_range.first << '-'
+              << entry.heuristic_range.last << '\n';
+  }
+
+  if (!ResolveCorePreference(run_options, perf_layout, error)) {
+    std::cerr << error << '\n';
+    return 1;
+  }
+  if (!ApplySchedulerPreference(run_options, error)) {
+    std::cerr << error << '\n';
+    return 1;
+  }
+  std::cout << "thread requested qos: " << QosClassName(qos_class_self()) << '\n';
 
   Profiler profiler;
   if (!profiler.Initialize(error)) {
@@ -1637,6 +1859,7 @@ int main(int argc, char **argv) {
 
     RunOptions scan_options = run_options;
     scan_options.require_stable_cpu = true;
+    scan_options.require_active_pmu = false;
     if (scan_options.max_attempts == 1) {
       scan_options.max_attempts = 25;
     }
@@ -1645,6 +1868,10 @@ int main(int argc, char **argv) {
     std::cout << "logical_cpu_max=" << logical_cpu_max
               << " max_attempts=" << scan_options.max_attempts
               << " require_stable_cpu=yes\n";
+    if (scan_options.prefer_cpu_range.has_value()) {
+      std::cout << "scan constrained to heuristic core range "
+                << scan_options.prefer_cpu_range->Description() << '\n';
+    }
 
     for (const ScanTarget &target : scan_targets) {
       CounterProgram program;
@@ -1655,7 +1882,14 @@ int main(int argc, char **argv) {
 
       std::cout << "\n== CPU Scan: " << target.label << " ==\n";
       std::cout << target.workload->description << '\n';
-      for (u32 cpu = 0; cpu < logical_cpu_max; ++cpu) {
+      u32 scan_first_cpu = 0;
+      u32 scan_last_cpu = logical_cpu_max - 1;
+      if (scan_options.prefer_cpu_range.has_value()) {
+        scan_first_cpu = std::max(0, scan_options.prefer_cpu_range->first);
+        scan_last_cpu =
+            std::min(static_cast<int>(logical_cpu_max) - 1, scan_options.prefer_cpu_range->last);
+      }
+      for (u32 cpu = scan_first_cpu; cpu <= scan_last_cpu; ++cpu) {
         scan_options.prefer_cpu = static_cast<int>(cpu);
         SampleResult result;
         bool matched = false;
@@ -1701,10 +1935,18 @@ int main(int argc, char **argv) {
   std::cout << "\nStarting issue-focused memory counter suite. Known-good passes are temporarily disabled so the run stays short and concentrates on the remaining inconsistencies.\n";
   std::cout << "Several workloads now have alternate optnone implementations in the same file so compiler-shape effects can be separated from PMU-event interaction problems.\n";
   std::cout << "LDST_X64_UOP counts 64-byte split accesses; on this machine hw.cachelinesize is 128, so the X64 workloads are about 64-byte boundaries rather than full L1 cache lines.\n";
-  if (run_options.prefer_cpu.has_value()) {
-    std::cout << "Sampling control: prefer_cpu=" << *run_options.prefer_cpu
-              << " max_attempts=" << run_options.max_attempts
+  if (run_options.prefer_cpu.has_value() || run_options.prefer_cpu_range.has_value() ||
+      run_options.require_active_pmu) {
+    std::cout << "Sampling control:";
+    if (run_options.prefer_cpu.has_value()) {
+      std::cout << " prefer_cpu=" << *run_options.prefer_cpu;
+    }
+    if (run_options.prefer_cpu_range.has_value()) {
+      std::cout << " prefer_core_range=" << run_options.prefer_cpu_range->Description();
+    }
+    std::cout << " max_attempts=" << run_options.max_attempts
               << " require_stable_cpu=" << (run_options.require_stable_cpu ? "yes" : "no")
+              << " require_active_pmu=" << (run_options.require_active_pmu ? "yes" : "no")
               << '\n';
   }
 

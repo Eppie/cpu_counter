@@ -32,13 +32,19 @@ Optional focused sampling controls:
 ```sh
 sudo ./cpu_counter --prefer-cpu 14 --max-attempts 25 --require-stable-cpu
 sudo ./cpu_counter --scan-cpus --max-attempts 25
+sudo ./cpu_counter --prefer-pcore --require-stable-cpu --require-active-pmu --max-attempts 40
 ```
 
 Useful flags:
 
 - `--prefer-cpu N`: keep retrying each workload until it runs entirely on CPU `N`
+- `--prefer-pcore`: best-effort performance-core mode
+  - requests `QOS_CLASS_USER_INTERACTIVE` on the measuring thread
+  - accepts only samples whose `cpu_before` and `cpu_after` fall in the heuristic performance-core range inferred from `hw.perflevel*`
+- `--prefer-ecore`: best-effort efficiency-core mode using a lower-QoS bias
 - `--max-attempts N`: cap retries per workload
 - `--require-stable-cpu`: reject samples that migrate during the measurement window
+- `--require-active-pmu`: reject samples whose configurable counters are all zero
 - `--allow-migration`: accept migrated samples again
 - `--scan-cpus`: run a compact per-CPU sweep with representative workloads to see which logical CPUs produce live counts
 
@@ -87,7 +93,13 @@ Notes:
 - Counter programming still requires privileged access on this machine.
 - This relies on private Apple interfaces, not public SDK APIs.
 - The code stays intentionally direct and single-file so it is easy to keep iterating during reverse engineering.
+- There is no clean public macOS API here for exact logical-CPU pinning. The new `--prefer-pcore` and `--prefer-ecore` modes are best-effort:
+  - they bias scheduling through thread QoS
+  - they filter accepted samples by the heuristic logical-CPU ranges derived from `hw.perflevel*`
 - If a requested event group cannot be programmed together on this machine, the tool prints that group as skipped and continues with the rest of the suite.
 - `LDST_X64_UOP` is a 64-byte split-access counter. On this M4 Max, `hw.cachelinesize` is `128`, so the X64 workloads are about 64-byte boundaries, not full L1 cache lines.
 - Each benchmark sample now records the current CPU before and after the workload so scheduler migration can be correlated with suspicious all-zero measurements.
 - Several debug-only workload variants use `optnone` so the optimizer can be ruled out without dropping the whole binary to `-O0`.
+- The current startup log prints the inferred perflevel layout, for example:
+  - `hw.perflevel0.name: Performance logicalcpu=12 heuristic_cpu_range=0-11`
+  - `hw.perflevel1.name: Efficiency logicalcpu=4 heuristic_cpu_range=12-15`
