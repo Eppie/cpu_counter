@@ -9,7 +9,7 @@ namespace {
 
 std::uint64_t MixerUpdate(std::vector<std::uint64_t> &buffer,
                           const std::vector<std::uint64_t> &coeffs) {
-  PerfScope guard("mixer_update", CYCLES | INSTRUCTIONS | L1_MISS | DTLB_MISS);
+  PERF_SCOPE("mixer_update", CYCLES | INSTRUCTIONS | L1_MISS | DTLB_MISS);
 
   std::uint64_t acc = 0;
   for (std::size_t i = 0; i < buffer.size(); ++i) {
@@ -20,7 +20,7 @@ std::uint64_t MixerUpdate(std::vector<std::uint64_t> &buffer,
 }
 
 std::uint64_t RandomWalk(const std::vector<std::uint32_t> &ring) {
-  PerfScope guard("random_walk", CYCLES | L1_LOAD_MISS | TLB_MISS | BRANCH_MISS);
+  PERF_SCOPE("random_walk", CYCLES | L1_LOAD_MISS | TLB_MISS | BRANCH_MISS);
 
   volatile const std::uint32_t *data = ring.data();
   std::uint32_t index = 0;
@@ -62,7 +62,7 @@ int main() {
 
   std::uint64_t mix_acc = 0;
   {
-    PerfScope outer("frame", CYCLES | INSTRUCTIONS | L1_MISS);
+    PERF_SCOPE("frame", CYCLES | INSTRUCTIONS | L1_MISS);
     mix_acc ^= MixerUpdate(mix_buffer, coeffs);
     mix_acc ^= RandomWalk(ring);
     HotLoop(hot_values);

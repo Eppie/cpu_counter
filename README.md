@@ -6,7 +6,7 @@
 #include "perf.h"
 
 void MixerUpdate() {
-  PerfScope guard("mixer_update", CYCLES | INSTRUCTIONS | L1_MISS | DTLB_MISS);
+  PERF_SCOPE("mixer_update", CYCLES | INSTRUCTIONS | L1_MISS | DTLB_MISS);
   // production work here
 }
 ```
@@ -20,6 +20,14 @@ The library now uses a lower-overhead runtime model:
 - thread-local aggregates are merged only when dumping JSONL at shutdown
 
 The important tradeoff is that nested scopes are expected to use subsets of the installed thread set. If you know a thread will use several different nested regions, prime a superset once with `PerfPrimeThread(...)`.
+
+The lowest-overhead API is now macro-first:
+
+- `PERF_SCOPE(...)` for normal scopes
+- `PERF_SCOPE_SAMPLED(...)` for sampled hot loops
+
+Those macros keep a static thread-local site cache, so they avoid the old per-callsite sampling hash map and also cache aggregate / slot metadata.
+Use them when the label and counter set are fixed per callsite. If those vary at runtime, use the direct `PerfScope` constructor instead.
 
 ## Caveat First
 
@@ -53,13 +61,13 @@ PERF_OUTPUT=- sudo ./cpu_counter
 Basic scope:
 
 ```cpp
-PerfScope guard("mixer_update", CYCLES | INSTRUCTIONS | L1_MISS);
+PERF_SCOPE("mixer_update", CYCLES | INSTRUCTIONS | L1_MISS);
 ```
 
 Sampling:
 
 ```cpp
-PerfScope guard("hot_path", CYCLES | L1_MISS, 1024);
+PERF_SCOPE_SAMPLED("hot_path", CYCLES | L1_MISS, 1024);
 ```
 
 Fast sampled hot-loop path:
@@ -68,16 +76,25 @@ Fast sampled hot-loop path:
 PERF_SCOPE_SAMPLED("hot_path", CYCLES | L1_MISS, 1024);
 ```
 
-`PERF_SCOPE_SAMPLED(...)` uses a `static thread_local` site counter, so it avoids the per-site TLS hash-map lookup used by the plain constructor form. For very hot loops, use the macro.
+`PERF_SCOPE(...)` and `PERF_SCOPE_SAMPLED(...)` both use a `static thread_local` site cache. `PERF_SCOPE_SAMPLED(...)` also uses a per-site sampled counter, so it avoids the old TLS hash-map lookup entirely. For hot code, use the macros.
 
 Thresholds:
 
 ```cpp
 PerfScope guard("cache_sensitive",
                 CYCLES | L2_TLB_MISS,
-                1,
                 {MaxThreshold(L2_TLB_MISS, 1000)});
 ```
+
+Dynamic or non-macro scope:
+
+```cpp
+PerfScope guard("cache_sensitive",
+                CYCLES | L2_TLB_MISS,
+                {MaxThreshold(L2_TLB_MISS, 1000)});
+```
+
+This still works, but it is not the lowest-overhead path because it does not get a static site cache.
 
 Optional thread priming for low-overhead nested use:
 
@@ -162,6 +179,34 @@ Important caveat:
 - `PerfPrimeThread(...)` is the intended fix for that case: prime the superset once per thread, then use cheap nested subsets.
 - If a scope requests too many counters, or a conflicting combination, that scope is dropped and the JSONL output records the failure.
 - This implementation reports that as a runtime error, not a compile-time error.
+
+## Breaking Changes
+
+If you were using the previous sampled constructor form:
+
+```cpp
+PerfScope guard("hot_path", CYCLES | L1_MISS, 1024);
+```
+
+update it to:
+
+```cpp
+PERF_SCOPE_SAMPLED("hot_path", CYCLES | L1_MISS, 1024);
+```
+
+If you want the new low-overhead cached path for ordinary scopes, update:
+
+```cpp
+PerfScope guard("mixer_update", CYCLES | INSTRUCTIONS);
+```
+
+to:
+
+```cpp
+PERF_SCOPE("mixer_update", CYCLES | INSTRUCTIONS);
+```
+
+The direct `PerfScope` constructor still exists for dynamic cases, but the macros are now the preferred production API.
 
 ## Files
 

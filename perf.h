@@ -18,7 +18,6 @@
 #include <limits>
 #include <mutex>
 #include <optional>
-#include <source_location>
 #include <span>
 #include <sstream>
 #include <string>
@@ -139,7 +138,12 @@ struct Threshold {
 };
 
 struct SampleSite {
-  u64 counter = 0;
+  u64 sample_counter = 0;
+  void *aggregate = nullptr;
+  const void *program = nullptr;
+  std::array<int, PERF_MAX_SCOPE_EVENTS> counter_slots{};
+
+  SampleSite() { counter_slots.fill(-1); }
 };
 
 inline constexpr Counter CYCLES = Counter::Named("FIXED_CYCLES", true);
@@ -239,55 +243,6 @@ inline std::string CanonicalCounterSetKey(const CounterSet &set) {
   return oss.str();
 }
 
-inline std::string ThresholdKey(std::initializer_list<Threshold> thresholds) {
-  std::vector<std::string> parts;
-  parts.reserve(thresholds.size());
-  for (const Threshold &threshold : thresholds) {
-    std::ostringstream oss;
-    oss << CounterId(threshold.counter) << "<=" << threshold.max_value;
-    parts.push_back(oss.str());
-  }
-  std::sort(parts.begin(), parts.end());
-  std::ostringstream joined;
-  for (usize i = 0; i < parts.size(); ++i) {
-    if (i != 0) {
-      joined << '|';
-    }
-    joined << parts[i];
-  }
-  return joined.str();
-}
-
-inline std::string AggregateKey(std::string_view label, const CounterSet &set,
-                                std::initializer_list<Threshold> thresholds) {
-  std::ostringstream oss;
-  oss << label << "::" << CanonicalCounterSetKey(set) << "::" << ThresholdKey(thresholds);
-  return oss.str();
-}
-
-inline std::string AggregateKey(std::string_view label, const CounterSet &set,
-                                const std::vector<Threshold> &thresholds) {
-  std::vector<std::string> parts;
-  parts.reserve(thresholds.size());
-  for (const Threshold &threshold : thresholds) {
-    std::ostringstream oss;
-    oss << CounterId(threshold.counter) << "<=" << threshold.max_value;
-    parts.push_back(oss.str());
-  }
-  std::sort(parts.begin(), parts.end());
-  std::ostringstream joined;
-  for (usize i = 0; i < parts.size(); ++i) {
-    if (i != 0) {
-      joined << '|';
-    }
-    joined << parts[i];
-  }
-
-  std::ostringstream oss;
-  oss << label << "::" << CanonicalCounterSetKey(set) << "::" << joined.str();
-  return oss.str();
-}
-
 inline bool IsSubset(const CounterSet &subset, const CounterSet &superset) {
   for (u8 i = 0; i < subset.count; ++i) {
     if (!superset.Contains(subset.items[i])) {
@@ -295,30 +250,6 @@ inline bool IsSubset(const CounterSet &subset, const CounterSet &superset) {
     }
   }
   return true;
-}
-
-inline u64 SourceLocationHash(const std::source_location &where) {
-  constexpr u64 kOffset = 1469598103934665603ULL;
-  constexpr u64 kPrime = 1099511628211ULL;
-  u64 hash = kOffset;
-  auto mix_byte = [&](u8 byte) {
-    hash ^= byte;
-    hash *= kPrime;
-  };
-  const char *file = where.file_name();
-  while (file != nullptr && *file != '\0') {
-    mix_byte(static_cast<u8>(*file++));
-  }
-  const char *function = where.function_name();
-  while (function != nullptr && *function != '\0') {
-    mix_byte(static_cast<u8>(*function++));
-  }
-  for (u32 value : {where.line(), where.column()}) {
-    for (u8 shift = 0; shift != 32; shift += 8) {
-      mix_byte(static_cast<u8>((value >> shift) & 0xffu));
-    }
-  }
-  return hash;
 }
 
 struct Api {
@@ -473,19 +404,22 @@ struct ScopeFrame {
   CounterSet requested{};
   std::vector<Threshold> thresholds;
   std::array<u64, PERF_MAX_SCOPE_EVENTS> start_values{};
+  std::array<int, PERF_MAX_SCOPE_EVENTS> counter_slots{};
   u64 start_ticks = 0;
   u32 sample_every = 1;
   bool active = false;
   bool dropped = false;
   std::string error;
   Aggregate *aggregate = nullptr;
+  SampleSite *site = nullptr;
+
+  ScopeFrame() { counter_slots.fill(-1); }
 };
 
 struct ThreadState {
   std::vector<ScopeFrame *> active_frames;
   Program *installed_program = nullptr;
   CounterSet installed_set{};
-  std::unordered_map<u64, u64> sample_counters;
   std::unordered_map<std::string, Aggregate> aggregates;
 };
 
@@ -507,23 +441,12 @@ class Backend {
   Backend(const Backend &) = delete;
   Backend &operator=(const Backend &) = delete;
 
-  bool ShouldSample(u32 sample_every, const std::source_location &where) {
-    if (sample_every <= 1) {
-      return true;
-    }
-    ThreadState &state = CurrentThreadState();
-    const u64 site_hash = SourceLocationHash(where);
-    u64 &counter = state.sample_counters[site_hash];
-    ++counter;
-    return (counter % sample_every) == 0;
-  }
-
   static bool ShouldSample(u32 sample_every, SampleSite &site) {
     if (sample_every <= 1) {
       return true;
     }
-    ++site.counter;
-    return (site.counter % sample_every) == 0;
+    ++site.sample_counter;
+    return (site.sample_counter % sample_every) == 0;
   }
 
   bool PrimeThread(CounterSet requested, std::string &error) {
@@ -560,8 +483,7 @@ class Backend {
   void Enter(ScopeFrame &frame) {
     frame.start_ticks = NowTicks();
     ThreadState &state = CurrentThreadState();
-    frame.aggregate = &GetOrCreateAggregate(state, frame.label, frame.requested, frame.thresholds,
-                                            frame.sample_every);
+    frame.aggregate = ResolveAggregate(state, frame);
 
     if (frame.requested.overflow) {
       frame.error = "requested counter set exceeds PERF_MAX_SCOPE_EVENTS";
@@ -589,8 +511,9 @@ class Backend {
       frame.dropped = true;
       return;
     }
+    ResolveCounterSlots(state, frame);
     for (u8 i = 0; i < frame.requested.count; ++i) {
-      const int slot = LookupCounterSlot(*state.installed_program, frame.requested.items[i]);
+      const int slot = frame.counter_slots[i];
       if (slot >= 0) {
         frame.start_values[i] = current[static_cast<usize>(slot)];
       }
@@ -637,7 +560,7 @@ class Backend {
         return;
       }
       for (u8 i = 0; i < frame.requested.count; ++i) {
-        const int slot = LookupCounterSlot(*state.installed_program, frame.requested.items[i]);
+        const int slot = frame.counter_slots[i];
         if (slot >= 0) {
           deltas[i] = current[static_cast<usize>(slot)] - frame.start_values[i];
         }
@@ -970,6 +893,39 @@ class Backend {
     return InstallProgram(state, widened, error);
   }
 
+  Aggregate *ResolveAggregate(ThreadState &state, ScopeFrame &frame) {
+    if (frame.site != nullptr && frame.site->aggregate != nullptr) {
+      return static_cast<Aggregate *>(frame.site->aggregate);
+    }
+    Aggregate &aggregate =
+        GetOrCreateAggregate(state, frame.label, frame.requested, frame.thresholds, frame.sample_every);
+    if (frame.site != nullptr) {
+      frame.site->aggregate = &aggregate;
+    }
+    return &aggregate;
+  }
+
+  void ResolveCounterSlots(ThreadState &state, ScopeFrame &frame) {
+    if (frame.requested.count == 0 || state.installed_program == nullptr) {
+      return;
+    }
+    if (frame.site != nullptr) {
+      if (frame.site->program != state.installed_program) {
+        frame.site->program = state.installed_program;
+        frame.site->counter_slots.fill(-1);
+        for (u8 i = 0; i < frame.requested.count; ++i) {
+          frame.site->counter_slots[i] =
+              LookupCounterSlot(*state.installed_program, frame.requested.items[i]);
+        }
+      }
+      frame.counter_slots = frame.site->counter_slots;
+      return;
+    }
+    for (u8 i = 0; i < frame.requested.count; ++i) {
+      frame.counter_slots[i] = LookupCounterSlot(*state.installed_program, frame.requested.items[i]);
+    }
+  }
+
   Aggregate &GetOrCreateAggregate(ThreadState &state, std::string_view label,
                                   const CounterSet &set, const std::vector<Threshold> &thresholds,
                                   u32 sample_every) {
@@ -1143,22 +1099,35 @@ class Backend {
 
 class PerfScope {
  public:
-  explicit PerfScope(const char *label, CounterSet counters = CounterSet{}, u32 sample_every = 1,
-                     std::initializer_list<Threshold> thresholds = {},
-                     std::source_location where = std::source_location::current())
+  explicit PerfScope(const char *label, CounterSet counters = CounterSet{},
+                     std::initializer_list<Threshold> thresholds = {})
       : label_(label),
         counters_(counters),
-        sample_every_(sample_every == 0 ? 1 : sample_every) {
+        sample_every_(1) {
     if (label_ == nullptr || label_[0] == '\0') {
-      return;
-    }
-    if (!detail::Backend::Instance().ShouldSample(sample_every_, where)) {
       return;
     }
     frame_.label = label_;
     frame_.requested = counters_;
     frame_.sample_every = sample_every_;
     frame_.thresholds.assign(thresholds.begin(), thresholds.end());
+    detail::Backend::Instance().Enter(frame_);
+    active_ = frame_.active || frame_.dropped;
+  }
+
+  PerfScope(const char *label, CounterSet counters, SampleSite &site,
+            std::initializer_list<Threshold> thresholds = {})
+      : label_(label),
+        counters_(counters),
+        sample_every_(1) {
+    if (label_ == nullptr || label_[0] == '\0') {
+      return;
+    }
+    frame_.label = label_;
+    frame_.requested = counters_;
+    frame_.sample_every = sample_every_;
+    frame_.thresholds.assign(thresholds.begin(), thresholds.end());
+    frame_.site = &site;
     detail::Backend::Instance().Enter(frame_);
     active_ = frame_.active || frame_.dropped;
   }
@@ -1178,6 +1147,7 @@ class PerfScope {
     frame_.requested = counters_;
     frame_.sample_every = sample_every_;
     frame_.thresholds.assign(thresholds.begin(), thresholds.end());
+    frame_.site = &site;
     detail::Backend::Instance().Enter(frame_);
     active_ = frame_.active || frame_.dropped;
   }
@@ -1279,6 +1249,7 @@ using PerfPointDelta = perf::PerfPointDelta;
 using PerfCounter = perf::Counter;
 using PerfCounterSet = perf::CounterSet;
 using PerfThreshold = perf::Threshold;
+using PerfScopeSite = perf::SampleSite;
 using PerfSampleSite = perf::SampleSite;
 
 inline constexpr auto CYCLES = perf::CYCLES;
@@ -1303,7 +1274,6 @@ inline bool PerfPrimeThread(PerfCounterSet counters, std::string *error = nullpt
 
 #include <cstdint>
 #include <initializer_list>
-#include <source_location>
 #include <string>
 
 namespace perf {
@@ -1351,9 +1321,9 @@ constexpr Threshold MaxThreshold(Counter counter, std::uint64_t max_value) {
 
 class PerfScope {
  public:
-  explicit PerfScope(const char *, CounterSet = CounterSet{}, std::uint32_t = 1,
-                     std::initializer_list<Threshold> = {},
-                     std::source_location = std::source_location::current()) {}
+  explicit PerfScope(const char *, CounterSet = CounterSet{},
+                     std::initializer_list<Threshold> = {}) {}
+  PerfScope(const char *, CounterSet, SampleSite &, std::initializer_list<Threshold> = {}) {}
   PerfScope(const char *, CounterSet, std::uint32_t, SampleSite &,
             std::initializer_list<Threshold> = {}) {}
 };
@@ -1383,6 +1353,7 @@ using PerfPointDelta = perf::PerfPointDelta;
 using PerfCounter = perf::Counter;
 using PerfCounterSet = perf::CounterSet;
 using PerfThreshold = perf::Threshold;
+using PerfScopeSite = perf::SampleSite;
 using PerfSampleSite = perf::SampleSite;
 
 inline constexpr auto CYCLES = perf::CYCLES;
@@ -1407,10 +1378,12 @@ inline bool PerfPrimeThread(PerfCounterSet counters, std::string *error = nullpt
 
 #define PERF_DETAIL_CONCAT_INNER_(a, b) a##b
 #define PERF_DETAIL_CONCAT_(a, b) PERF_DETAIL_CONCAT_INNER_(a, b)
-#define PERF_SCOPE(label, counters) \
-  ::PerfScope PERF_DETAIL_CONCAT_(_perf_scope_, __LINE__)((label), (counters))
+#define PERF_SCOPE(label, counters)                                                       \
+  static thread_local ::PerfScopeSite PERF_DETAIL_CONCAT_(_perf_site_, __LINE__);        \
+  ::PerfScope PERF_DETAIL_CONCAT_(_perf_scope_, __LINE__)(                               \
+      (label), (counters), PERF_DETAIL_CONCAT_(_perf_site_, __LINE__))
 #define PERF_SCOPE_SAMPLED(label, counters, sample_every)                                  \
-  static thread_local ::PerfSampleSite PERF_DETAIL_CONCAT_(_perf_site_, __LINE__);         \
+  static thread_local ::PerfScopeSite PERF_DETAIL_CONCAT_(_perf_site_, __LINE__);          \
   ::PerfScope PERF_DETAIL_CONCAT_(_perf_scope_, __LINE__)(                                 \
       (label), (counters), (sample_every), PERF_DETAIL_CONCAT_(_perf_site_, __LINE__))
 
