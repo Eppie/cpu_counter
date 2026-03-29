@@ -1,15 +1,15 @@
 # CPU Counter Probe
 
-This is a rough proof of concept for accessing Apple Silicon PMU counters from C++ on macOS.
+This project is a rough proof of concept for accessing Apple Silicon PMU counters from C++ on macOS and then using them to characterize specific code patterns.
 
-Current findings on this machine:
+Current host:
 
 - Chip: `Apple M4 Max`
 - `hw.cpufamily`: `0x17d5b93a`
 - `kpc_cpu_string()`: `cpu_100000c_2_17d5b93a`
 - Local PMU database: `/usr/share/kpep/cpu_100000c_2_17d5b93a.plist -> as4-1.plist`
 
-The probe uses:
+The code uses:
 
 - `kperf.framework` for the private `kpc_*` control/read APIs
 - `kperfdata.framework` for the private `kpep_*` event database/config helpers
@@ -23,33 +23,48 @@ make
 Run:
 
 ```sh
-./cpu_counter
-```
-
-At the moment, the unprivileged run reaches the private framework successfully but fails at:
-
-```text
-kpc_force_all_ctrs_set(1)
-```
-
-That strongly suggests real counter programming on this machine requires elevated privileges. The next intended run is:
-
-```sh
 sudo ./cpu_counter
 ```
 
-What the program currently does:
+The current binary is a small memory-counter suite. It reprograms the configurable PMCs at runtime, fixes the raw-slot versus packed-counter indexing issue in the readout path, and runs several benchmark patterns, including:
 
-1. Resolves the current Apple PMU database from the local `/usr/share/kpep` files.
-2. Dynamically loads `kperf.framework` and `kperfdata.framework`.
-3. Configures these events:
-   - `FIXED_CYCLES`
-   - `FIXED_INSTRUCTIONS`
-   - `INST_BRANCH`
-   - `BRANCH_MISPRED_NONSPEC`
-4. Tries to enable counting for the current thread and report counter deltas around a synthetic workload.
+- hot sequential reads
+- scalar streaming reads
+- explicit NEON streaming reads
+- random pointer chasing
+- page-stride reads
+- hot sequential writes
+- scalar streaming writes
+- explicit NEON streaming writes
+- random page writes
+- aligned vs cache-line-crossing loads/stores
+- aligned vs page-crossing loads/stores
+
+The suite is intentionally split into multiple passes because Apple only exposes a small number of configurable PMCs at once, and some event combinations interact badly. Current groups focus on:
+
+- primary memory-boundness counters:
+  - `INST_LDST`
+  - `L1D_CACHE_MISS_LD`
+  - `L1D_CACHE_MISS_ST`
+  - `L1D_TLB_MISS`
+  - `MMU_TABLE_WALK_DATA`
+- deeper translation counters:
+  - `L1D_TLB_FILL`
+  - `L2_TLB_MISS_DATA`
+- scalar vs SIMD mixes:
+  - `INST_INT_LD`
+  - `INST_INT_ST`
+  - `INST_SIMD_LD`
+  - `INST_SIMD_ST`
+- boundary-crossing diagnostics:
+  - `LDST_X64_UOP`
+  - `LDST_XPG_UOP`
+- store-path diagnostics:
+  - `L1D_CACHE_WRITEBACK`
 
 Notes:
 
+- Counter programming still requires privileged access on this machine.
 - This relies on private Apple interfaces, not public SDK APIs.
-- The current code is intentionally single-file and direct so it is easy to iterate on during reverse engineering.
+- The code stays intentionally direct and single-file so it is easy to keep iterating during reverse engineering.
+- If a requested event group cannot be programmed together on this machine, the tool prints that group as skipped and continues with the rest of the suite.
