@@ -787,6 +787,7 @@ struct RunOptions {
   std::optional<int> prefer_cpu;
   usize max_attempts = 1;
   bool require_stable_cpu = false;
+  bool scan_cpus = false;
 };
 
 class Profiler {
@@ -1250,6 +1251,10 @@ bool ParseRunOptions(int argc, char **argv, RunOptions &options, std::string &er
       options.require_stable_cpu = false;
       continue;
     }
+    if (arg == "--scan-cpus") {
+      options.scan_cpus = true;
+      continue;
+    }
     error = "unknown argument: " + std::string(arg);
     return false;
   }
@@ -1588,6 +1593,110 @@ int main(int argc, char **argv) {
       SuiteRun{&crossing_load_group, crossing_load_workloads},
       SuiteRun{&crossing_store_group, crossing_store_workloads},
   };
+
+  if (run_options.scan_cpus) {
+    struct ScanTarget {
+      std::string_view label;
+      const EventGroupDefinition *group;
+      const WorkloadDefinition *workload;
+      std::array<std::string_view, 2> summary_events;
+    };
+
+    const std::array<ScanTarget, 4> scan_targets = {
+        ScanTarget{
+            "translation_page_stride",
+            &translation_with_ldst_group,
+            &page_read,
+            {"INST_LDST", "L1D_TLB_MISS"},
+        },
+        ScanTarget{
+            "stream_scalar",
+            &stream_scalar_group,
+            &stream_read,
+            {"INST_INT_LD", "L1D_CACHE_MISS_LD"},
+        },
+        ScanTarget{
+            "stream_simd",
+            &stream_simd_group,
+            &simd_stream_read,
+            {"INST_SIMD_LD", "L1D_CACHE_MISS_LD"},
+        },
+        ScanTarget{
+            "store_scalar",
+            &store_scalar_group,
+            &stream_write,
+            {"INST_INT_ST", "L1D_CACHE_MISS_ST"},
+        },
+    };
+
+    const auto logical_cpu_max = ReadSysctlIntegral<u32>("hw.logicalcpu_max").value_or(0);
+    if (logical_cpu_max == 0) {
+      std::cerr << "failed to read hw.logicalcpu_max\n";
+      return 1;
+    }
+
+    RunOptions scan_options = run_options;
+    scan_options.require_stable_cpu = true;
+    if (scan_options.max_attempts == 1) {
+      scan_options.max_attempts = 25;
+    }
+
+    std::cout << "\nCPU scan mode. Each target retries until it lands on the requested CPU or exhausts attempts.\n";
+    std::cout << "logical_cpu_max=" << logical_cpu_max
+              << " max_attempts=" << scan_options.max_attempts
+              << " require_stable_cpu=yes\n";
+
+    for (const ScanTarget &target : scan_targets) {
+      CounterProgram program;
+      if (!profiler.BuildProgram(*target.group, program, error)) {
+        std::cerr << error << '\n';
+        return 1;
+      }
+
+      std::cout << "\n== CPU Scan: " << target.label << " ==\n";
+      std::cout << target.workload->description << '\n';
+      for (u32 cpu = 0; cpu < logical_cpu_max; ++cpu) {
+        scan_options.prefer_cpu = static_cast<int>(cpu);
+        SampleResult result;
+        bool matched = false;
+        for (usize attempt = 1; attempt <= scan_options.max_attempts; ++attempt) {
+          if (!profiler.Measure(program, *target.workload, state, result, error)) {
+            std::cerr << error << '\n';
+            return 1;
+          }
+          if (SampleMatches(result, scan_options)) {
+            matched = true;
+            break;
+          }
+        }
+
+        std::cout << "cpu=" << cpu;
+        if (!matched) {
+          std::cout << " status=unreached";
+          std::cout << " last_cpu_before=" << result.cpu_before
+                    << " last_cpu_after=" << result.cpu_after << '\n';
+          continue;
+        }
+
+        u64 configurable_sum = 0;
+        for (usize i = 2; i < result.deltas.size(); ++i) {
+          configurable_sum += result.deltas[i];
+        }
+        std::cout << " status=matched";
+        std::cout << " active=" << (configurable_sum != 0 ? "yes" : "no");
+        std::cout << " elapsed_ms=" << std::fixed << std::setprecision(3) << result.elapsed_ms;
+        for (const std::string_view event_name : target.summary_events) {
+          if (const auto value = FindEventDelta(program, result, event_name)) {
+            std::cout << ' ' << event_name << '=' << *value;
+          }
+        }
+        std::cout << '\n';
+      }
+    }
+
+    std::cout << "\nfinal sink=" << g_sink << '\n';
+    return 0;
+  }
 
   std::cout << "\nStarting issue-focused memory counter suite. Known-good passes are temporarily disabled so the run stays short and concentrates on the remaining inconsistencies.\n";
   std::cout << "Several workloads now have alternate optnone implementations in the same file so compiler-shape effects can be separated from PMU-event interaction problems.\n";
