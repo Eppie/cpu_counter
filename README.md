@@ -27,40 +27,41 @@ Run:
 sudo ./cpu_counter
 ```
 
-The current binary is a small memory-counter suite. It reprograms the configurable PMCs at runtime, fixes the raw-slot versus packed-counter indexing issue in the readout path, and runs several benchmark patterns, including:
+The current binary is an issue-focused memory-counter suite. It reprograms the configurable PMCs at runtime, fixes the raw-slot versus packed-counter indexing issue in the readout path, and temporarily disables the known-good passes so the output stays concentrated on the remaining inconsistencies.
 
-- hot sequential reads
 - scalar streaming reads
+- alternate scalar streaming reads compiled `optnone`
 - explicit NEON streaming reads
-- random pointer chasing
 - page-stride reads
-- hot sequential writes
+- alternate page-stride reads compiled `optnone`
 - scalar streaming writes
 - explicit NEON streaming writes
 - random page writes
-- aligned vs cache-line-crossing loads/stores
+- alternate random page writes compiled `optnone`
+- aligned vs 64-byte-split loads/stores
 - aligned vs page-crossing loads/stores
+- alternate cross-page stores compiled `optnone`
 
-The suite is intentionally split into multiple passes because Apple only exposes a small number of configurable PMCs at once, and some event combinations interact badly. Current groups focus on:
+The suite is intentionally split into multiple passes because Apple only exposes a small number of configurable PMCs at once, and some event combinations interact badly. The current focused groups are:
 
-- primary memory-boundness counters:
-  - `INST_LDST`
+- translation with and without `INST_LDST`, to check whether `INST_LDST` is what poisons page-stride and random-page-write samples
+- scalar stream debug:
+  - `INST_INT_LD`
+  - `LD_UNIT_UOP`
   - `L1D_CACHE_MISS_LD`
-  - `L1D_CACHE_MISS_ST`
   - `L1D_TLB_MISS`
   - `MMU_TABLE_WALK_DATA`
+- SIMD stream debug:
+  - `INST_SIMD_LD`
+  - `LD_UNIT_UOP`
+  - `L1D_CACHE_MISS_LD`
 - deeper translation counters:
   - `L1D_TLB_FILL`
   - `L2_TLB_MISS_DATA`
-- scalar vs SIMD mixes:
-  - `INST_INT_LD`
-  - `INST_INT_ST`
-  - `INST_SIMD_LD`
-  - `INST_SIMD_ST`
 - separate scalar and SIMD store passes:
   - scalar stores avoid the `INST_LDST` + `INST_INT_ST` conflict
   - SIMD stores are measured in their own pass
-- boundary-crossing diagnostics:
+- split-boundary diagnostics:
   - `LDST_X64_UOP`
   - `LDST_XPG_UOP`
 - store-path diagnostics:
@@ -74,3 +75,4 @@ Notes:
 - If a requested event group cannot be programmed together on this machine, the tool prints that group as skipped and continues with the rest of the suite.
 - `LDST_X64_UOP` is a 64-byte split-access counter. On this M4 Max, `hw.cachelinesize` is `128`, so the X64 workloads are about 64-byte boundaries, not full L1 cache lines.
 - Each benchmark sample now records the current CPU before and after the workload so scheduler migration can be correlated with suspicious all-zero measurements.
+- Several debug-only workload variants use `optnone` so the optimizer can be ruled out without dropping the whole binary to `-O0`.

@@ -26,6 +26,12 @@ using u64 = std::uint64_t;
 using usize = std::size_t;
 using kpc_config_t = u64;
 
+#if defined(__clang__)
+#define CLANG_OPTNONE __attribute__((optnone))
+#else
+#define CLANG_OPTNONE
+#endif
+
 struct kpep_db;
 struct kpep_config;
 struct kpep_event;
@@ -445,6 +451,37 @@ struct MemoryBenchState {
   return sum;
 }
 
+[[gnu::noinline]] CLANG_OPTNONE u64 StreamingReadScalarVolatileDebug(
+    MemoryBenchState &state) {
+  volatile const u64 *data = state.stream_read.data();
+  u64 sum = 0;
+  constexpr usize kPasses = 8;
+  for (usize pass = 0; pass < kPasses; ++pass) {
+    for (usize i = 0; i < state.stream_read.size(); ++i) {
+      sum += data[i];
+    }
+  }
+  g_sink ^= sum;
+  return sum;
+}
+
+[[gnu::noinline]] CLANG_OPTNONE u64 StreamingReadScalarPointerDebug(
+    MemoryBenchState &state) {
+  volatile const u64 *begin = state.stream_read.data();
+  volatile const u64 *end = begin + state.stream_read.size();
+  u64 sum = 0;
+  constexpr usize kPasses = 8;
+  for (usize pass = 0; pass < kPasses; ++pass) {
+    volatile const u64 *ptr = begin;
+    while (ptr != end) {
+      sum += *ptr;
+      ++ptr;
+    }
+  }
+  g_sink ^= sum;
+  return sum;
+}
+
 [[gnu::noinline]] u64 StreamingReadSimd(MemoryBenchState &state) {
   const u64 *data = state.stream_read.data();
   uint64x2_t acc = vdupq_n_u64(0);
@@ -486,6 +523,21 @@ struct MemoryBenchState {
   for (usize pass = 0; pass < kPasses; ++pass) {
     for (usize page : state.page_order) {
       sum += base[page * stride];
+    }
+  }
+  g_sink ^= sum;
+  return sum;
+}
+
+[[gnu::noinline]] CLANG_OPTNONE u64 PageStrideReadDebug(MemoryBenchState &state) {
+  volatile const u64 *base = state.page_base;
+  const usize stride = state.PageWords();
+  u64 sum = 0;
+  constexpr usize kPasses = 256;
+  for (usize pass = 0; pass < kPasses; ++pass) {
+    for (usize page : state.page_order) {
+      volatile const u64 *ptr = base + page * stride;
+      sum += *ptr;
     }
   }
   g_sink ^= sum;
@@ -553,6 +605,21 @@ struct MemoryBenchState {
   for (usize pass = 0; pass < kPasses; ++pass) {
     for (usize page : state.page_order) {
       base[page * stride] += static_cast<u64>(pass + 1);
+    }
+  }
+  u64 sample = base[state.page_order.front() * stride];
+  g_sink += sample;
+  return sample;
+}
+
+[[gnu::noinline]] CLANG_OPTNONE u64 RandomPageWriteDebug(MemoryBenchState &state) {
+  volatile u64 *base = state.page_base;
+  const usize stride = state.PageWords();
+  constexpr usize kPasses = 256;
+  for (usize pass = 0; pass < kPasses; ++pass) {
+    for (usize page : state.page_order) {
+      volatile u64 *ptr = base + page * stride;
+      *ptr += static_cast<u64>(pass + 1);
     }
   }
   u64 sample = base[state.page_order.front() * stride];
@@ -648,6 +715,22 @@ struct MemoryBenchState {
 }
 
 [[gnu::noinline]] u64 CrossPageStore(MemoryBenchState &state) {
+  constexpr usize kPasses = 256;
+  for (usize pass = 0; pass < kPasses; ++pass) {
+    for (usize page : state.page_order) {
+      volatile u64 *ptr = reinterpret_cast<volatile u64 *>(
+          reinterpret_cast<u8 *>(state.page_base) + page * state.page_size +
+          state.page_size - sizeof(u32));
+      *ptr += static_cast<u64>(pass + 1);
+    }
+  }
+  u64 sample = *reinterpret_cast<volatile u64 *>(
+      reinterpret_cast<u8 *>(state.page_base) + state.page_size - sizeof(u32));
+  g_sink += sample;
+  return sample;
+}
+
+[[gnu::noinline]] CLANG_OPTNONE u64 CrossPageStoreDebug(MemoryBenchState &state) {
   constexpr usize kPasses = 256;
   for (usize pass = 0; pass < kPasses; ++pass) {
     for (usize page : state.page_order) {
@@ -787,8 +870,12 @@ class Profiler {
 
     std::vector<const char *> requested_names;
     requested_names.insert(requested_names.end(), kFixedEvents.begin(), kFixedEvents.end());
-    requested_names.insert(requested_names.end(), group.configurable_events.begin(),
-                           group.configurable_events.end());
+    for (const char *event_name : group.configurable_events) {
+      if (event_name == nullptr || event_name[0] == '\0') {
+        continue;
+      }
+      requested_names.push_back(event_name);
+    }
 
     for (const char *event_name : requested_names) {
       kpep_event *event = nullptr;
@@ -1149,7 +1236,7 @@ int main() {
     return 1;
   }
 
-  const WorkloadDefinition hot_seq_read{
+  [[maybe_unused]] const WorkloadDefinition hot_seq_read{
       "hot_seq_read",
       "32 KiB dependent load ring that stays resident in L1D and should show very low data-cache and DTLB miss pressure.",
       &HotSequentialRead,
@@ -1159,12 +1246,22 @@ int main() {
       "64 MiB scalar sequential read stream with vectorization disabled so INST_INT_LD has a clean target.",
       &StreamingReadScalar,
   };
+  const WorkloadDefinition stream_read_volatile{
+      "stream_read_scalar_volatile",
+      "Same sequential scalar read, but compiled optnone and using volatile loads to remove optimizer ambiguity.",
+      &StreamingReadScalarVolatileDebug,
+  };
+  const WorkloadDefinition stream_read_ptr{
+      "stream_read_scalar_ptr",
+      "Same sequential scalar read, but compiled optnone with an explicit pointer-walk loop.",
+      &StreamingReadScalarPointerDebug,
+  };
   const WorkloadDefinition simd_stream_read{
       "stream_read_simd",
       "64 MiB explicit NEON read stream so INST_SIMD_LD lights up without relying on auto-vectorization.",
       &StreamingReadSimd,
   };
-  const WorkloadDefinition random_read{
+  [[maybe_unused]] const WorkloadDefinition random_read{
       "random_pointer_chase",
       "32 MiB random dependent load chain that should drive high L1D miss rates and poor prefetch behavior.",
       &RandomPointerChase,
@@ -1174,7 +1271,12 @@ int main() {
       "One demand load per randomly ordered page across 64 MiB to emphasize DTLB misses and table walks.",
       &PageStrideRead,
   };
-  const WorkloadDefinition hot_seq_write{
+  const WorkloadDefinition page_read_debug{
+      "page_stride_read_debug",
+      "Same page-stride read, but compiled optnone and forced through an explicit volatile pointer.",
+      &PageStrideReadDebug,
+  };
+  [[maybe_unused]] const WorkloadDefinition hot_seq_write{
       "hot_seq_write",
       "32 KiB sequential write loop that should keep store misses low because the working set fits in L1D.",
       &HotSequentialWrite,
@@ -1193,6 +1295,11 @@ int main() {
       "random_page_write",
       "One store per randomly ordered page across 64 MiB to drive store misses plus DTLB pressure.",
       &RandomPageWrite,
+  };
+  const WorkloadDefinition random_write_debug{
+      "random_page_write_debug",
+      "Same random page write, but compiled optnone to reduce optimizer-side ambiguity in the store path.",
+      &RandomPageWriteDebug,
   };
   const WorkloadDefinition aligned_line_load{
       "aligned_x64_load",
@@ -1229,21 +1336,15 @@ int main() {
       "Store 8 bytes starting 4 bytes before the page boundary so every store crosses into the next page.",
       &CrossPageStore,
   };
-
-  const EventGroupDefinition memory_core_group{
-      "memory_core",
-      "Primary memory-boundness counters. This pass keeps the event set small on purpose because only five configurable PMCs fit at once and some combinations interact badly.",
-      {
-          "INST_LDST",
-          "L1D_CACHE_MISS_LD",
-          "L1D_CACHE_MISS_ST",
-          "L1D_TLB_MISS",
-          "MMU_TABLE_WALK_DATA",
-      },
+  const WorkloadDefinition cross_page_store_debug{
+      "cross_page_store_debug",
+      "Same cross-page store pattern, but compiled optnone to keep the generated store sequence simple.",
+      &CrossPageStoreDebug,
   };
-  const EventGroupDefinition translation_group{
-      "translation_deep",
-      "Translation-focused counters for page-local versus page-scattered access patterns, including second-level DTLB pressure.",
+
+  const EventGroupDefinition translation_with_ldst_group{
+      "translation_with_ldst",
+      "Reproduce the translation-side issue with INST_LDST still present in the group.",
       {
           "INST_LDST",
           "L1D_TLB_FILL",
@@ -1252,15 +1353,37 @@ int main() {
           "MMU_TABLE_WALK_DATA",
       },
   };
-  const EventGroupDefinition load_mix_group{
-      "load_mix",
-      "Compare scalar and explicit-NEON read kernels using instruction-class counters plus load misses.",
+  const EventGroupDefinition translation_raw_group{
+      "translation_raw",
+      "Same translation counters without INST_LDST, to test whether INST_LDST is what poisons page-stride and random-page-write samples.",
       {
-          "INST_LDST",
+          "L1D_TLB_FILL",
+          "L1D_TLB_MISS",
+          "L2_TLB_MISS_DATA",
+          "MMU_TABLE_WALK_DATA",
+          nullptr,
+      },
+  };
+  const EventGroupDefinition stream_scalar_group{
+      "stream_scalar_debug",
+      "Focused scalar-stream group for the unexpectedly all-zero cases. The alternate workloads are compiled optnone.",
+      {
           "INST_INT_LD",
+          "LD_UNIT_UOP",
+          "L1D_CACHE_MISS_LD",
+          "L1D_TLB_MISS",
+          "MMU_TABLE_WALK_DATA",
+      },
+  };
+  const EventGroupDefinition stream_simd_group{
+      "stream_simd_debug",
+      "Focused SIMD-stream group so the explicit NEON workload can be checked in isolation from the scalar load counters.",
+      {
           "INST_SIMD_LD",
           "LD_UNIT_UOP",
           "L1D_CACHE_MISS_LD",
+          nullptr,
+          nullptr,
       },
   };
   const EventGroupDefinition store_scalar_group{
@@ -1285,56 +1408,65 @@ int main() {
           "L1D_TLB_MISS",
       },
   };
-  const EventGroupDefinition crossing_group{
-      "ldst_crossings",
-      "Deliberately compare aligned accesses against cache-line-crossing and page-crossing accesses.",
+  const EventGroupDefinition crossing_load_group{
+      "crossing_load_debug",
+      "Load-only split-boundary group. ST_UNIT_UOP is removed so the previously all-zero load cases can be checked in isolation.",
       {
           "INST_LDST",
           "LD_UNIT_UOP",
+          "LDST_X64_UOP",
+          "LDST_XPG_UOP",
+          nullptr,
+      },
+  };
+  const EventGroupDefinition crossing_store_group{
+      "crossing_store_debug",
+      "Store-only split-boundary group, with an optnone cross-page variant to check whether the old zero results were caused by code shape.",
+      {
+          "INST_LDST",
           "ST_UNIT_UOP",
           "LDST_X64_UOP",
           "LDST_XPG_UOP",
+          nullptr,
       },
   };
 
-  const std::array<const WorkloadDefinition *, 7> memory_core_workloads = {
-      &hot_seq_read,
-      &stream_read,
-      &random_read,
+  const std::array<const WorkloadDefinition *, 4> translation_focus_workloads = {
       &page_read,
-      &hot_seq_write,
-      &stream_write,
+      &page_read_debug,
       &random_write,
+      &random_write_debug,
   };
-  const std::array<const WorkloadDefinition *, 4> translation_workloads = {
-      &hot_seq_read,
-      &page_read,
-      &random_read,
-      &random_write,
-  };
-  const std::array<const WorkloadDefinition *, 4> load_mix_workloads = {
-      &hot_seq_read,
+  const std::array<const WorkloadDefinition *, 4> stream_scalar_workloads = {
       &stream_read,
+      &stream_read_volatile,
+      &stream_read_ptr,
       &simd_stream_read,
-      &random_read,
+  };
+  const std::array<const WorkloadDefinition *, 2> stream_simd_workloads = {
+      &simd_stream_read,
+      &stream_read,
   };
   const std::array<const WorkloadDefinition *, 3> store_scalar_workloads = {
-      &hot_seq_write,
       &stream_write,
       &random_write,
+      &random_write_debug,
   };
   const std::array<const WorkloadDefinition *, 2> store_simd_workloads = {
       &simd_stream_write,
       &random_write,
   };
-  const std::array<const WorkloadDefinition *, 7> crossing_workloads = {
+  const std::array<const WorkloadDefinition *, 4> crossing_load_workloads = {
       &aligned_line_load,
       &cross_line_load,
       &aligned_page_load,
       &cross_page_load,
+  };
+  const std::array<const WorkloadDefinition *, 4> crossing_store_workloads = {
       &aligned_line_store,
       &cross_line_store,
       &cross_page_store,
+      &cross_page_store_debug,
   };
 
   struct SuiteRun {
@@ -1342,17 +1474,19 @@ int main() {
     std::span<const WorkloadDefinition *const> workloads;
   };
 
-  const std::array<SuiteRun, 6> suites = {
-      SuiteRun{&memory_core_group, memory_core_workloads},
-      SuiteRun{&translation_group, translation_workloads},
-      SuiteRun{&load_mix_group, load_mix_workloads},
+  const std::array<SuiteRun, 8> suites = {
+      SuiteRun{&translation_with_ldst_group, translation_focus_workloads},
+      SuiteRun{&translation_raw_group, translation_focus_workloads},
+      SuiteRun{&stream_scalar_group, stream_scalar_workloads},
+      SuiteRun{&stream_simd_group, stream_simd_workloads},
       SuiteRun{&store_scalar_group, store_scalar_workloads},
       SuiteRun{&store_simd_group, store_simd_workloads},
-      SuiteRun{&crossing_group, crossing_workloads},
+      SuiteRun{&crossing_load_group, crossing_load_workloads},
+      SuiteRun{&crossing_store_group, crossing_store_workloads},
   };
 
-  std::cout << "\nStarting memory counter suite. The groups are intentionally split because Apple only gives us a handful of configurable PMCs per pass, and some event combinations clearly interact.\n";
-  std::cout << "This revision also separates scalar and explicit-NEON streaming kernels so the load/store instruction-class counters are easier to interpret.\n";
+  std::cout << "\nStarting issue-focused memory counter suite. Known-good passes are temporarily disabled so the run stays short and concentrates on the remaining inconsistencies.\n";
+  std::cout << "Several workloads now have alternate optnone implementations in the same file so compiler-shape effects can be separated from PMU-event interaction problems.\n";
   std::cout << "LDST_X64_UOP counts 64-byte split accesses; on this machine hw.cachelinesize is 128, so the X64 workloads are about 64-byte boundaries rather than full L1 cache lines.\n";
 
   usize skipped_groups = 0;
