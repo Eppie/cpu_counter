@@ -11,7 +11,15 @@ void MixerUpdate() {
 }
 ```
 
-It is header-only in the normal build sense: no extra `.cpp`, no extra link flags, no explicit init/teardown call. The first sampled use lazily initializes the private `kperf` / `kperfdata` backend, and process shutdown writes JSONL output.
+It is header-only in the normal build sense: no extra `.cpp`, no extra link flags, no required init/teardown call. The first sampled use lazily initializes the private `kperf` / `kperfdata` backend, and process shutdown writes JSONL output.
+
+The library now uses a lower-overhead runtime model:
+
+- counters are installed per thread and kept active
+- scope enter/exit just snapshots counters and updates thread-local aggregates
+- thread-local aggregates are merged only when dumping JSONL at shutdown
+
+The important tradeoff is that nested scopes are expected to use subsets of the installed thread set. If you know a thread will use several different nested regions, prime a superset once with `PerfPrimeThread(...)`.
 
 ## Caveat First
 
@@ -62,6 +70,17 @@ PerfScope guard("cache_sensitive",
                 1,
                 {MaxThreshold(L2_TLB_MISS, 1000)});
 ```
+
+Optional thread priming for low-overhead nested use:
+
+```cpp
+std::string error;
+if (!PerfPrimeThread(CYCLES | INSTRUCTIONS | L1_MISS | DTLB_MISS, &error)) {
+  // handle or log error
+}
+```
+
+This is not required for basic use, but it is the recommended pattern when nested scopes on the same thread need different counters.
 
 Manual snapshots:
 
@@ -125,13 +144,15 @@ Each object contains:
 ## Nesting and Thread Safety
 
 - Active scopes are thread-local.
-- Aggregation is process-global and mutex-protected.
-- Nested scopes are supported by reprogramming to the union of counters requested by the active stack on that thread.
+- Aggregation is thread-local on the hot path and merged at dump time.
+- The PMU configuration is installed per thread and reused.
 
 Important caveat:
 
-- Nested scopes only work while the union fits what the PMU can program simultaneously.
-- If a scope or nested union requests too many counters, or requests a conflicting combination, that scope is dropped and the JSONL output records the failure.
+- The first scope on a thread installs that scope's counter set. Later scopes on that thread may widen the installed set when no scope is active.
+- Nested scopes are expected to request subsets of the installed thread set. If an inner scope needs extra counters that were not already installed, that inner scope is dropped and the JSONL output records the failure.
+- `PerfPrimeThread(...)` is the intended fix for that case: prime the superset once per thread, then use cheap nested subsets.
+- If a scope requests too many counters, or a conflicting combination, that scope is dropped and the JSONL output records the failure.
 - This implementation reports that as a runtime error, not a compile-time error.
 
 ## Files

@@ -2,12 +2,12 @@
 #define PERF_H_
 
 #include <dlfcn.h>
+#include <mach/mach_time.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <array>
-#include <chrono>
 #include <cstring>
 #include <cstdint>
 #include <cstdlib>
@@ -161,10 +161,8 @@ constexpr Threshold MaxThreshold(Counter counter, u64 max_value) {
 
 namespace detail {
 
-inline u64 NowNs() {
-  return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                              std::chrono::steady_clock::now().time_since_epoch())
-                              .count());
+inline u64 NowTicks() {
+  return mach_absolute_time();
 }
 
 inline std::string JsonEscape(std::string_view text) {
@@ -450,9 +448,9 @@ struct Aggregate {
   u32 sample_every = 1;
   u64 sampled_count = 0;
   u64 dropped_count = 0;
-  u64 total_wall_ns = 0;
-  u64 min_wall_ns = std::numeric_limits<u64>::max();
-  u64 max_wall_ns = 0;
+  u64 total_wall_ticks = 0;
+  u64 min_wall_ticks = std::numeric_limits<u64>::max();
+  u64 max_wall_ticks = 0;
   std::array<u64, PERF_MAX_SCOPE_EVENTS> total_counters{};
   std::array<u64, PERF_MAX_SCOPE_EVENTS> min_counters{};
   std::array<u64, PERF_MAX_SCOPE_EVENTS> max_counters{};
@@ -470,28 +468,33 @@ struct ScopeFrame {
   const char *label = "";
   CounterSet requested{};
   std::vector<Threshold> thresholds;
-  std::array<u64, PERF_MAX_SCOPE_EVENTS> totals{};
-  u64 start_ns = 0;
+  std::array<u64, PERF_MAX_SCOPE_EVENTS> start_values{};
+  u64 start_ticks = 0;
   u32 sample_every = 1;
   bool active = false;
   bool dropped = false;
   std::string error;
+  Aggregate *aggregate = nullptr;
 };
 
 struct ThreadState {
   std::vector<ScopeFrame *> active_frames;
-  Program *current_program = nullptr;
-  std::array<u64, KPC_MAX_COUNTERS> segment_start{};
+  Program *installed_program = nullptr;
+  CounterSet installed_set{};
   std::unordered_map<u64, u64> sample_counters;
+  std::unordered_map<std::string, Aggregate> aggregates;
 };
-
-inline ThreadState &GetThreadState() {
-  thread_local ThreadState state;
-  return state;
-}
 
 class Backend {
  public:
+  struct PointSnapshot {
+    CounterSet set{};
+    std::array<u64, PERF_MAX_SCOPE_EVENTS> values{};
+    u8 count = 0;
+    bool valid = false;
+    std::string error;
+  };
+
   static Backend &Instance() {
     static Backend backend;
     return backend;
@@ -504,56 +507,81 @@ class Backend {
     if (sample_every <= 1) {
       return true;
     }
-    ThreadState &state = GetThreadState();
+    ThreadState &state = CurrentThreadState();
     const u64 site_hash = SourceLocationHash(where);
     u64 &counter = state.sample_counters[site_hash];
     ++counter;
     return (counter % sample_every) == 0;
   }
 
-  void Enter(ScopeFrame &frame) {
-    frame.start_ns = NowNs();
-    if (!EnsureInitialized(frame.error)) {
-      frame.dropped = true;
-      return;
+  bool PrimeThread(CounterSet requested, std::string &error) {
+    if (requested.overflow) {
+      error = "requested counter set exceeds PERF_MAX_SCOPE_EVENTS";
+      return false;
     }
+    if (requested.count == 0) {
+      return true;
+    }
+    if (!EnsureInitialized(error)) {
+      return false;
+    }
+
+    ThreadState &state = CurrentThreadState();
+    if (state.installed_program != nullptr) {
+      if (IsSubset(requested, state.installed_set)) {
+        return true;
+      }
+      if (!state.active_frames.empty()) {
+        error =
+            "cannot widen the installed thread counter set while scopes are active on this thread";
+        return false;
+      }
+      requested = state.installed_set | requested;
+      if (requested.overflow) {
+        error = "too many simultaneous configurable counters in installed thread set";
+        return false;
+      }
+    }
+    return InstallProgram(state, requested, error);
+  }
+
+  void Enter(ScopeFrame &frame) {
+    frame.start_ticks = NowTicks();
+    ThreadState &state = CurrentThreadState();
+    frame.aggregate = &GetOrCreateAggregate(state, frame.label, frame.requested, frame.thresholds,
+                                            frame.sample_every);
+
     if (frame.requested.overflow) {
       frame.error = "requested counter set exceeds PERF_MAX_SCOPE_EVENTS";
       frame.dropped = true;
       return;
     }
 
-    ThreadState &state = GetThreadState();
-    std::array<u64, KPC_MAX_COUNTERS> boundary{};
-    bool have_boundary = false;
-    if (state.current_program != nullptr) {
-      if (!ReadThreadCounters(*state.current_program, boundary, frame.error)) {
-        frame.dropped = true;
-        return;
-      }
-      AccumulateBoundary(state, boundary);
-      have_boundary = true;
+    if (frame.requested.count == 0) {
+      frame.active = true;
+      state.active_frames.push_back(&frame);
+      return;
     }
 
-    CounterSet new_union = CurrentUnion(state);
-    new_union = new_union | frame.requested;
-    const std::string new_key = CanonicalCounterSetKey(new_union);
+    if (!EnsureInitialized(frame.error)) {
+      frame.dropped = true;
+      return;
+    }
+    if (!EnsureThreadProgram(state, frame.requested, frame.error)) {
+      frame.dropped = true;
+      return;
+    }
 
-    if (state.current_program == nullptr) {
-      if (!InstallProgram(state, new_union, frame.error)) {
-        frame.dropped = true;
-        return;
+    std::array<u64, KPC_MAX_COUNTERS> current{};
+    if (!ReadThreadCounters(*state.installed_program, current, frame.error)) {
+      frame.dropped = true;
+      return;
+    }
+    for (u8 i = 0; i < frame.requested.count; ++i) {
+      const int slot = LookupCounterSlot(*state.installed_program, frame.requested.items[i]);
+      if (slot >= 0) {
+        frame.start_values[i] = current[static_cast<usize>(slot)];
       }
-    } else if (new_key != state.current_program->key) {
-      if (!InstallProgram(state, new_union, frame.error)) {
-        if (have_boundary) {
-          state.segment_start = boundary;
-        }
-        frame.dropped = true;
-        return;
-      }
-    } else if (have_boundary) {
-      state.segment_start = boundary;
     }
 
     frame.active = true;
@@ -561,121 +589,84 @@ class Backend {
   }
 
   void Exit(ScopeFrame &frame) {
-    const u64 end_ns = NowNs();
+    const u64 end_ticks = NowTicks();
+    if (frame.aggregate == nullptr) {
+      return;
+    }
     if (frame.dropped) {
-      RecordDropped(frame);
+      RecordDropped(*frame.aggregate, frame);
       return;
     }
     if (!frame.active) {
       return;
     }
 
-    ThreadState &state = GetThreadState();
-    if (state.current_program == nullptr) {
-      frame.error = "no active program on scope exit";
-      RecordDropped(frame);
-      return;
+    ThreadState &state = CurrentThreadState();
+    if (!state.active_frames.empty() && state.active_frames.back() == &frame) {
+      state.active_frames.pop_back();
+    } else {
+      auto it = std::find(state.active_frames.begin(), state.active_frames.end(), &frame);
+      if (it != state.active_frames.end()) {
+        state.active_frames.erase(it);
+      }
     }
 
-    std::array<u64, KPC_MAX_COUNTERS> boundary{};
-    if (!ReadThreadCounters(*state.current_program, boundary, frame.error)) {
-      RecordDropped(frame);
-      return;
-    }
-    AccumulateBoundary(state, boundary);
-
-    auto it = std::find(state.active_frames.begin(), state.active_frames.end(), &frame);
-    if (it != state.active_frames.end()) {
-      state.active_frames.erase(it);
-    }
-
-    const u64 wall_ns = end_ns - frame.start_ns;
-    RecordComplete(frame, wall_ns);
-
-    CounterSet remaining = CurrentUnion(state);
-    if (remaining.count == 0) {
-      DisableCounting(state);
-      return;
-    }
-
-    const std::string remaining_key = CanonicalCounterSetKey(remaining);
-    if (remaining_key != state.current_program->key) {
-      std::string restore_error;
-      if (!InstallProgram(state, remaining, restore_error)) {
-        last_error_ = restore_error;
-        DisableCounting(state);
+    std::array<u64, PERF_MAX_SCOPE_EVENTS> deltas{};
+    deltas.fill(0);
+    if (frame.requested.count != 0) {
+      if (state.installed_program == nullptr) {
+        frame.error = "no installed program on scope exit";
+        RecordDropped(*frame.aggregate, frame);
         return;
       }
-    } else {
-      state.segment_start = boundary;
+      std::array<u64, KPC_MAX_COUNTERS> current{};
+      if (!ReadThreadCounters(*state.installed_program, current, frame.error)) {
+        RecordDropped(*frame.aggregate, frame);
+        return;
+      }
+      for (u8 i = 0; i < frame.requested.count; ++i) {
+        const int slot = LookupCounterSlot(*state.installed_program, frame.requested.items[i]);
+        if (slot >= 0) {
+          deltas[i] = current[static_cast<usize>(slot)] - frame.start_values[i];
+        }
+      }
     }
-  }
 
-  struct PointSnapshot {
-    CounterSet set{};
-    std::array<u64, PERF_MAX_SCOPE_EVENTS> values{};
-    u8 count = 0;
-    bool valid = false;
-    std::string error;
-  };
+    RecordComplete(*frame.aggregate, frame, end_ticks - frame.start_ticks, deltas);
+  }
 
   PointSnapshot CapturePoint(const CounterSet &requested) {
     PointSnapshot snapshot;
     snapshot.set = requested;
     snapshot.count = requested.count;
-    if (!EnsureInitialized(snapshot.error)) {
-      return snapshot;
-    }
     if (requested.overflow) {
       snapshot.error = "requested counter set exceeds PERF_MAX_SCOPE_EVENTS";
       return snapshot;
     }
-
-    ThreadState &state = GetThreadState();
-    std::array<u64, KPC_MAX_COUNTERS> current{};
-    if (state.current_program != nullptr && IsSubset(requested, state.current_program->set)) {
-      if (!ReadThreadCounters(*state.current_program, current, snapshot.error)) {
-        return snapshot;
-      }
-      for (u8 i = 0; i < requested.count; ++i) {
-        const int slot = LookupCounterSlot(*state.current_program, requested.items[i]);
-        if (slot >= 0) {
-          snapshot.values[i] = current[static_cast<usize>(slot)];
-        }
-      }
+    if (requested.count == 0) {
       snapshot.valid = true;
       return snapshot;
     }
-
-    if (!state.active_frames.empty()) {
-      snapshot.error =
-          "PerfPoint capture requires the requested counters to be a subset of the active scope union";
+    if (!EnsureInitialized(snapshot.error)) {
       return snapshot;
     }
 
-    Program *saved_program = state.current_program;
-    std::array<u64, KPC_MAX_COUNTERS> saved_segment = state.segment_start;
-    std::string error;
-    if (!InstallProgram(state, requested, error)) {
-      snapshot.error = error;
+    ThreadState &state = CurrentThreadState();
+    if (!EnsureThreadProgram(state, requested, snapshot.error)) {
       return snapshot;
     }
-    if (!ReadThreadCounters(*state.current_program, current, snapshot.error)) {
-      DisableCounting(state);
-      state.current_program = saved_program;
-      state.segment_start = saved_segment;
+
+    std::array<u64, KPC_MAX_COUNTERS> current{};
+    if (!ReadThreadCounters(*state.installed_program, current, snapshot.error)) {
       return snapshot;
     }
     for (u8 i = 0; i < requested.count; ++i) {
-      const int slot = LookupCounterSlot(*state.current_program, requested.items[i]);
+      const int slot = LookupCounterSlot(*state.installed_program, requested.items[i]);
       if (slot >= 0) {
         snapshot.values[i] = current[static_cast<usize>(slot)];
       }
     }
     snapshot.valid = true;
-    DisableCounting(state);
-    state.current_program = saved_program;
-    state.segment_start = saved_segment;
     return snapshot;
   }
 
@@ -697,12 +688,23 @@ class Backend {
   bool initialized_ = false;
   bool attempted_ = false;
   std::string init_error_;
-  std::string last_error_;
   std::mutex mutex_;
   std::unordered_map<std::string, Program> programs_;
-  std::unordered_map<std::string, Aggregate> aggregates_;
+  std::vector<ThreadState *> thread_states_;
 
   Backend() = default;
+
+  static ThreadState &CurrentThreadState() {
+    thread_local ThreadState *state = Instance().AllocateThreadState();
+    return *state;
+  }
+
+  ThreadState *AllocateThreadState() {
+    std::scoped_lock lock(mutex_);
+    ThreadState *state = new ThreadState();
+    thread_states_.push_back(state);
+    return state;
+  }
 
   bool EnsureInitialized(std::string &error) {
     std::scoped_lock lock(mutex_);
@@ -732,14 +734,6 @@ class Backend {
     return true;
   }
 
-  CounterSet CurrentUnion(const ThreadState &state) const {
-    CounterSet set;
-    for (const ScopeFrame *frame : state.active_frames) {
-      set = set | frame->requested;
-    }
-    return set;
-  }
-
   static int LookupCounterSlot(const Program &program, Counter counter) {
     for (u8 i = 0; i < program.set.count; ++i) {
       if (program.set.items[i] == counter) {
@@ -759,23 +753,6 @@ class Backend {
       return false;
     }
     return true;
-  }
-
-  void AccumulateBoundary(ThreadState &state,
-                          const std::array<u64, KPC_MAX_COUNTERS> &boundary_counters) {
-    if (state.current_program == nullptr) {
-      return;
-    }
-    for (ScopeFrame *frame : state.active_frames) {
-      for (u8 i = 0; i < frame->requested.count; ++i) {
-        const int slot = LookupCounterSlot(*state.current_program, frame->requested.items[i]);
-        if (slot >= 0) {
-          frame->totals[i] +=
-              boundary_counters[static_cast<usize>(slot)] - state.segment_start[slot];
-        }
-      }
-    }
-    state.segment_start = boundary_counters;
   }
 
   bool BuildProgram(const CounterSet &set, Program &program, std::string &error) {
@@ -899,7 +876,7 @@ class Backend {
         ++next_raw_slot;
       }
       if (next_raw_slot >= static_cast<int>(program.active_count)) {
-        error = "too many simultaneous configurable counters in one scope or nested union";
+        error = "too many simultaneous configurable counters in installed thread set";
         return false;
       }
       program.regs[static_cast<usize>(next_raw_slot)] = counter.raw_config;
@@ -933,7 +910,8 @@ class Backend {
 
   bool InstallProgram(ThreadState &state, const CounterSet &set, std::string &error) {
     if (set.count == 0) {
-      DisableCounting(state);
+      state.installed_program = nullptr;
+      state.installed_set = {};
       return true;
     }
     Program *program = GetOrBuildProgram(set, error);
@@ -952,60 +930,72 @@ class Backend {
       error = "failed to enable counting";
       return false;
     }
-    std::array<u64, KPC_MAX_COUNTERS> baseline{};
-    if (!ReadThreadCounters(*program, baseline, error)) {
-      return false;
-    }
-    state.current_program = program;
-    state.segment_start = baseline;
+    state.installed_program = program;
+    state.installed_set = set;
     return true;
   }
 
-  void DisableCounting(ThreadState &state) {
-    api_.kpc_set_thread_counting(0);
-    api_.kpc_set_counting(0);
-    state.current_program = nullptr;
-    state.segment_start.fill(0);
+  bool EnsureThreadProgram(ThreadState &state, const CounterSet &requested, std::string &error) {
+    if (requested.count == 0) {
+      return true;
+    }
+    if (state.installed_program == nullptr) {
+      return InstallProgram(state, requested, error);
+    }
+    if (IsSubset(requested, state.installed_set)) {
+      return true;
+    }
+    if (!state.active_frames.empty()) {
+      error =
+          "requested counters are not a subset of this thread's installed counter set; prime a superset before nested use";
+      return false;
+    }
+    CounterSet widened = state.installed_set | requested;
+    if (widened.overflow) {
+      error = "too many simultaneous configurable counters in installed thread set";
+      return false;
+    }
+    return InstallProgram(state, widened, error);
   }
 
-  void RecordDropped(const ScopeFrame &frame) {
-    std::scoped_lock lock(mutex_);
-    const std::string key = AggregateKey(frame.label, frame.requested, frame.thresholds);
-    Aggregate &aggregate = aggregates_[key];
-    if (aggregate.label.empty()) {
-      aggregate.label = frame.label;
-      aggregate.set = frame.requested;
-      aggregate.sample_every = frame.sample_every;
-      for (u8 i = 0; i < frame.requested.count; ++i) {
-        aggregate.counter_names.push_back(CounterName(frame.requested.items[i]));
-      }
-      aggregate.thresholds = frame.thresholds;
+  Aggregate &GetOrCreateAggregate(ThreadState &state, std::string_view label,
+                                  const CounterSet &set, const std::vector<Threshold> &thresholds,
+                                  u32 sample_every) {
+    std::ostringstream key_builder;
+    key_builder << label << "::" << CanonicalCounterSetKey(set) << "::" << sample_every << "::";
+    for (const Threshold &threshold : thresholds) {
+      key_builder << CounterId(threshold.counter) << "<=" << threshold.max_value << '|';
     }
+    const std::string key = key_builder.str();
+
+    auto [it, inserted] = state.aggregates.try_emplace(key);
+    Aggregate &aggregate = it->second;
+    if (inserted) {
+      aggregate.label = std::string(label);
+      aggregate.set = set;
+      aggregate.sample_every = sample_every;
+      aggregate.thresholds = thresholds;
+      for (u8 i = 0; i < set.count; ++i) {
+        aggregate.counter_names.push_back(CounterName(set.items[i]));
+      }
+    }
+    return aggregate;
+  }
+
+  static void RecordDropped(Aggregate &aggregate, const ScopeFrame &frame) {
     ++aggregate.dropped_count;
     aggregate.last_error = frame.error;
   }
 
-  void RecordComplete(const ScopeFrame &frame, u64 wall_ns) {
-    std::scoped_lock lock(mutex_);
-    const std::string key = AggregateKey(frame.label, frame.requested, frame.thresholds);
-    Aggregate &aggregate = aggregates_[key];
-    if (aggregate.label.empty()) {
-      aggregate.label = frame.label;
-      aggregate.set = frame.requested;
-      aggregate.sample_every = frame.sample_every;
-      for (u8 i = 0; i < frame.requested.count; ++i) {
-        aggregate.counter_names.push_back(CounterName(frame.requested.items[i]));
-      }
-      aggregate.thresholds = frame.thresholds;
-    }
-
+  static void RecordComplete(Aggregate &aggregate, const ScopeFrame &frame, u64 wall_ticks,
+                             const std::array<u64, PERF_MAX_SCOPE_EVENTS> &deltas) {
     ++aggregate.sampled_count;
-    aggregate.total_wall_ns += wall_ns;
-    aggregate.min_wall_ns = std::min(aggregate.min_wall_ns, wall_ns);
-    aggregate.max_wall_ns = std::max(aggregate.max_wall_ns, wall_ns);
+    aggregate.total_wall_ticks += wall_ticks;
+    aggregate.min_wall_ticks = std::min(aggregate.min_wall_ticks, wall_ticks);
+    aggregate.max_wall_ticks = std::max(aggregate.max_wall_ticks, wall_ticks);
 
     for (u8 i = 0; i < frame.requested.count; ++i) {
-      const u64 value = frame.totals[i];
+      const u64 value = deltas[i];
       aggregate.total_counters[i] += value;
       aggregate.min_counters[i] = std::min(aggregate.min_counters[i], value);
       aggregate.max_counters[i] = std::max(aggregate.max_counters[i], value);
@@ -1013,18 +1003,57 @@ class Backend {
 
     for (const Threshold &threshold : frame.thresholds) {
       for (u8 i = 0; i < frame.requested.count; ++i) {
-        if (frame.requested.items[i] == threshold.counter && frame.totals[i] > threshold.max_value) {
+        if (frame.requested.items[i] == threshold.counter && deltas[i] > threshold.max_value) {
           ++aggregate.threshold_violations;
         }
       }
     }
   }
 
+  static void MergeAggregate(Aggregate &dst, const Aggregate &src) {
+    if (dst.label.empty()) {
+      dst = src;
+      return;
+    }
+    dst.sampled_count += src.sampled_count;
+    dst.dropped_count += src.dropped_count;
+    dst.total_wall_ticks += src.total_wall_ticks;
+    if (src.sampled_count != 0) {
+      dst.min_wall_ticks = std::min(dst.min_wall_ticks, src.min_wall_ticks);
+      dst.max_wall_ticks = std::max(dst.max_wall_ticks, src.max_wall_ticks);
+    }
+    for (u8 i = 0; i < dst.set.count; ++i) {
+      dst.total_counters[i] += src.total_counters[i];
+      if (src.sampled_count != 0) {
+        dst.min_counters[i] = std::min(dst.min_counters[i], src.min_counters[i]);
+        dst.max_counters[i] = std::max(dst.max_counters[i], src.max_counters[i]);
+      }
+    }
+    dst.threshold_violations += src.threshold_violations;
+    if (!src.last_error.empty()) {
+      dst.last_error = src.last_error;
+    }
+  }
+
+  static u64 TicksToNs(u64 ticks) {
+    static const mach_timebase_info_data_t timebase = [] {
+      mach_timebase_info_data_t info{};
+      mach_timebase_info(&info);
+      return info;
+    }();
+    return static_cast<u64>((static_cast<__uint128_t>(ticks) * timebase.numer) / timebase.denom);
+  }
+
   void DumpJsonl() {
     std::unordered_map<std::string, Aggregate> snapshot;
     {
       std::scoped_lock lock(mutex_);
-      snapshot = aggregates_;
+      for (ThreadState *state : thread_states_) {
+        for (const auto &entry : state->aggregates) {
+          Aggregate &merged = snapshot[entry.first];
+          MergeAggregate(merged, entry.second);
+        }
+      }
     }
     if (snapshot.empty()) {
       return;
@@ -1061,11 +1090,12 @@ class Backend {
       (*out) << ",\"sampled_count\":" << aggregate.sampled_count;
       (*out) << ",\"dropped_count\":" << aggregate.dropped_count;
       if (aggregate.sampled_count != 0) {
-        (*out) << ",\"wall_ns\":{\"total\":" << aggregate.total_wall_ns
-               << ",\"min\":" << aggregate.min_wall_ns << ",\"max\":" << aggregate.max_wall_ns
-               << ",\"mean\":"
-               << static_cast<double>(aggregate.total_wall_ns) /
-                      static_cast<double>(aggregate.sampled_count)
+        const u64 total_ns = TicksToNs(aggregate.total_wall_ticks);
+        const u64 min_ns = TicksToNs(aggregate.min_wall_ticks);
+        const u64 max_ns = TicksToNs(aggregate.max_wall_ticks);
+        (*out) << ",\"wall_ns\":{\"total\":" << total_ns << ",\"min\":" << min_ns
+               << ",\"max\":" << max_ns << ",\"mean\":"
+               << static_cast<double>(total_ns) / static_cast<double>(aggregate.sampled_count)
                << '}';
       }
 
@@ -1088,7 +1118,6 @@ class Backend {
         (*out) << '}';
       }
       (*out) << ']';
-
       (*out) << ",\"threshold_violations\":" << aggregate.threshold_violations;
       if (!aggregate.last_error.empty()) {
         (*out) << ",\"last_error\":\"" << JsonEscape(aggregate.last_error) << '"';
@@ -1117,7 +1146,7 @@ class PerfScope {
     frame_.label = label_;
     frame_.requested = counters_;
     frame_.sample_every = sample_every_;
-    frame_.thresholds.assign(thresholds_.begin(), thresholds_.end());
+    frame_.thresholds.assign(thresholds.begin(), thresholds.end());
     detail::Backend::Instance().Enter(frame_);
     active_ = frame_.active || frame_.dropped;
   }
@@ -1202,6 +1231,15 @@ class PerfPoint {
   detail::Backend::PointSnapshot snapshot_{};
 };
 
+inline bool PrimeThread(CounterSet counters, std::string *error = nullptr) {
+  std::string local_error;
+  const bool ok = detail::Backend::Instance().PrimeThread(counters, local_error);
+  if (error != nullptr) {
+    *error = local_error;
+  }
+  return ok;
+}
+
 }  // namespace perf
 
 using PerfScope = perf::PerfScope;
@@ -1225,6 +1263,9 @@ inline constexpr auto L2_TLB_MISS = perf::L2_TLB_MISS;
 inline constexpr auto L2_MISS = perf::L2_MISS;
 inline constexpr auto RawEvent = perf::RawEvent;
 inline constexpr auto MaxThreshold = perf::MaxThreshold;
+inline bool PerfPrimeThread(PerfCounterSet counters, std::string *error = nullptr) {
+  return perf::PrimeThread(counters, error);
+}
 
 #else
 
@@ -1294,6 +1335,8 @@ class PerfPoint {
   friend PerfPointDelta operator-(const PerfPoint &, const PerfPoint &) { return PerfPointDelta{}; }
 };
 
+inline bool PrimeThread(CounterSet, std::string * = nullptr) { return true; }
+
 }  // namespace perf
 
 using PerfScope = perf::PerfScope;
@@ -1317,6 +1360,9 @@ inline constexpr auto L2_TLB_MISS = perf::L2_TLB_MISS;
 inline constexpr auto L2_MISS = perf::L2_MISS;
 inline constexpr auto RawEvent = perf::RawEvent;
 inline constexpr auto MaxThreshold = perf::MaxThreshold;
+inline bool PerfPrimeThread(PerfCounterSet counters, std::string *error = nullptr) {
+  return perf::PrimeThread(counters, error);
+}
 
 #endif
 

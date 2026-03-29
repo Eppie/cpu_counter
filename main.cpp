@@ -42,6 +42,13 @@ void HotLoop(std::vector<std::uint64_t> &values) {
 int main() {
   std::cout << "perf.h example; output defaults to perf.jsonl or $PERF_OUTPUT\n";
 
+  std::string prime_error;
+  const auto thread_counters =
+      CYCLES | INSTRUCTIONS | L1_MISS | DTLB_MISS | L1_LOAD_MISS | TLB_MISS | BRANCH_MISS;
+  if (!PerfPrimeThread(thread_counters, &prime_error)) {
+    std::cout << "PerfPrimeThread failed: " << prime_error << '\n';
+  }
+
   std::vector<std::uint64_t> mix_buffer(1 << 18, 1);
   std::vector<std::uint64_t> coeffs = {3, 5, 7, 11, 13, 17, 19, 23};
   std::vector<std::uint32_t> ring(1 << 20);
