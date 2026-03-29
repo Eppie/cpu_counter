@@ -48,45 +48,35 @@ Useful flags:
 - `--allow-migration`: accept migrated samples again
 - `--scan-cpus`: run a compact per-CPU sweep with representative workloads to see which logical CPUs produce live counts
 
-The current binary is an issue-focused memory-counter suite. It reprograms the configurable PMCs at runtime, fixes the raw-slot versus packed-counter indexing issue in the readout path, and temporarily disables the known-good passes so the output stays concentrated on the remaining inconsistencies.
+The current binary is a cache/TLB/I-side expansion suite. It reprograms the configurable PMCs at runtime and currently focuses on the remaining memory-side nonspec counters plus instruction-side cache/TLB counters.
 
 - scalar streaming reads
-- alternate scalar streaming reads compiled `optnone`
-- explicit NEON streaming reads
-- page-stride reads
-- alternate page-stride reads compiled `optnone`
+- random pointer chasing
 - scalar streaming writes
-- explicit NEON streaming writes
 - random page writes
-- alternate random page writes compiled `optnone`
-- aligned vs 64-byte-split loads/stores
-- aligned vs page-crossing loads/stores
-- alternate cross-page stores compiled `optnone`
+- hot-code loop for low instruction-side pressure
+- sequential executable-page sweep
+- randomized executable-page sweep
 
 The suite is intentionally split into multiple passes because Apple only exposes a small number of configurable PMCs at once, and some event combinations interact badly. The current focused groups are:
 
-- translation with and without `INST_LDST`, to check whether `INST_LDST` is what poisons page-stride and random-page-write samples
-- scalar stream debug:
-  - `INST_INT_LD`
-  - `LD_UNIT_UOP`
+- extra L1D cache counters:
   - `L1D_CACHE_MISS_LD`
-  - `L1D_TLB_MISS`
-  - `MMU_TABLE_WALK_DATA`
-- SIMD stream debug:
-  - `INST_SIMD_LD`
-  - `LD_UNIT_UOP`
-  - `L1D_CACHE_MISS_LD`
-- deeper translation counters:
+  - `L1D_CACHE_MISS_LD_NONSPEC`
+  - `L1D_CACHE_MISS_ST`
+  - `L1D_CACHE_MISS_ST_NONSPEC`
+- extra DTLB counters:
+  - `L1D_TLB_ACCESS`
   - `L1D_TLB_FILL`
-  - `L2_TLB_MISS_DATA`
-- separate scalar and SIMD store passes:
-  - scalar stores avoid the `INST_LDST` + `INST_INT_ST` conflict
-  - SIMD stores are measured in their own pass
-- split-boundary diagnostics:
-  - `LDST_X64_UOP`
-  - `LDST_XPG_UOP`
-- store-path diagnostics:
-  - `L1D_CACHE_WRITEBACK`
+  - `L1D_TLB_MISS`
+  - `L1D_TLB_MISS_NONSPEC`
+  - `MMU_TABLE_WALK_DATA`
+- instruction-side counters:
+  - `L1I_CACHE_MISS_DEMAND`
+  - `L1I_TLB_FILL`
+  - `L1I_TLB_MISS_DEMAND`
+  - `L2_TLB_MISS_INSTRUCTION`
+  - `MMU_TABLE_WALK_INSTRUCTION`
 
 Notes:
 
@@ -96,6 +86,7 @@ Notes:
 - There is no clean public macOS API here for exact logical-CPU pinning. The new `--prefer-pcore` and `--prefer-ecore` modes are best-effort:
   - they bias scheduling through thread QoS
   - they filter accepted samples by the heuristic logical-CPU ranges derived from `hw.perflevel*`
+- Instruction-side workloads use generated executable stubs in an RX mapping. A standalone local smoke test confirmed that the `mmap` + `mprotect(PROT_EXEC)` + `sys_icache_invalidate()` path works on this host.
 - If a requested event group cannot be programmed together on this machine, the tool prints that group as skipped and continues with the rest of the suite.
 - `LDST_X64_UOP` is a 64-byte split-access counter. On this M4 Max, `hw.cachelinesize` is `128`, so the X64 workloads are about 64-byte boundaries, not full L1 cache lines.
 - Each benchmark sample now records the current CPU before and after the workload so scheduler migration can be correlated with suspicious all-zero measurements.

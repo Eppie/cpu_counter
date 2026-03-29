@@ -1,11 +1,14 @@
 #include <arm_neon.h>
 #include <dlfcn.h>
+#include <libkern/OSCacheControl.h>
 #include <pthread/qos.h>
+#include <sys/mman.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <chrono>
 #include <cctype>
 #include <cstdint>
@@ -23,6 +26,7 @@
 #include <vector>
 
 using u8 = std::uint8_t;
+using u16 = std::uint16_t;
 using u32 = std::uint32_t;
 using u64 = std::uint64_t;
 using usize = std::size_t;
@@ -527,8 +531,15 @@ std::vector<usize> BuildShuffledSequence(usize count, u64 seed) {
   return order;
 }
 
+u32 EncodeMovzX0(u16 imm16) {
+  return 0xD2800000u | (static_cast<u32>(imm16) << 5);
+}
+
 struct MemoryBenchState {
+  using ExecStub = u64 (*)(void);
+
   usize page_size = 0;
+  std::string error_message;
   std::vector<u32> hot_ring;
   std::vector<u32> random_ring;
   std::vector<u64> stream_read;
@@ -544,14 +555,27 @@ struct MemoryBenchState {
   u64 *line_base = nullptr;
   usize line_count = 0;
 
+  u8 *exec_code = nullptr;
+  usize exec_bytes = 0;
+  usize exec_page_count = 0;
+  std::vector<usize> exec_page_order;
+
+  ~MemoryBenchState() {
+    if (exec_code != nullptr && exec_bytes != 0) {
+      ::munmap(exec_code, exec_bytes);
+    }
+  }
+
   bool Initialize() {
     page_size = static_cast<usize>(::getpagesize());
+    error_message.clear();
 
     constexpr usize kHotBytes = 32 * 1024;
     constexpr usize kStreamBytes = 64 * 1024 * 1024;
     constexpr usize kRandomRingBytes = 32 * 1024 * 1024;
     constexpr usize kPageWorkingSetBytes = 64 * 1024 * 1024;
     constexpr usize kLineWorkingSetBytes = 16 * 1024 * 1024;
+    constexpr usize kExecWorkingSetBytes = 64 * 1024 * 1024;
 
     hot_ring = BuildSequentialRing(kHotBytes / sizeof(u32));
     random_ring = BuildRandomRing(kRandomRingBytes / sizeof(u32), 0x5a17d3b9ULL);
@@ -593,10 +617,42 @@ struct MemoryBenchState {
       *cross = static_cast<u32>(line * 11);
     }
 
+    exec_page_count = kExecWorkingSetBytes / page_size;
+    exec_page_order = BuildShuffledSequence(exec_page_count, 0xa11ce5eedULL);
+    exec_bytes = exec_page_count * page_size;
+    void *mapping =
+        ::mmap(nullptr, exec_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (mapping == MAP_FAILED) {
+      error_message = std::string("mmap executable working set failed: ") + std::strerror(errno);
+      exec_code = nullptr;
+      exec_bytes = 0;
+      return false;
+    }
+    exec_code = static_cast<u8 *>(mapping);
+    for (usize page = 0; page < exec_page_count; ++page) {
+      u32 *stub = reinterpret_cast<u32 *>(exec_code + page * page_size);
+      stub[0] = EncodeMovzX0(static_cast<u16>((page + 1) & 0xffffu));
+      stub[1] = 0xD65F03C0u;  // ret
+    }
+    sys_icache_invalidate(exec_code, exec_bytes);
+    if (::mprotect(exec_code, exec_bytes, PROT_READ | PROT_EXEC) != 0) {
+      error_message =
+          std::string("mprotect(PROT_EXEC) for instruction working set failed: ") +
+          std::strerror(errno);
+      ::munmap(exec_code, exec_bytes);
+      exec_code = nullptr;
+      exec_bytes = 0;
+      return false;
+    }
+
     return true;
   }
 
   usize PageWords() const { return page_size / sizeof(u64); }
+
+  ExecStub ExecStubAt(usize page) const {
+    return reinterpret_cast<ExecStub>(exec_code + page * page_size);
+  }
 };
 
 [[gnu::noinline]] u64 HotSequentialRead(MemoryBenchState &state) {
@@ -918,6 +974,41 @@ struct MemoryBenchState {
       reinterpret_cast<u8 *>(state.page_base) + state.page_size - sizeof(u32));
   g_sink += sample;
   return sample;
+}
+
+[[gnu::noinline]] u64 HotInstructionLoop(MemoryBenchState &state) {
+  const auto fn = state.ExecStubAt(0);
+  u64 sum = 0;
+  constexpr usize kCalls = 32'000'000;
+  for (usize i = 0; i < kCalls; ++i) {
+    sum += fn();
+  }
+  g_sink ^= sum;
+  return sum;
+}
+
+[[gnu::noinline]] u64 SequentialInstructionPageSweep(MemoryBenchState &state) {
+  u64 sum = 0;
+  constexpr usize kPasses = 128;
+  for (usize pass = 0; pass < kPasses; ++pass) {
+    for (usize page = 0; page < state.exec_page_count; ++page) {
+      sum += state.ExecStubAt(page)();
+    }
+  }
+  g_sink += sum;
+  return sum;
+}
+
+[[gnu::noinline]] u64 RandomInstructionPageSweep(MemoryBenchState &state) {
+  u64 sum = 0;
+  constexpr usize kPasses = 128;
+  for (usize pass = 0; pass < kPasses; ++pass) {
+    for (usize page : state.exec_page_order) {
+      sum += state.ExecStubAt(page)();
+    }
+  }
+  g_sink += sum;
+  return sum;
 }
 
 struct WorkloadDefinition {
@@ -1288,16 +1379,30 @@ void PrintDerivedMetrics(const CounterProgram &program, const SampleResult &resu
   if (const auto load_miss = FindEventDelta(program, result, "L1D_CACHE_MISS_LD")) {
     append_ratio("l1d_load_miss_per_kldst", *load_miss, ldst);
   }
+  if (const auto load_miss_nonspec =
+          FindEventDelta(program, result, "L1D_CACHE_MISS_LD_NONSPEC")) {
+    append_ratio("l1d_load_miss_nonspec_per_kldst", *load_miss_nonspec, ldst);
+  }
   if (const auto store_miss = FindEventDelta(program, result, "L1D_CACHE_MISS_ST")) {
     append_ratio("l1d_store_miss_per_kldst", *store_miss, ldst);
+  }
+  if (const auto store_miss_nonspec =
+          FindEventDelta(program, result, "L1D_CACHE_MISS_ST_NONSPEC")) {
+    append_ratio("l1d_store_miss_nonspec_per_kldst", *store_miss_nonspec, ldst);
   }
   if (const auto load_miss = FindEventDelta(program, result, "L1D_CACHE_MISS_LD")) {
     if (const auto store_miss = FindEventDelta(program, result, "L1D_CACHE_MISS_ST")) {
       append_ratio("l1d_total_miss_per_kldst", *load_miss + *store_miss, ldst);
     }
   }
+  const auto dtlb_access = FindEventDelta(program, result, "L1D_TLB_ACCESS");
   if (const auto dtlb_miss = FindEventDelta(program, result, "L1D_TLB_MISS")) {
     append_ratio("dtlb_miss_per_kldst", *dtlb_miss, ldst);
+    append_ratio("dtlb_miss_per_kaccess", *dtlb_miss, dtlb_access);
+  }
+  if (const auto dtlb_miss_nonspec =
+          FindEventDelta(program, result, "L1D_TLB_MISS_NONSPEC")) {
+    append_ratio("dtlb_miss_nonspec_per_kaccess", *dtlb_miss_nonspec, dtlb_access);
   }
   if (const auto l2_dtlb_miss = FindEventDelta(program, result, "L2_TLB_MISS_DATA")) {
     append_ratio("l2_dtlb_miss_per_kldst", *l2_dtlb_miss, ldst);
@@ -1325,6 +1430,20 @@ void PrintDerivedMetrics(const CounterProgram &program, const SampleResult &resu
   }
   if (const auto xpg = FindEventDelta(program, result, "LDST_XPG_UOP")) {
     append_ratio("xpg_cross_per_kldst", *xpg, ldst);
+  }
+  if (const auto l1i_miss = FindEventDelta(program, result, "L1I_CACHE_MISS_DEMAND")) {
+    append_ratio("l1i_miss_per_kinst", *l1i_miss, instructions);
+  }
+  if (const auto itlb_miss = FindEventDelta(program, result, "L1I_TLB_MISS_DEMAND")) {
+    append_ratio("itlb_miss_per_kinst", *itlb_miss, instructions);
+  }
+  if (const auto l2_itlb_miss =
+          FindEventDelta(program, result, "L2_TLB_MISS_INSTRUCTION")) {
+    append_ratio("l2_itlb_miss_per_kinst", *l2_itlb_miss, instructions);
+  }
+  if (const auto instruction_walk =
+          FindEventDelta(program, result, "MMU_TABLE_WALK_INSTRUCTION")) {
+    append_ratio("itlb_walk_per_kinst", *instruction_walk, instructions);
   }
   std::cout << '\n';
 }
@@ -1563,11 +1682,15 @@ int main(int argc, char **argv) {
 
   MemoryBenchState state;
   if (!state.Initialize()) {
-    std::cerr << "failed to initialize benchmark state\n";
+    std::cerr << "failed to initialize benchmark state";
+    if (!state.error_message.empty()) {
+      std::cerr << ": " << state.error_message;
+    }
+    std::cerr << '\n';
     return 1;
   }
 
-  [[maybe_unused]] const WorkloadDefinition hot_seq_read{
+  const WorkloadDefinition hot_seq_read{
       "hot_seq_read",
       "32 KiB dependent load ring that stays resident in L1D and should show very low data-cache and DTLB miss pressure.",
       &HotSequentialRead,
@@ -1592,7 +1715,7 @@ int main(int argc, char **argv) {
       "64 MiB explicit NEON read stream so INST_SIMD_LD lights up without relying on auto-vectorization.",
       &StreamingReadSimd,
   };
-  [[maybe_unused]] const WorkloadDefinition random_read{
+  const WorkloadDefinition random_read{
       "random_pointer_chase",
       "32 MiB random dependent load chain that should drive high L1D miss rates and poor prefetch behavior.",
       &RandomPointerChase,
@@ -1672,6 +1795,21 @@ int main(int argc, char **argv) {
       "Same cross-page store pattern, but compiled optnone to keep the generated store sequence simple.",
       &CrossPageStoreDebug,
   };
+  const WorkloadDefinition hot_exec{
+      "hot_instruction_loop",
+      "Call the same tiny executable stub repeatedly so instruction-cache and ITLB miss rates stay near zero.",
+      &HotInstructionLoop,
+  };
+  const WorkloadDefinition seq_exec{
+      "sequential_instruction_pages",
+      "Call one tiny executable stub per page across 64 MiB in increasing page order to stress the instruction-side cache and ITLB.",
+      &SequentialInstructionPageSweep,
+  };
+  const WorkloadDefinition random_exec{
+      "random_instruction_pages",
+      "Call one tiny executable stub per page across 64 MiB in randomized page order to maximize instruction-side cache and ITLB pressure.",
+      &RandomInstructionPageSweep,
+  };
 
   const EventGroupDefinition translation_with_ldst_group{
       "translation_with_ldst",
@@ -1684,7 +1822,7 @@ int main(int argc, char **argv) {
           "MMU_TABLE_WALK_DATA",
       },
   };
-  const EventGroupDefinition translation_raw_group{
+  [[maybe_unused]] const EventGroupDefinition translation_raw_group{
       "translation_raw",
       "Same translation counters without INST_LDST, to test whether INST_LDST is what poisons page-stride and random-page-write samples.",
       {
@@ -1728,7 +1866,7 @@ int main(int argc, char **argv) {
           "L1D_TLB_MISS",
       },
   };
-  const EventGroupDefinition store_simd_group{
+  [[maybe_unused]] const EventGroupDefinition store_simd_group{
       "store_simd",
       "Explicit-NEON store path separated from scalar stores so SIMD store counters can be observed without INST_INT_ST conflicts.",
       {
@@ -1739,7 +1877,7 @@ int main(int argc, char **argv) {
           "L1D_TLB_MISS",
       },
   };
-  const EventGroupDefinition crossing_load_group{
+  [[maybe_unused]] const EventGroupDefinition crossing_load_group{
       "crossing_load_debug",
       "Load-only split-boundary group. ST_UNIT_UOP is removed so the previously all-zero load cases can be checked in isolation.",
       {
@@ -1750,7 +1888,7 @@ int main(int argc, char **argv) {
           nullptr,
       },
   };
-  const EventGroupDefinition crossing_store_group{
+  [[maybe_unused]] const EventGroupDefinition crossing_store_group{
       "crossing_store_debug",
       "Store-only split-boundary group, with an optnone cross-page variant to check whether the old zero results were caused by code shape.",
       {
@@ -1761,43 +1899,93 @@ int main(int argc, char **argv) {
           nullptr,
       },
   };
+  const EventGroupDefinition data_cache_extra_group{
+      "data_cache_extra",
+      "Extra L1D cache counters, including the non-speculative load/store miss variants.",
+      {
+          "INST_LDST",
+          "L1D_CACHE_MISS_LD",
+          "L1D_CACHE_MISS_LD_NONSPEC",
+          "L1D_CACHE_MISS_ST",
+          "L1D_CACHE_MISS_ST_NONSPEC",
+      },
+  };
+  const EventGroupDefinition data_tlb_extra_group{
+      "data_tlb_extra",
+      "Extra DTLB counters, including DTLB access counts and the non-speculative miss variant.",
+      {
+          "L1D_TLB_ACCESS",
+          "L1D_TLB_FILL",
+          "L1D_TLB_MISS",
+          "L1D_TLB_MISS_NONSPEC",
+          "MMU_TABLE_WALK_DATA",
+      },
+  };
+  const EventGroupDefinition instruction_side_group{
+      "instruction_side",
+      "Instruction-cache and instruction-TLB counters using hot-code and page-scattered executable stubs.",
+      {
+          "L1I_CACHE_MISS_DEMAND",
+          "L1I_TLB_FILL",
+          "L1I_TLB_MISS_DEMAND",
+          "L2_TLB_MISS_INSTRUCTION",
+          "MMU_TABLE_WALK_INSTRUCTION",
+      },
+  };
 
-  const std::array<const WorkloadDefinition *, 4> translation_focus_workloads = {
+  [[maybe_unused]] const std::array<const WorkloadDefinition *, 4> translation_focus_workloads = {
       &page_read,
       &page_read_debug,
       &random_write,
       &random_write_debug,
   };
-  const std::array<const WorkloadDefinition *, 4> stream_scalar_workloads = {
+  [[maybe_unused]] const std::array<const WorkloadDefinition *, 4> stream_scalar_workloads = {
       &stream_read,
       &stream_read_volatile,
       &stream_read_ptr,
       &simd_stream_read,
   };
-  const std::array<const WorkloadDefinition *, 2> stream_simd_workloads = {
+  [[maybe_unused]] const std::array<const WorkloadDefinition *, 2> stream_simd_workloads = {
       &simd_stream_read,
       &stream_read,
   };
-  const std::array<const WorkloadDefinition *, 3> store_scalar_workloads = {
+  [[maybe_unused]] const std::array<const WorkloadDefinition *, 3> store_scalar_workloads = {
       &stream_write,
       &random_write,
       &random_write_debug,
   };
-  const std::array<const WorkloadDefinition *, 2> store_simd_workloads = {
+  [[maybe_unused]] const std::array<const WorkloadDefinition *, 2> store_simd_workloads = {
       &simd_stream_write,
       &random_write,
   };
-  const std::array<const WorkloadDefinition *, 4> crossing_load_workloads = {
+  [[maybe_unused]] const std::array<const WorkloadDefinition *, 4> crossing_load_workloads = {
       &aligned_line_load,
       &cross_line_load,
       &aligned_page_load,
       &cross_page_load,
   };
-  const std::array<const WorkloadDefinition *, 4> crossing_store_workloads = {
+  [[maybe_unused]] const std::array<const WorkloadDefinition *, 4> crossing_store_workloads = {
       &aligned_line_store,
       &cross_line_store,
       &cross_page_store,
       &cross_page_store_debug,
+  };
+  const std::array<const WorkloadDefinition *, 4> data_cache_extra_workloads = {
+      &stream_read,
+      &random_read,
+      &stream_write,
+      &random_write,
+  };
+  const std::array<const WorkloadDefinition *, 4> data_tlb_extra_workloads = {
+      &hot_seq_read,
+      &page_read,
+      &random_read,
+      &random_write,
+  };
+  const std::array<const WorkloadDefinition *, 3> instruction_side_workloads = {
+      &hot_exec,
+      &seq_exec,
+      &random_exec,
   };
 
   struct SuiteRun {
@@ -1805,15 +1993,10 @@ int main(int argc, char **argv) {
     std::span<const WorkloadDefinition *const> workloads;
   };
 
-  const std::array<SuiteRun, 8> suites = {
-      SuiteRun{&translation_with_ldst_group, translation_focus_workloads},
-      SuiteRun{&translation_raw_group, translation_focus_workloads},
-      SuiteRun{&stream_scalar_group, stream_scalar_workloads},
-      SuiteRun{&stream_simd_group, stream_simd_workloads},
-      SuiteRun{&store_scalar_group, store_scalar_workloads},
-      SuiteRun{&store_simd_group, store_simd_workloads},
-      SuiteRun{&crossing_load_group, crossing_load_workloads},
-      SuiteRun{&crossing_store_group, crossing_store_workloads},
+  const std::array<SuiteRun, 3> suites = {
+      SuiteRun{&data_cache_extra_group, data_cache_extra_workloads},
+      SuiteRun{&data_tlb_extra_group, data_tlb_extra_workloads},
+      SuiteRun{&instruction_side_group, instruction_side_workloads},
   };
 
   if (run_options.scan_cpus) {
@@ -1932,9 +2115,9 @@ int main(int argc, char **argv) {
     return 0;
   }
 
-  std::cout << "\nStarting issue-focused memory counter suite. Known-good passes are temporarily disabled so the run stays short and concentrates on the remaining inconsistencies.\n";
-  std::cout << "Several workloads now have alternate optnone implementations in the same file so compiler-shape effects can be separated from PMU-event interaction problems.\n";
-  std::cout << "LDST_X64_UOP counts 64-byte split accesses; on this machine hw.cachelinesize is 128, so the X64 workloads are about 64-byte boundaries rather than full L1 cache lines.\n";
+  std::cout << "\nStarting cache/TLB/I-side expansion suite. This pass concentrates on the remaining L1D nonspec counters, extra DTLB counters, and the instruction-side counters.\n";
+  std::cout << "Instruction-side measurements use generated executable stubs spread across many pages so L1I and ITLB events have an explicit trigger workload.\n";
+  std::cout << "LDST_X64_UOP counts 64-byte split accesses; on this machine hw.cachelinesize is 128, so any X64 workloads are about 64-byte boundaries rather than full L1 cache lines.\n";
   if (run_options.prefer_cpu.has_value() || run_options.prefer_cpu_range.has_value() ||
       run_options.require_active_pmu) {
     std::cout << "Sampling control:";
