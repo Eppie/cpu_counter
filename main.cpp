@@ -745,36 +745,6 @@ class Profiler {
     return name;
   }
 
-  static std::vector<usize> BuildCounterSlots(const std::vector<usize> &hardware_slots,
-                                              usize fixed_count) {
-    std::vector<usize> configurable_slots;
-    configurable_slots.reserve(hardware_slots.size());
-    for (usize slot : hardware_slots) {
-      if (slot < fixed_count) {
-        continue;
-      }
-      if (std::find(configurable_slots.begin(), configurable_slots.end(), slot) ==
-          configurable_slots.end()) {
-        configurable_slots.push_back(slot);
-      }
-    }
-    std::sort(configurable_slots.begin(), configurable_slots.end());
-
-    std::vector<usize> counter_slots;
-    counter_slots.reserve(hardware_slots.size());
-    for (usize slot : hardware_slots) {
-      if (slot < fixed_count) {
-        counter_slots.push_back(slot);
-        continue;
-      }
-      const auto it =
-          std::lower_bound(configurable_slots.begin(), configurable_slots.end(), slot);
-      counter_slots.push_back(fixed_count +
-                              static_cast<usize>(it - configurable_slots.begin()));
-    }
-    return counter_slots;
-  }
-
   bool BuildProgram(const EventGroupDefinition &group, CounterProgram &program,
                     std::string &error) {
     if (!initialized_) {
@@ -881,7 +851,14 @@ class Profiler {
     program.configurable_count =
         program.active_count > program.fixed_count ? program.active_count - program.fixed_count
                                                    : 0;
-    program.counter_slots = BuildCounterSlots(program.hardware_slots, program.fixed_count);
+    program.counter_slots = program.hardware_slots;
+    for (usize slot : program.counter_slots) {
+      if (slot >= program.active_count) {
+        error = "event map slot " + std::to_string(slot) +
+                " is outside the active counter range";
+        return false;
+      }
+    }
     return true;
   }
 
@@ -1106,6 +1083,12 @@ int main() {
   if (const auto cpu_family = ReadSysctlIntegral<u32>("hw.cpufamily")) {
     std::cout << "hw.cpufamily: " << HexString(*cpu_family) << '\n';
   }
+  if (const auto cache_line = ReadSysctlIntegral<u32>("hw.cachelinesize")) {
+    std::cout << "hw.cachelinesize: " << *cache_line << '\n';
+  }
+  if (const auto page_size = ReadSysctlIntegral<u32>("hw.pagesize")) {
+    std::cout << "hw.pagesize: " << *page_size << '\n';
+  }
 
   Profiler profiler;
   std::string error;
@@ -1187,13 +1170,13 @@ int main() {
       &RandomPageWrite,
   };
   const WorkloadDefinition aligned_line_load{
-      "aligned_cacheline_load",
-      "Load from the start of each cache line as a baseline with almost no cross-64B accesses.",
+      "aligned_x64_load",
+      "Load from the start of each 64-byte region as a baseline with almost no split-64B accesses.",
       &AlignedCacheLineLoad,
   };
   const WorkloadDefinition cross_line_load{
-      "cross_cacheline_load",
-      "Load 8 bytes starting at byte 60 of each cache line so every access crosses a 64B boundary.",
+      "cross_x64_load",
+      "Load 8 bytes starting at byte 60 of each 64-byte region so every access crosses a 64-byte boundary.",
       &CrossCacheLineLoad,
   };
   const WorkloadDefinition aligned_page_load{
@@ -1207,13 +1190,13 @@ int main() {
       &CrossPageLoad,
   };
   const WorkloadDefinition aligned_line_store{
-      "aligned_cacheline_store",
-      "Store to the start of each cache line as a baseline with almost no cross-64B accesses.",
+      "aligned_x64_store",
+      "Store to the start of each 64-byte region as a baseline with almost no split-64B accesses.",
       &AlignedCacheLineStore,
   };
   const WorkloadDefinition cross_line_store{
-      "cross_cacheline_store",
-      "Store 8 bytes starting at byte 60 of each cache line so every store crosses a 64B boundary.",
+      "cross_x64_store",
+      "Store 8 bytes starting at byte 60 of each 64-byte region so every store crosses a 64-byte boundary.",
       &CrossCacheLineStore,
   };
   const WorkloadDefinition cross_page_store{
@@ -1330,6 +1313,7 @@ int main() {
 
   std::cout << "\nStarting memory counter suite. The groups are intentionally split because Apple only gives us a handful of configurable PMCs per pass, and some event combinations clearly interact.\n";
   std::cout << "This revision also separates scalar and explicit-NEON streaming kernels so the load/store instruction-class counters are easier to interpret.\n";
+  std::cout << "LDST_X64_UOP counts 64-byte split accesses; on this machine hw.cachelinesize is 128, so the X64 workloads are about 64-byte boundaries rather than full L1 cache lines.\n";
 
   usize skipped_groups = 0;
   for (const SuiteRun &suite : suites) {

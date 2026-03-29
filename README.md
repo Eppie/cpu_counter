@@ -6,6 +6,7 @@ Current host:
 
 - Chip: `Apple M4 Max`
 - `hw.cpufamily`: `0x17d5b93a`
+- `hw.cachelinesize`: `128`
 - `kpc_cpu_string()`: `cpu_100000c_2_17d5b93a`
 - Local PMU database: `/usr/share/kpep/cpu_100000c_2_17d5b93a.plist -> as4-1.plist`
 
@@ -68,3 +69,4 @@ Notes:
 - This relies on private Apple interfaces, not public SDK APIs.
 - The code stays intentionally direct and single-file so it is easy to keep iterating during reverse engineering.
 - If a requested event group cannot be programmed together on this machine, the tool prints that group as skipped and continues with the rest of the suite.
+- `LDST_X64_UOP` is a 64-byte split-access counter. On this M4 Max, `hw.cachelinesize` is `128`, so the X64 workloads are about 64-byte boundaries, not full L1 cache lines.
