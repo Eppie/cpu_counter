@@ -27,6 +27,19 @@ Run:
 sudo ./cpu_counter
 ```
 
+Optional focused sampling controls:
+
+```sh
+sudo ./cpu_counter --prefer-cpu 14 --max-attempts 25 --require-stable-cpu
+```
+
+Useful flags:
+
+- `--prefer-cpu N`: keep retrying each workload until it runs entirely on CPU `N`
+- `--max-attempts N`: cap retries per workload
+- `--require-stable-cpu`: reject samples that migrate during the measurement window
+- `--allow-migration`: accept migrated samples again
+
 The current binary is an issue-focused memory-counter suite. It reprograms the configurable PMCs at runtime, fixes the raw-slot versus packed-counter indexing issue in the readout path, and temporarily disables the known-good passes so the output stays concentrated on the remaining inconsistencies.
 
 - scalar streaming reads

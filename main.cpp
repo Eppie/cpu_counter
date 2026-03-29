@@ -783,6 +783,12 @@ struct SampleResult {
   int cpu_after = -1;
 };
 
+struct RunOptions {
+  std::optional<int> prefer_cpu;
+  usize max_attempts = 1;
+  bool require_stable_cpu = false;
+};
+
 class Profiler {
  public:
   ~Profiler() {
@@ -1161,6 +1167,98 @@ void PrintSkippedGroup(const EventGroupDefinition &group, const std::string &err
   std::cout << "skipped: " << error << '\n';
 }
 
+void PrintSkippedWorkload(const WorkloadDefinition &workload, usize attempts,
+                          const SampleResult &last_result,
+                          const RunOptions &options) {
+  std::cout << "- workload: " << workload.name << '\n';
+  std::cout << "  " << workload.description << '\n';
+  std::cout << "  skipped after " << attempts << " attempt";
+  if (attempts != 1) {
+    std::cout << 's';
+  }
+  std::cout << ": last cpu_before=" << last_result.cpu_before
+            << " cpu_after=" << last_result.cpu_after;
+  if (options.prefer_cpu.has_value()) {
+    std::cout << " prefer_cpu=" << *options.prefer_cpu;
+  }
+  if (options.require_stable_cpu) {
+    std::cout << " require_stable_cpu=yes";
+  }
+  std::cout << '\n';
+}
+
+bool SampleMatches(const SampleResult &result, const RunOptions &options) {
+  if (options.require_stable_cpu && result.cpu_before != result.cpu_after) {
+    return false;
+  }
+  if (options.prefer_cpu.has_value()) {
+    if (result.cpu_before != *options.prefer_cpu || result.cpu_after != *options.prefer_cpu) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ParsePositiveInt(const char *text, int &value) {
+  if (text == nullptr || text[0] == '\0') {
+    return false;
+  }
+  char *end = nullptr;
+  const long parsed = std::strtol(text, &end, 10);
+  if (end == nullptr || *end != '\0' || parsed < 0 ||
+      parsed > std::numeric_limits<int>::max()) {
+    return false;
+  }
+  value = static_cast<int>(parsed);
+  return true;
+}
+
+bool ParseRunOptions(int argc, char **argv, RunOptions &options, std::string &error) {
+  for (int i = 1; i < argc; ++i) {
+    const std::string_view arg = argv[i];
+    if (arg == "--prefer-cpu") {
+      if (i + 1 >= argc) {
+        error = "--prefer-cpu requires a CPU number";
+        return false;
+      }
+      int cpu = 0;
+      if (!ParsePositiveInt(argv[++i], cpu)) {
+        error = "invalid value for --prefer-cpu";
+        return false;
+      }
+      options.prefer_cpu = cpu;
+      continue;
+    }
+    if (arg == "--max-attempts") {
+      if (i + 1 >= argc) {
+        error = "--max-attempts requires a positive integer";
+        return false;
+      }
+      int attempts = 0;
+      if (!ParsePositiveInt(argv[++i], attempts) || attempts <= 0) {
+        error = "invalid value for --max-attempts";
+        return false;
+      }
+      options.max_attempts = static_cast<usize>(attempts);
+      continue;
+    }
+    if (arg == "--require-stable-cpu") {
+      options.require_stable_cpu = true;
+      continue;
+    }
+    if (arg == "--allow-migration") {
+      options.require_stable_cpu = false;
+      continue;
+    }
+    error = "unknown argument: " + std::string(arg);
+    return false;
+  }
+  if (options.prefer_cpu.has_value() && options.max_attempts == 1) {
+    options.max_attempts = 25;
+  }
+  return true;
+}
+
 void PrintSampleResult(const CounterProgram &program, const SampleResult &result) {
   std::cout << "- workload: " << result.workload_name << '\n';
   std::cout << "  " << result.workload_description << '\n';
@@ -1188,8 +1286,15 @@ void PrintSampleResult(const CounterProgram &program, const SampleResult &result
   PrintDerivedMetrics(program, result);
 }
 
-int main() {
+int main(int argc, char **argv) {
   std::cout.setf(std::ios::unitbuf);
+
+  RunOptions run_options;
+  std::string error;
+  if (!ParseRunOptions(argc, argv, run_options, error)) {
+    std::cerr << error << '\n';
+    return 1;
+  }
 
   std::cout << "cpu brand: " << ReadSysctlString("machdep.cpu.brand_string") << '\n';
   if (const auto cpu_family = ReadSysctlIntegral<u32>("hw.cpufamily")) {
@@ -1203,7 +1308,6 @@ int main() {
   }
 
   Profiler profiler;
-  std::string error;
   if (!profiler.Initialize(error)) {
     std::cerr << error << '\n';
     return 1;
@@ -1488,6 +1592,12 @@ int main() {
   std::cout << "\nStarting issue-focused memory counter suite. Known-good passes are temporarily disabled so the run stays short and concentrates on the remaining inconsistencies.\n";
   std::cout << "Several workloads now have alternate optnone implementations in the same file so compiler-shape effects can be separated from PMU-event interaction problems.\n";
   std::cout << "LDST_X64_UOP counts 64-byte split accesses; on this machine hw.cachelinesize is 128, so the X64 workloads are about 64-byte boundaries rather than full L1 cache lines.\n";
+  if (run_options.prefer_cpu.has_value()) {
+    std::cout << "Sampling control: prefer_cpu=" << *run_options.prefer_cpu
+              << " max_attempts=" << run_options.max_attempts
+              << " require_stable_cpu=" << (run_options.require_stable_cpu ? "yes" : "no")
+              << '\n';
+  }
 
   usize skipped_groups = 0;
   for (const SuiteRun &suite : suites) {
@@ -1502,9 +1612,20 @@ int main() {
     PrintProgramHeader(program);
     for (const WorkloadDefinition *workload : suite.workloads) {
       SampleResult result;
-      if (!profiler.Measure(program, *workload, state, result, error)) {
-        std::cerr << error << '\n';
-        return 1;
+      bool matched = false;
+      for (usize attempt = 1; attempt <= run_options.max_attempts; ++attempt) {
+        if (!profiler.Measure(program, *workload, state, result, error)) {
+          std::cerr << error << '\n';
+          return 1;
+        }
+        if (SampleMatches(result, run_options)) {
+          matched = true;
+          break;
+        }
+      }
+      if (!matched) {
+        PrintSkippedWorkload(*workload, run_options.max_attempts, result, run_options);
+        continue;
       }
       PrintSampleResult(program, result);
     }
