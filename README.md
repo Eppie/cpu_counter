@@ -57,6 +57,9 @@ The suite is intentionally split into multiple passes because Apple only exposes
   - `INST_INT_ST`
   - `INST_SIMD_LD`
   - `INST_SIMD_ST`
+- separate scalar and SIMD store passes:
+  - scalar stores avoid the `INST_LDST` + `INST_INT_ST` conflict
+  - SIMD stores are measured in their own pass
 - boundary-crossing diagnostics:
   - `LDST_X64_UOP`
   - `LDST_XPG_UOP`
@@ -70,3 +73,4 @@ Notes:
 - The code stays intentionally direct and single-file so it is easy to keep iterating during reverse engineering.
 - If a requested event group cannot be programmed together on this machine, the tool prints that group as skipped and continues with the rest of the suite.
 - `LDST_X64_UOP` is a 64-byte split-access counter. On this M4 Max, `hw.cachelinesize` is `128`, so the X64 workloads are about 64-byte boundaries, not full L1 cache lines.
+- Each benchmark sample now records the current CPU before and after the workload so scheduler migration can be correlated with suspicious all-zero measurements.

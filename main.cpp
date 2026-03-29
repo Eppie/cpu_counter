@@ -211,6 +211,7 @@ struct Api {
   int (*kpc_set_thread_counting)(u32 classes) = nullptr;
   int (*kpc_set_config)(u32 classes, kpc_config_t *config) = nullptr;
   u32 (*kpc_get_counter_count)(u32 classes) = nullptr;
+  int (*kpc_get_cpu_counters)(bool all_cpus, u32 classes, int *curcpu, u64 *buf) = nullptr;
   int (*kpc_get_thread_counters)(u32 tid, u32 buf_count, u64 *buf) = nullptr;
   int (*kpc_force_all_ctrs_set)(int val) = nullptr;
   int (*kpc_force_all_ctrs_get)(int *val_out) = nullptr;
@@ -290,6 +291,7 @@ struct Api {
            load_kperf("kpc_set_thread_counting", kpc_set_thread_counting) &&
            load_kperf("kpc_set_config", kpc_set_config) &&
            load_kperf("kpc_get_counter_count", kpc_get_counter_count) &&
+           load_kperf("kpc_get_cpu_counters", kpc_get_cpu_counters) &&
            load_kperf("kpc_get_thread_counters", kpc_get_thread_counters) &&
            load_kperf("kpc_force_all_ctrs_set", kpc_force_all_ctrs_set) &&
            load_kperf("kpc_force_all_ctrs_get", kpc_force_all_ctrs_get) &&
@@ -694,6 +696,8 @@ struct SampleResult {
   std::vector<u64> deltas;
   u64 sink = 0;
   double elapsed_ms = 0.0;
+  int cpu_before = -1;
+  int cpu_after = -1;
 };
 
 class Profiler {
@@ -895,10 +899,19 @@ class Profiler {
 
     std::array<u64, KPC_MAX_COUNTERS> before{};
     std::array<u64, KPC_MAX_COUNTERS> after{};
+    std::array<u64, KPC_MAX_COUNTERS> cpu_before{};
+    std::array<u64, KPC_MAX_COUNTERS> cpu_after{};
+    int curcpu_before = -1;
+    int curcpu_after = -1;
 
     ret = api_.kpc_get_thread_counters(0, program.active_count, before.data());
     if (ret != 0) {
       error = "kpc_get_thread_counters(before) failed: " + std::to_string(ret);
+      return false;
+    }
+    ret = api_.kpc_get_cpu_counters(false, program.classes, &curcpu_before, cpu_before.data());
+    if (ret < 0) {
+      error = "kpc_get_cpu_counters(before) failed: " + std::to_string(ret);
       return false;
     }
 
@@ -909,6 +922,11 @@ class Profiler {
     ret = api_.kpc_get_thread_counters(0, program.active_count, after.data());
     if (ret != 0) {
       error = "kpc_get_thread_counters(after) failed: " + std::to_string(ret);
+      return false;
+    }
+    ret = api_.kpc_get_cpu_counters(false, program.classes, &curcpu_after, cpu_after.data());
+    if (ret < 0) {
+      error = "kpc_get_cpu_counters(after) failed: " + std::to_string(ret);
       return false;
     }
 
@@ -922,6 +940,8 @@ class Profiler {
     result.sink = sink;
     result.elapsed_ms =
         std::chrono::duration<double, std::milli>(finished - started).count();
+    result.cpu_before = curcpu_before;
+    result.cpu_after = curcpu_after;
 
     for (usize i = 0; i < program.event_names.size(); ++i) {
       const usize slot = program.counter_slots[i];
@@ -1058,7 +1078,12 @@ void PrintSampleResult(const CounterProgram &program, const SampleResult &result
   std::cout << "- workload: " << result.workload_name << '\n';
   std::cout << "  " << result.workload_description << '\n';
   std::cout << "  elapsed_ms=" << std::fixed << std::setprecision(3) << result.elapsed_ms
-            << " sink=" << result.sink << '\n';
+            << " sink=" << result.sink << " cpu_before=" << result.cpu_before
+            << " cpu_after=" << result.cpu_after;
+  if (result.cpu_before != result.cpu_after) {
+    std::cout << " migrated=yes";
+  }
+  std::cout << '\n';
 
   const auto instructions = FindEventDelta(program, result, "FIXED_INSTRUCTIONS");
   for (usize i = 0; i < program.event_names.size(); ++i) {
@@ -1083,7 +1108,7 @@ int main() {
   if (const auto cpu_family = ReadSysctlIntegral<u32>("hw.cpufamily")) {
     std::cout << "hw.cpufamily: " << HexString(*cpu_family) << '\n';
   }
-  if (const auto cache_line = ReadSysctlIntegral<u32>("hw.cachelinesize")) {
+  if (const auto cache_line = ReadSysctlIntegral<u64>("hw.cachelinesize")) {
     std::cout << "hw.cachelinesize: " << *cache_line << '\n';
   }
   if (const auto page_size = ReadSysctlIntegral<u32>("hw.pagesize")) {
@@ -1238,15 +1263,26 @@ int main() {
           "L1D_CACHE_MISS_LD",
       },
   };
-  const EventGroupDefinition store_mix_group{
-      "store_mix",
-      "Compare scalar and explicit-NEON write kernels using instruction-class counters, store misses, and writebacks.",
+  const EventGroupDefinition store_scalar_group{
+      "store_scalar",
+      "Scalar store path using only store-compatible counters. INST_LDST is intentionally excluded because it conflicts with INST_INT_ST on this PMU.",
       {
-          "INST_LDST",
           "INST_INT_ST",
-          "INST_SIMD_ST",
+          "ST_UNIT_UOP",
           "L1D_CACHE_MISS_ST",
           "L1D_CACHE_WRITEBACK",
+          "L1D_TLB_MISS",
+      },
+  };
+  const EventGroupDefinition store_simd_group{
+      "store_simd",
+      "Explicit-NEON store path separated from scalar stores so SIMD store counters can be observed without INST_INT_ST conflicts.",
+      {
+          "INST_SIMD_ST",
+          "ST_UNIT_UOP",
+          "L1D_CACHE_MISS_ST",
+          "L1D_CACHE_WRITEBACK",
+          "L1D_TLB_MISS",
       },
   };
   const EventGroupDefinition crossing_group{
@@ -1282,9 +1318,12 @@ int main() {
       &simd_stream_read,
       &random_read,
   };
-  const std::array<const WorkloadDefinition *, 4> store_mix_workloads = {
+  const std::array<const WorkloadDefinition *, 3> store_scalar_workloads = {
       &hot_seq_write,
       &stream_write,
+      &random_write,
+  };
+  const std::array<const WorkloadDefinition *, 2> store_simd_workloads = {
       &simd_stream_write,
       &random_write,
   };
@@ -1303,11 +1342,12 @@ int main() {
     std::span<const WorkloadDefinition *const> workloads;
   };
 
-  const std::array<SuiteRun, 5> suites = {
+  const std::array<SuiteRun, 6> suites = {
       SuiteRun{&memory_core_group, memory_core_workloads},
       SuiteRun{&translation_group, translation_workloads},
       SuiteRun{&load_mix_group, load_mix_workloads},
-      SuiteRun{&store_mix_group, store_mix_workloads},
+      SuiteRun{&store_scalar_group, store_scalar_workloads},
+      SuiteRun{&store_simd_group, store_simd_workloads},
       SuiteRun{&crossing_group, crossing_workloads},
   };
 
