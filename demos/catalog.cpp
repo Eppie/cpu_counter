@@ -24,6 +24,12 @@ const WorkloadExpectation kRandomPointerExpectations[] = {
     {"l1-load-miss", "high", "Random dependent loads defeat prefetching and force frequent L1D misses."},
 };
 
+const WorkloadExpectation kLinearPointerExpectations[] = {
+    {"cycles", "low", "The address stream is linear enough for the hardware prefetchers to stay useful, so the same number of dependent loads costs fewer cycles."},
+    {"instructions", "low", "The loop body is still tiny; this is a latency baseline, not an instruction-density demo."},
+    {"l1-load-miss", "low", "A linear walk keeps spatial locality intact, so miss pressure drops sharply versus the random chase."},
+};
+
 const WorkloadExpectation kHotWriteExpectations[] = {
     {"l1-store-miss", "low", "Repeated stores revisit the same hot cache lines, so store misses stay low."},
 };
@@ -86,6 +92,16 @@ constexpr std::string_view kRandomPointerConfig =
     "2,000,000 dependent loads through a 32 MiB randomized ring.";
 constexpr std::string_view kRandomPointerCode = R"cpp(
 volatile const std::uint32_t *ring = state.random_ring.data();
+std::uint32_t index = 0;
+for (std::size_t i = 0; i < 2'000'000; ++i) {
+  index = ring[index];
+}
+)cpp";
+
+constexpr std::string_view kLinearPointerConfig =
+    "2,000,000 dependent loads through a 32 MiB linear ring.";
+constexpr std::string_view kLinearPointerCode = R"cpp(
+volatile const std::uint32_t *ring = state.linear_ring.data();
 std::uint32_t index = 0;
 for (std::size_t i = 0; i < 2'000'000; ++i) {
   index = ring[index];
@@ -197,6 +213,21 @@ const WorkloadDefinition kWorkloads[] = {
         &workloads::HotSequentialRead,
     },
     {
+        "linear-pointer-chase",
+        "Linear Pointer Chase",
+        "A same-size dependent load chain, but with linear address order.",
+        "This is the contrast case for random pointer chasing: the dependency is still there, but the access pattern preserves spatial predictability.",
+        kLinearPointerConfig,
+        kLinearPointerCode,
+        Group::MemoryCache,
+        Tier::Stable,
+        3,
+        1,
+        CYCLES | INSTRUCTIONS | L1_LOAD_MISS,
+        std::span<const WorkloadExpectation>(kLinearPointerExpectations),
+        &workloads::LinearPointerChase,
+    },
+    {
         "random-pointer-chase",
         "Random Pointer Chase",
         "A large dependent load chain that defeats prefetching.",
@@ -210,6 +241,8 @@ const WorkloadDefinition kWorkloads[] = {
         CYCLES | INSTRUCTIONS | L1_LOAD_MISS,
         std::span<const WorkloadExpectation>(kRandomPointerExpectations),
         &workloads::RandomPointerChase,
+        "linear-pointer-chase",
+        "Compare this against the same-size linear pointer chase. The instruction count stays similar, so the wall-time and cycle gap mostly reflects lost spatial predictability and miss latency.",
     },
     {
         "hot-seq-write",

@@ -63,6 +63,11 @@ struct CounterComparison {
   bool validation_passed = false;
 };
 
+struct DemoContrast {
+  const demo::WorkloadDefinition *workload = nullptr;
+  WorkloadRunSummary summary;
+};
+
 std::string CounterLabel(PerfCounter counter) {
   for (const demo::CounterDefinition &definition : demo::Counters()) {
     if (definition.counter == counter) {
@@ -446,6 +451,17 @@ std::string FormatWallNs(double ns) {
   return oss.str();
 }
 
+double Ratio(double numerator, double denominator) {
+  if (denominator == 0.0) {
+    return numerator > 0.0 ? std::numeric_limits<double>::infinity() : 1.0;
+  }
+  return numerator / denominator;
+}
+
+std::string FormatRatio(double numerator, double denominator, int precision = 2) {
+  return FormatDouble(Ratio(numerator, denominator), precision) + "x";
+}
+
 std::string_view TrimBlock(std::string_view block) {
   while (!block.empty() && (block.front() == '\n' || block.front() == '\r')) {
     block.remove_prefix(1);
@@ -480,6 +496,24 @@ const demo::WorkloadExpectation *FindExpectation(const demo::WorkloadDefinition 
     }
   }
   return nullptr;
+}
+
+std::optional<double> MeanIpc(const WorkloadRunSummary &summary) {
+  const auto cycles = MeanCounterValue(summary, CYCLES);
+  const auto instructions = MeanCounterValue(summary, INSTRUCTIONS);
+  if (!cycles.has_value() || !instructions.has_value() || *cycles <= 0.0) {
+    return std::nullopt;
+  }
+  return *instructions / *cycles;
+}
+
+std::optional<double> MeanCpi(const WorkloadRunSummary &summary) {
+  const auto cycles = MeanCounterValue(summary, CYCLES);
+  const auto instructions = MeanCounterValue(summary, INSTRUCTIONS);
+  if (!cycles.has_value() || !instructions.has_value() || *instructions <= 0.0) {
+    return std::nullopt;
+  }
+  return *cycles / *instructions;
 }
 
 std::string MismatchReason(const PerfMeasurement &measurement, const demo::RunOptions &options) {
@@ -560,6 +594,60 @@ void PrintWorkloadRunSummary(const WorkloadRunSummary &summary) {
     std::cout << "  derived:\n";
     std::cout << "    IPC  " << FormatDouble(*instructions / *cycles, 3) << '\n';
     std::cout << "    CPI  " << FormatDouble(*cycles / *instructions, 3) << '\n';
+  }
+}
+
+void PrintDemoContrastSummary(const demo::WorkloadDefinition &primary,
+                              const WorkloadRunSummary &primary_summary,
+                              const demo::WorkloadDefinition &contrast,
+                              const WorkloadRunSummary &contrast_summary) {
+  std::cout << "\nComparison against " << contrast.title << " (" << contrast.id << "):\n";
+  std::cout << "  " << contrast.summary << '\n';
+
+  std::size_t metric_width = std::string("metric").size();
+  std::size_t primary_width = primary.title.size();
+  std::size_t contrast_width = contrast.title.size();
+
+  struct Row {
+    std::string metric;
+    std::string primary_value;
+    std::string contrast_value;
+    std::string ratio;
+  };
+  std::vector<Row> rows;
+
+  rows.push_back({"wall", FormatWallNs(MeanWallNs(primary_summary)),
+                  FormatWallNs(MeanWallNs(contrast_summary)),
+                  FormatRatio(MeanWallNs(primary_summary), MeanWallNs(contrast_summary))});
+
+  for (std::uint8_t i = 0; i < primary_summary.measured_counters.count; ++i) {
+    const PerfCounter counter = primary_summary.measured_counters.items[i];
+    const auto primary_mean = MeanCounterValue(primary_summary, counter);
+    const auto contrast_mean = MeanCounterValue(contrast_summary, counter);
+    if (!primary_mean.has_value() || !contrast_mean.has_value()) {
+      continue;
+    }
+    Row row{
+        CounterLabel(counter),
+        FormatDouble(*primary_mean),
+        FormatDouble(*contrast_mean),
+        FormatRatio(*primary_mean, *contrast_mean),
+    };
+    metric_width = std::max(metric_width, row.metric.size());
+    primary_width = std::max(primary_width, row.primary_value.size());
+    contrast_width = std::max(contrast_width, row.contrast_value.size());
+    rows.push_back(std::move(row));
+  }
+
+  std::cout << "  " << std::left << std::setw(static_cast<int>(metric_width)) << "metric"
+            << "  " << std::right << std::setw(static_cast<int>(primary_width)) << primary.title
+            << "  " << std::right << std::setw(static_cast<int>(contrast_width)) << contrast.title
+            << "  ratio\n";
+  for (const Row &row : rows) {
+    std::cout << "  " << std::left << std::setw(static_cast<int>(metric_width)) << row.metric
+              << "  " << std::right << std::setw(static_cast<int>(primary_width))
+              << row.primary_value << "  " << std::right << std::setw(static_cast<int>(contrast_width))
+              << row.contrast_value << "  " << row.ratio << '\n';
   }
 }
 
@@ -789,6 +877,14 @@ int ExplainDemo(const CliOptions &options) {
     std::cout << "- representative code:\n";
     PrintIndentedBlock(workload->code_snippet, "    ");
   }
+  if (!workload->contrast_demo_id.empty()) {
+    if (const demo::WorkloadDefinition *contrast = demo::FindWorkload(workload->contrast_demo_id)) {
+      std::cout << "- contrast demo: " << contrast->id << " — " << contrast->summary << '\n';
+    }
+    if (!workload->contrast_blurb.empty()) {
+      std::cout << "- comparison goal: " << workload->contrast_blurb << '\n';
+    }
+  }
   return 0;
 }
 
@@ -873,6 +969,14 @@ int RunDemo(CliOptions options) {
     std::cout << "- representative code:\n";
     PrintIndentedBlock(workload->code_snippet, "    ");
   }
+  if (!workload->contrast_demo_id.empty()) {
+    if (const demo::WorkloadDefinition *contrast = demo::FindWorkload(workload->contrast_demo_id)) {
+      std::cout << "- contrast demo: " << contrast->title << " (" << contrast->id << ")\n";
+    }
+    if (!workload->contrast_blurb.empty()) {
+      std::cout << "- comparison goal: " << workload->contrast_blurb << '\n';
+    }
+  }
   std::cout << "\nExpected counter behavior:\n";
   for (const auto &expectation : workload->expectations) {
     std::cout << "- " << expectation.counter_name << " -> " << expectation.level << ": "
@@ -886,12 +990,86 @@ int RunDemo(CliOptions options) {
     return 1;
   }
 
+  DemoContrast contrast;
+  if (!workload->contrast_demo_id.empty()) {
+    contrast.workload = demo::FindWorkload(workload->contrast_demo_id);
+    if (contrast.workload == nullptr) {
+      std::cout << "\nRun failed: unknown contrast demo " << workload->contrast_demo_id << '\n';
+      return 1;
+    }
+    const PerfCounterSet contrast_set = workload->measurement_counters | contrast.workload->measurement_counters;
+    if (contrast_set.overflow) {
+      std::cout << "\nRun failed: contrast measurement set exceeds PERF_MAX_SCOPE_EVENTS\n";
+      return 1;
+    }
+    if (!ExecuteWorkload(*contrast.workload, contrast_set, environment, options, contrast.summary)) {
+      std::cout << "\nRun failed: contrast demo failed: " << contrast.summary.error << '\n';
+      return 1;
+    }
+  }
+
   std::cout << "\nMeasured output:\n";
   PrintWorkloadRunSummary(summary);
+  if (contrast.workload != nullptr) {
+    std::cout << '\n';
+    PrintWorkloadRunSummary(contrast.summary);
+    PrintDemoContrastSummary(*workload, summary, *contrast.workload, contrast.summary);
+  }
 
   std::cout << "\nInterpretation:\n";
-  std::cout << "- This demo is meant to explain a mechanism, not to score absolute performance.\n";
-  std::cout << "- Compare the highlighted counters above against the expected high/low notes to understand what the code pattern is stressing.\n";
+  const auto ipc = MeanIpc(summary);
+  const auto cpi = MeanCpi(summary);
+  if (contrast.workload != nullptr) {
+    const auto contrast_ipc = MeanIpc(contrast.summary);
+    std::cout << "- " << workload->title << " took "
+              << FormatRatio(MeanWallNs(summary), MeanWallNs(contrast.summary))
+              << " the wall time of " << contrast.workload->title << ".\n";
+    if (const auto cycles = MeanCounterValue(summary, CYCLES);
+        cycles.has_value()) {
+      if (const auto contrast_cycles = MeanCounterValue(contrast.summary, CYCLES);
+          contrast_cycles.has_value()) {
+        std::cout << "- Cycle count changed by "
+                  << FormatRatio(*cycles, *contrast_cycles)
+                  << ", so the slowdown shows up directly in the core-cycle counter.\n";
+      }
+    }
+    if (const auto misses = MeanCounterValue(summary, L1_LOAD_MISS);
+        misses.has_value()) {
+      if (const auto contrast_misses = MeanCounterValue(contrast.summary, L1_LOAD_MISS);
+          contrast_misses.has_value()) {
+        std::cout << "- L1 load misses changed by "
+                  << FormatRatio(*misses, *contrast_misses)
+                  << ", which is the clearest signal that randomizing the chain destroyed locality.\n";
+      }
+    }
+    if (ipc.has_value() && contrast_ipc.has_value()) {
+      std::cout << "- IPC moved from " << FormatDouble(*contrast_ipc, 3) << " in "
+                << contrast.workload->id << " to " << FormatDouble(*ipc, 3) << " in "
+                << workload->id
+                << ", which means the random chase spent far more of its time stalled on miss latency.\n";
+    }
+    if (!workload->contrast_blurb.empty()) {
+      std::cout << "- " << workload->contrast_blurb << '\n';
+    }
+  } else {
+    if (ipc.has_value() && cpi.has_value()) {
+      std::cout << "- IPC is " << FormatDouble(*ipc, 3) << " and CPI is "
+                << FormatDouble(*cpi, 3) << ".\n";
+    }
+    for (const auto &expectation : workload->expectations) {
+      const demo::CounterDefinition *definition = demo::FindCounter(expectation.counter_name);
+      if (definition == nullptr) {
+        continue;
+      }
+      const auto mean = MeanCounterValue(summary, definition->counter);
+      if (!mean.has_value()) {
+        continue;
+      }
+      std::cout << "- " << expectation.counter_name << " measured "
+                << FormatDouble(*mean) << " and is expected to be " << expectation.level
+                << " here because " << expectation.note << '\n';
+    }
+  }
   return 0;
 }
 

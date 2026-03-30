@@ -278,6 +278,7 @@ bool DemoEnvironment::Initialize(std::string &error) {
   constexpr std::size_t kExecWorkingSetBytes = 64 * 1024 * 1024;
 
   hot_ring = BuildSequentialRing(kHotBytes / sizeof(std::uint32_t));
+  linear_ring = BuildSequentialRing(kRandomRingBytes / sizeof(std::uint32_t));
   random_ring = BuildRandomRing(kRandomRingBytes / sizeof(std::uint32_t), 0x5a17d3b9ULL);
 
   stream_read.resize(kStreamBytes / sizeof(std::uint64_t));
@@ -383,6 +384,17 @@ namespace workloads {
   volatile const std::uint32_t *ring = state.hot_ring.data();
   std::uint32_t index = 0;
   constexpr std::size_t kSteps = 32'000'000;
+  for (std::size_t i = 0; i < kSteps; ++i) {
+    index = ring[index];
+  }
+  g_sink += index;
+  return index;
+}
+
+[[gnu::noinline]] std::uint64_t LinearPointerChase(DemoEnvironment &state) {
+  volatile const std::uint32_t *ring = state.linear_ring.data();
+  std::uint32_t index = 0;
+  constexpr std::size_t kSteps = 2'000'000;
   for (std::size_t i = 0; i < kSteps; ++i) {
     index = ring[index];
   }

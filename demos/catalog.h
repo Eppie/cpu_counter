@@ -84,6 +84,7 @@ struct DemoEnvironment {
   std::string error_message;
 
   std::vector<std::uint32_t> hot_ring;
+  std::vector<std::uint32_t> linear_ring;
   std::vector<std::uint32_t> random_ring;
   std::vector<std::uint64_t> stream_read;
   std::vector<std::uint64_t> stream_store;
@@ -126,6 +127,8 @@ struct WorkloadDefinition {
   PerfCounterSet measurement_counters{};
   std::span<const WorkloadExpectation> expectations;
   WorkloadFn run = nullptr;
+  std::string_view contrast_demo_id{};
+  std::string_view contrast_blurb{};
 };
 
 struct CounterDefinition {
@@ -159,6 +162,7 @@ namespace workloads {
 
 std::uint64_t DenseIntegerAlu(DemoEnvironment &state);
 std::uint64_t HotSequentialRead(DemoEnvironment &state);
+std::uint64_t LinearPointerChase(DemoEnvironment &state);
 std::uint64_t RandomPointerChase(DemoEnvironment &state);
 std::uint64_t HotSequentialWrite(DemoEnvironment &state);
 std::uint64_t RandomPageWrite(DemoEnvironment &state);
