@@ -11,6 +11,7 @@ The library stays as one shipped header. The demo lab is built from the `demos/`
 
 - This project uses private Apple `kperf` / `kperfdata` APIs.
 - Programming counters still requires `root` or a blessed pid on this machine.
+- Some machines also reject `kpc_force_all_ctrs_set(1)` even under `sudo`; the library now treats that as best-effort and reports the later programming failure directly if configurable PMCs still cannot be installed.
 - Without privilege, the binary still runs, but measured commands fail with a clear error instead of crashing.
 
 ## Build

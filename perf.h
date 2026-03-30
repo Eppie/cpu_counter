@@ -634,7 +634,9 @@ class Backend {
     if (initialized_) {
       api_.kpc_set_thread_counting(0);
       api_.kpc_set_counting(0);
-      api_.kpc_force_all_ctrs_set(0);
+      if (forced_all_counters_) {
+        api_.kpc_force_all_ctrs_set(0);
+      }
       if (db_ != nullptr) {
         api_.kpep_db_free(db_);
       }
@@ -646,6 +648,7 @@ class Backend {
   kpep_db *db_ = nullptr;
   bool initialized_ = false;
   bool attempted_ = false;
+  bool forced_all_counters_ = false;
   std::string init_error_;
   std::mutex mutex_;
   std::unordered_map<std::string, Program> programs_;
@@ -684,10 +687,8 @@ class Backend {
       error = init_error_;
       return false;
     }
-    if (api_.kpc_force_all_ctrs_set(1) != 0) {
-      init_error_ = "kpc_force_all_ctrs_set(1) failed; run as root or blessed pid";
-      error = init_error_;
-      return false;
+    if (api_.kpc_force_all_ctrs_set(1) == 0) {
+      forced_all_counters_ = true;
     }
     initialized_ = true;
     return true;
@@ -881,12 +882,22 @@ class Backend {
       const int config_ret = api_.kpc_set_config(program->classes, program->regs.data());
       if (config_ret != 0) {
         error = "kpc_set_config failed: " + std::to_string(config_ret);
+        if (!forced_all_counters_) {
+          error +=
+              " (kpc_force_all_ctrs_set(1) was rejected; configurable events may require a "
+              "blessed pid or a different PMU policy on this machine)";
+        }
         return false;
       }
     }
     if (api_.kpc_set_counting(program->classes) != 0 ||
         api_.kpc_set_thread_counting(program->classes) != 0) {
       error = "failed to enable counting";
+      if (!forced_all_counters_) {
+        error +=
+            " (kpc_force_all_ctrs_set(1) was rejected; configurable events may require a "
+            "blessed pid or a different PMU policy on this machine)";
+      }
       return false;
     }
     state.installed_program = program;

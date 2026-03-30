@@ -2,6 +2,7 @@ CXX := /opt/homebrew/opt/llvm/bin/clang++
 CXXFLAGS := -std=c++20 -O2 -Wall -Wextra -pedantic -I.
 TARGET := cpu_counter
 SOURCES := main.cpp $(wildcard demos/*.cpp)
+HEADERS := perf.h $(wildcard demos/*.h)
 TEST_API := test_api_compile
 TEST_REGISTRY := test_registry_check
 
@@ -9,13 +10,13 @@ TEST_REGISTRY := test_registry_check
 
 all: $(TARGET)
 
-$(TARGET): $(SOURCES)
+$(TARGET): $(SOURCES) $(HEADERS)
 	$(CXX) $(CXXFLAGS) $(SOURCES) -o $(TARGET)
 
-$(TEST_API): tests/api_compile.cpp
+$(TEST_API): tests/api_compile.cpp $(HEADERS)
 	$(CXX) $(CXXFLAGS) tests/api_compile.cpp -o $(TEST_API)
 
-$(TEST_REGISTRY): tests/registry_check.cpp $(wildcard demos/*.cpp)
+$(TEST_REGISTRY): tests/registry_check.cpp $(wildcard demos/*.cpp) $(HEADERS)
 	$(CXX) $(CXXFLAGS) tests/registry_check.cpp $(wildcard demos/*.cpp) -o $(TEST_REGISTRY)
 
 run: $(TARGET)
