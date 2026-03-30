@@ -260,6 +260,7 @@ struct Api {
   int (*kpc_set_thread_counting)(u32 classes) = nullptr;
   int (*kpc_set_config)(u32 classes, kpc_config_t *config) = nullptr;
   u32 (*kpc_get_counter_count)(u32 classes) = nullptr;
+  int (*kpc_get_cpu_counters)(bool all_cpus, u32 classes, int *curcpu, u64 *buf) = nullptr;
   int (*kpc_get_thread_counters)(u32 tid, u32 buf_count, u64 *buf) = nullptr;
   int (*kpc_force_all_ctrs_set)(int val) = nullptr;
 
@@ -337,6 +338,8 @@ inline bool LoadApi(Api &api, std::string &error) {
          LoadSymbol(api.kperf_handle, "kpc_set_config", api.kpc_set_config, error) &&
          LoadSymbol(api.kperf_handle, "kpc_get_counter_count", api.kpc_get_counter_count,
                     error) &&
+         LoadSymbol(api.kperf_handle, "kpc_get_cpu_counters", api.kpc_get_cpu_counters,
+                    error) &&
          LoadSymbol(api.kperf_handle, "kpc_get_thread_counters", api.kpc_get_thread_counters,
                     error) &&
          LoadSymbol(api.kperf_handle, "kpc_force_all_ctrs_set", api.kpc_force_all_ctrs_set,
@@ -399,6 +402,15 @@ struct Aggregate {
   }
 };
 
+inline u64 TicksToNs(u64 ticks) {
+  static const mach_timebase_info_data_t timebase = [] {
+    mach_timebase_info_data_t info{};
+    mach_timebase_info(&info);
+    return info;
+  }();
+  return static_cast<u64>((static_cast<__uint128_t>(ticks) * timebase.numer) / timebase.denom);
+}
+
 struct ScopeFrame {
   const char *label = "";
   CounterSet requested{};
@@ -430,6 +442,7 @@ class Backend {
     std::array<u64, PERF_MAX_SCOPE_EVENTS> values{};
     u8 count = 0;
     bool valid = false;
+    int cpu = -1;
     std::string error;
   };
 
@@ -587,8 +600,19 @@ class Backend {
     }
 
     ThreadState &state = CurrentThreadState();
-    if (!EnsureThreadProgram(state, requested, snapshot.error)) {
+    if (!EnsureExactThreadProgram(state, requested, snapshot.error)) {
       return snapshot;
+    }
+
+    if (api_.kpc_get_cpu_counters != nullptr && state.installed_program != nullptr) {
+      std::array<u64, KPC_MAX_COUNTERS> cpu_counters{};
+      int current_cpu = -1;
+      const int cpu_ret =
+          api_.kpc_get_cpu_counters(false, state.installed_program->classes, &current_cpu,
+                                    cpu_counters.data());
+      if (cpu_ret >= 0) {
+        snapshot.cpu = current_cpu;
+      }
     }
 
     std::array<u64, KPC_MAX_COUNTERS> current{};
@@ -893,6 +917,28 @@ class Backend {
     return InstallProgram(state, widened, error);
   }
 
+  bool EnsureExactThreadProgram(ThreadState &state, const CounterSet &requested,
+                                std::string &error) {
+    if (requested.count == 0) {
+      return true;
+    }
+    if (state.installed_program == nullptr) {
+      return InstallProgram(state, requested, error);
+    }
+    if (!state.active_frames.empty()) {
+      if (IsSubset(requested, state.installed_set)) {
+        return true;
+      }
+      error =
+          "requested counters are not a subset of the active thread counter set; prime a superset before nested use";
+      return false;
+    }
+    if (CanonicalCounterSetKey(requested) == CanonicalCounterSetKey(state.installed_set)) {
+      return true;
+    }
+    return InstallProgram(state, requested, error);
+  }
+
   Aggregate *ResolveAggregate(ThreadState &state, ScopeFrame &frame) {
     if (frame.site != nullptr && frame.site->aggregate != nullptr) {
       return static_cast<Aggregate *>(frame.site->aggregate);
@@ -1003,15 +1049,6 @@ class Backend {
     }
   }
 
-  static u64 TicksToNs(u64 ticks) {
-    static const mach_timebase_info_data_t timebase = [] {
-      mach_timebase_info_data_t info{};
-      mach_timebase_info(&info);
-      return info;
-    }();
-    return static_cast<u64>((static_cast<__uint128_t>(ticks) * timebase.numer) / timebase.denom);
-  }
-
   void DumpJsonl() {
     std::unordered_map<std::string, Aggregate> snapshot;
     {
@@ -1058,9 +1095,9 @@ class Backend {
       (*out) << ",\"sampled_count\":" << aggregate.sampled_count;
       (*out) << ",\"dropped_count\":" << aggregate.dropped_count;
       if (aggregate.sampled_count != 0) {
-        const u64 total_ns = TicksToNs(aggregate.total_wall_ticks);
-        const u64 min_ns = TicksToNs(aggregate.min_wall_ticks);
-        const u64 max_ns = TicksToNs(aggregate.max_wall_ticks);
+        const u64 total_ns = detail::TicksToNs(aggregate.total_wall_ticks);
+        const u64 min_ns = detail::TicksToNs(aggregate.min_wall_ticks);
+        const u64 max_ns = detail::TicksToNs(aggregate.max_wall_ticks);
         (*out) << ",\"wall_ns\":{\"total\":" << total_ns << ",\"min\":" << min_ns
                << ",\"max\":" << max_ns << ",\"mean\":"
                << static_cast<double>(total_ns) / static_cast<double>(aggregate.sampled_count)
@@ -1199,6 +1236,69 @@ struct PerfPointDelta {
   }
 };
 
+struct PerfMeasurement {
+  CounterSet set{};
+  std::array<u64, PERF_MAX_SCOPE_EVENTS> values{};
+  u8 count = 0;
+  bool valid = false;
+  u64 wall_ns = 0;
+  int cpu_before = -1;
+  int cpu_after = -1;
+  std::string error;
+
+  [[nodiscard]] std::optional<u64> Get(Counter counter) const {
+    if (!valid) {
+      return std::nullopt;
+    }
+    for (u8 i = 0; i < count; ++i) {
+      if (set.items[i] == counter) {
+        return values[i];
+      }
+    }
+    return std::nullopt;
+  }
+
+  [[nodiscard]] bool HasActiveConfigurableCounters() const {
+    if (!valid) {
+      return false;
+    }
+    bool requested_configurable = false;
+    for (u8 i = 0; i < count; ++i) {
+      if (!set.items[i].fixed) {
+        requested_configurable = true;
+      }
+      if (!set.items[i].fixed && values[i] != 0) {
+        return true;
+      }
+    }
+    return !requested_configurable;
+  }
+
+  [[nodiscard]] std::string ToJson() const {
+    std::ostringstream oss;
+    oss << '{';
+    oss << "\"valid\":" << (valid ? "true" : "false");
+    oss << ",\"wall_ns\":" << wall_ns;
+    oss << ",\"cpu_before\":" << cpu_before;
+    oss << ",\"cpu_after\":" << cpu_after;
+    if (!error.empty()) {
+      oss << ",\"error\":\"" << detail::JsonEscape(error) << '"';
+    }
+    oss << ",\"counters\":[";
+    for (u8 i = 0; i < count; ++i) {
+      if (i != 0) {
+        oss << ',';
+      }
+      oss << '{';
+      oss << "\"name\":\"" << detail::JsonEscape(detail::CounterName(set.items[i])) << '"';
+      oss << ",\"delta\":" << values[i];
+      oss << '}';
+    }
+    oss << "]}";
+    return oss.str();
+  }
+};
+
 class PerfPoint {
  public:
   explicit PerfPoint(CounterSet counters = CounterSet{}) : set_(counters) {
@@ -1232,6 +1332,38 @@ class PerfPoint {
   detail::Backend::PointSnapshot snapshot_{};
 };
 
+template <typename Fn>
+PerfMeasurement PerfMeasure(CounterSet counters, Fn &&fn) {
+  PerfMeasurement measurement;
+  measurement.set = counters;
+  measurement.count = counters.count;
+
+  const u64 start_ticks = detail::NowTicks();
+  const detail::Backend::PointSnapshot before =
+      detail::Backend::Instance().CapturePoint(counters);
+  measurement.cpu_before = before.cpu;
+
+  std::forward<Fn>(fn)();
+
+  const detail::Backend::PointSnapshot after =
+      detail::Backend::Instance().CapturePoint(counters);
+  const u64 end_ticks = detail::NowTicks();
+  measurement.wall_ns = detail::TicksToNs(end_ticks - start_ticks);
+  measurement.cpu_after = after.cpu;
+
+  if (!before.valid || !after.valid) {
+    measurement.error = !before.valid ? before.error : after.error;
+    return measurement;
+  }
+
+  measurement.valid = true;
+  measurement.count = after.count;
+  for (u8 i = 0; i < measurement.count; ++i) {
+    measurement.values[i] = after.values[i] - before.values[i];
+  }
+  return measurement;
+}
+
 inline bool PrimeThread(CounterSet counters, std::string *error = nullptr) {
   std::string local_error;
   const bool ok = detail::Backend::Instance().PrimeThread(counters, local_error);
@@ -1246,6 +1378,7 @@ inline bool PrimeThread(CounterSet counters, std::string *error = nullptr) {
 using PerfScope = perf::PerfScope;
 using PerfPoint = perf::PerfPoint;
 using PerfPointDelta = perf::PerfPointDelta;
+using PerfMeasurement = perf::PerfMeasurement;
 using PerfCounter = perf::Counter;
 using PerfCounterSet = perf::CounterSet;
 using PerfThreshold = perf::Threshold;
@@ -1266,6 +1399,7 @@ inline constexpr auto L2_TLB_MISS = perf::L2_TLB_MISS;
 inline constexpr auto L2_MISS = perf::L2_MISS;
 inline constexpr auto RawEvent = perf::RawEvent;
 inline constexpr auto MaxThreshold = perf::MaxThreshold;
+using perf::PerfMeasure;
 inline bool PerfPrimeThread(PerfCounterSet counters, std::string *error = nullptr) {
   return perf::PrimeThread(counters, error);
 }
@@ -1274,7 +1408,9 @@ inline bool PerfPrimeThread(PerfCounterSet counters, std::string *error = nullpt
 
 #include <cstdint>
 #include <initializer_list>
+#include <optional>
 #include <string>
+#include <utility>
 
 namespace perf {
 
@@ -1332,6 +1468,21 @@ struct PerfPointDelta {
   [[nodiscard]] std::string ToJson() const { return "{\"valid\":false}"; }
 };
 
+struct PerfMeasurement {
+  CounterSet set{};
+  std::array<std::uint64_t, 10> values{};
+  std::uint8_t count = 0;
+  std::uint64_t wall_ns = 0;
+  int cpu_before = -1;
+  int cpu_after = -1;
+  bool valid = false;
+  std::string error;
+
+  [[nodiscard]] std::optional<std::uint64_t> Get(Counter) const { return std::nullopt; }
+  [[nodiscard]] bool HasActiveConfigurableCounters() const { return false; }
+  [[nodiscard]] std::string ToJson() const { return "{\"valid\":false}"; }
+};
+
 class PerfPoint {
  public:
   explicit PerfPoint(CounterSet = CounterSet{}) {}
@@ -1343,6 +1494,14 @@ class PerfPoint {
   friend PerfPointDelta operator-(const PerfPoint &, const PerfPoint &) { return PerfPointDelta{}; }
 };
 
+template <typename Fn>
+PerfMeasurement PerfMeasure(CounterSet, Fn &&fn) {
+  PerfMeasurement measurement;
+  std::forward<Fn>(fn)();
+  measurement.valid = true;
+  return measurement;
+}
+
 inline bool PrimeThread(CounterSet, std::string * = nullptr) { return true; }
 
 }  // namespace perf
@@ -1350,6 +1509,7 @@ inline bool PrimeThread(CounterSet, std::string * = nullptr) { return true; }
 using PerfScope = perf::PerfScope;
 using PerfPoint = perf::PerfPoint;
 using PerfPointDelta = perf::PerfPointDelta;
+using PerfMeasurement = perf::PerfMeasurement;
 using PerfCounter = perf::Counter;
 using PerfCounterSet = perf::CounterSet;
 using PerfThreshold = perf::Threshold;
@@ -1370,6 +1530,7 @@ inline constexpr auto L2_TLB_MISS = perf::L2_TLB_MISS;
 inline constexpr auto L2_MISS = perf::L2_MISS;
 inline constexpr auto RawEvent = perf::RawEvent;
 inline constexpr auto MaxThreshold = perf::MaxThreshold;
+using perf::PerfMeasure;
 inline bool PerfPrimeThread(PerfCounterSet counters, std::string *error = nullptr) {
   return perf::PrimeThread(counters, error);
 }

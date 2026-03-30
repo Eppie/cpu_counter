@@ -1,39 +1,17 @@
-# perf.h
+# perf.h + cpu_counter
 
-`perf.h` is a single-header Apple Silicon PMU profiling helper aimed at instrumenting real C++ code with minimal ceremony:
+This project now has two jobs:
 
-```cpp
-#include "perf.h"
+1. `perf.h` is the production-facing single-header PMU instrumentation library.
+2. `cpu_counter` is a demo and validation binary that explains counters with small curated workloads.
 
-void MixerUpdate() {
-  PERF_SCOPE("mixer_update", CYCLES | INSTRUCTIONS | L1_MISS | DTLB_MISS);
-  // production work here
-}
-```
-
-It is header-only in the normal build sense: no extra `.cpp`, no extra link flags, no required init/teardown call. The first sampled use lazily initializes the private `kperf` / `kperfdata` backend, and process shutdown writes JSONL output.
-
-The library now uses a lower-overhead runtime model:
-
-- counters are installed per thread and kept active
-- scope enter/exit just snapshots counters and updates thread-local aggregates
-- thread-local aggregates are merged only when dumping JSONL at shutdown
-
-The important tradeoff is that nested scopes are expected to use subsets of the installed thread set. If you know a thread will use several different nested regions, prime a superset once with `PerfPrimeThread(...)`.
-
-The lowest-overhead API is now macro-first:
-
-- `PERF_SCOPE(...)` for normal scopes
-- `PERF_SCOPE_SAMPLED(...)` for sampled hot loops
-
-Those macros keep a static thread-local site cache, so they avoid the old per-callsite sampling hash map and also cache aggregate / slot metadata.
-Use them when the label and counter set are fixed per callsite. If those vary at runtime, use the direct `PerfScope` constructor instead.
+The library stays as one shipped header. The demo lab is built from the `demos/` subtree and uses the public library API only.
 
 ## Caveat First
 
-- This uses private Apple APIs.
-- Counter programming on this machine still requires `root` or a blessed pid.
-- Without privilege, the process still runs, but the JSONL output records dropped scopes with a clear error instead of crashing.
+- This project uses private Apple `kperf` / `kperfdata` APIs.
+- Programming counters still requires `root` or a blessed pid on this machine.
+- Without privilege, the binary still runs, but measured commands fail with a clear error instead of crashing.
 
 ## Build
 
@@ -41,175 +19,237 @@ Use them when the label and counter set are fixed per callsite. If those vary at
 make
 ```
 
-The example binary is `cpu_counter`.
-
-## Run
+Useful targets:
 
 ```sh
-sudo ./cpu_counter
+make test
+make test-disable
+make live-smoke
 ```
 
-By default the library writes `perf.jsonl` in the current directory. Override with:
+## 1. Using `perf.h` in Production Code
 
-```sh
-PERF_OUTPUT=/tmp/my_profile.jsonl sudo ./cpu_counter
-PERF_OUTPUT=- sudo ./cpu_counter
-```
-
-## API
-
-Basic scope:
+`perf.h` is still the stable public surface. The recommended path is macro-first because the macros keep a static thread-local site cache.
 
 ```cpp
-PERF_SCOPE("mixer_update", CYCLES | INSTRUCTIONS | L1_MISS);
+#include "perf.h"
+
+void MixerUpdate() {
+  PERF_SCOPE("mixer_update", CYCLES | INSTRUCTIONS | L1_MISS);
+}
+
+void HotLoop() {
+  for (std::size_t i = 0; i < 1'000'000; ++i) {
+    PERF_SCOPE_SAMPLED("hot_loop", CYCLES | L1_MISS, 1024);
+  }
+}
 ```
 
-Sampling:
+### Recommended API
+
+- `PERF_SCOPE(...)`
+- `PERF_SCOPE_SAMPLED(...)`
+- `PerfPrimeThread(...)`
+- `PerfPoint`
+- `PerfMeasure(...)`
+
+### Explicit Measurement API
+
+The demo runner uses `PerfMeasure(...)`, and advanced users can use it directly when they want immediate deltas instead of aggregate JSONL output.
 
 ```cpp
-PERF_SCOPE_SAMPLED("hot_path", CYCLES | L1_MISS, 1024);
+std::uint64_t sink = 0;
+PerfMeasurement measurement = PerfMeasure(CYCLES | INSTRUCTIONS | L1_LOAD_MISS, [&] {
+  sink = RunKernel();
+});
+
+if (measurement.valid) {
+  auto cycles = measurement.Get(CYCLES);
+  auto misses = measurement.Get(L1_LOAD_MISS);
+}
 ```
 
-Fast sampled hot-loop path:
+`PerfMeasurement` includes:
 
-```cpp
-PERF_SCOPE_SAMPLED("hot_path", CYCLES | L1_MISS, 1024);
-```
+- `valid`
+- `error`
+- `wall_ns`
+- `cpu_before`
+- `cpu_after`
+- `count`
+- `set`
+- raw counter deltas in `values`
+- `Get(Counter)`
+- `HasActiveConfigurableCounters()`
 
-`PERF_SCOPE(...)` and `PERF_SCOPE_SAMPLED(...)` both use a `static thread_local` site cache. `PERF_SCOPE_SAMPLED(...)` also uses a per-site sampled counter, so it avoids the old TLS hash-map lookup entirely. For hot code, use the macros.
+### Thread Priming
 
-Thresholds:
+The runtime keeps one installed counter set per thread. Nested scopes are expected to use subsets of that installed set.
 
-```cpp
-PerfScope guard("cache_sensitive",
-                CYCLES | L2_TLB_MISS,
-                {MaxThreshold(L2_TLB_MISS, 1000)});
-```
-
-Dynamic or non-macro scope:
-
-```cpp
-PerfScope guard("cache_sensitive",
-                CYCLES | L2_TLB_MISS,
-                {MaxThreshold(L2_TLB_MISS, 1000)});
-```
-
-This still works, but it is not the lowest-overhead path because it does not get a static site cache.
-
-Optional thread priming for low-overhead nested use:
+If you know a thread will use multiple nested regions with different counters, prime a superset first:
 
 ```cpp
 std::string error;
 if (!PerfPrimeThread(CYCLES | INSTRUCTIONS | L1_MISS | DTLB_MISS, &error)) {
-  // handle or log error
+  // handle error
 }
 ```
 
-This is not required for basic use, but it is the recommended pattern when nested scopes on the same thread need different counters.
+### Output
 
-Manual snapshots:
+Production-style `PerfScope` aggregation still writes JSONL on shutdown:
 
-```cpp
-PerfPoint a(CYCLES | L1_MISS);
-// weird control flow
-PerfPoint b(CYCLES | L1_MISS);
-PerfPointDelta d = b - a;
+```sh
+PERF_OUTPUT=/tmp/profile.jsonl ./your_binary
+PERF_OUTPUT=- ./your_binary
 ```
 
-Compile out everything:
+The demo binary does not rely on that aggregated output. It measures workloads explicitly with `PerfMeasure(...)` and prints human-facing explanations.
 
-```cpp
-#define PERF_DISABLE
-#include "perf.h"
+## 2. Running the Demo Lab
+
+One binary drives the whole demo system:
+
+```sh
+sudo ./cpu_counter help
 ```
 
-## Built-in Counters
+### CLI
 
-Currently exposed built-ins:
-
-- `CYCLES`
-- `INSTRUCTIONS`
-- `BRANCHES`
-- `BRANCH_MISS`
-- `L1_LOAD_MISS`
-- `L1_STORE_MISS`
-- `L1_MISS`
-- `DTLB_MISS`
-- `ITLB_MISS`
-- `TLB_MISS`
-- `L2_TLB_MISS`
-- `L2_MISS`
-
-Notes:
-
-- `L1_MISS` currently aliases `L1_LOAD_MISS`.
-- `L2_MISS` currently aliases `L2_TLB_MISS_DATA`, not a generic L2 cache miss. That is a convenience alias, not a fully validated semantic name.
-
-Raw configurable events are also supported:
-
-```cpp
-PerfScope guard("raw_probe", CYCLES | RawEvent(0x1234, "my_raw_event"));
+```sh
+./cpu_counter list counters
+./cpu_counter list demos
+./cpu_counter explain counter l1-load-miss
+./cpu_counter explain demo random-pointer-chase
+sudo ./cpu_counter run counter l1-load-miss
+sudo ./cpu_counter run demo page-stride-read
+sudo ./cpu_counter validate
 ```
 
-## Output
+Supported flags:
 
-The library writes one JSON object per aggregate.
+- `--tier stable|experimental|all`
+- `--group <group>`
+- `--repeat <N>`
+- `--warmup <N>`
+- `--prefer-pcore`
+- `--prefer-ecore`
+- `--prefer-cpu <N>`
+- `--require-stable-cpu`
+- `--require-active-pmu`
 
-Each object contains:
+### Demo Structure
 
-- `label`
-- `sample_every`
-- `sampled_count`
-- `dropped_count`
-- `wall_ns`: `total`, `min`, `max`, `mean`
-- `counters`: per-counter `total`, `min`, `max`, `mean`
-- `threshold_violations`
-- `last_error` when scopes were dropped
+The demo lab is registry-driven.
 
-## Nesting and Thread Safety
+Each workload has:
 
-- Active scopes are thread-local.
-- Aggregation is thread-local on the hot path and merged at dump time.
-- The PMU configuration is installed per thread and reused.
+- stable id
+- title
+- summary
+- mechanism explanation
+- group
+- tier
+- default repeats / warmups
+- curated measurement set
+- expected high/low counter behaviors
 
-Important caveat:
+Each counter has:
 
-- The first scope on a thread installs that scope's counter set. Later scopes on that thread may widen the installed set when no scope is active.
-- Nested scopes are expected to request subsets of the installed thread set. If an inner scope needs extra counters that were not already installed, that inner scope is dropped and the JSONL output records the failure.
-- `PerfPrimeThread(...)` is the intended fix for that case: prime the superset once per thread, then use cheap nested subsets.
-- If a scope requests too many counters, or a conflicting combination, that scope is dropped and the JSONL output records the failure.
-- This implementation reports that as a runtime error, not a compile-time error.
+- CLI name
+- public `Counter` mapping
+- description
+- caveats
+- tier
+- curated high demo
+- curated low demo
+- validation rule
 
-## Breaking Changes
+### Current Stable Demos
 
-If you were using the previous sampled constructor form:
+Stable showcase workloads currently include:
+
+- `dense-integer-alu`
+- `hot-seq-read`
+- `random-pointer-chase`
+- `hot-seq-write`
+- `random-page-write`
+- `page-stride-read`
+- `predictable-branch`
+- `unpredictable-branch`
+- `hot-instruction-loop`
+- `random-instruction-pages`
+
+### Counter Support Table
+
+| CLI name | Tier | Meaning | High demo | Low demo | Notes |
+| --- | --- | --- | --- | --- | --- |
+| `cycles` | stable | fixed cycle count | `random-pointer-chase` | `hot-seq-read` | best read with instruction or miss context |
+| `instructions` | stable | fixed retired instructions | `dense-integer-alu` | `random-pointer-chase` | shows instruction density, not stalls |
+| `branches` | stable | retired branch instructions | `unpredictable-branch` | `dense-integer-alu` | branch-heavy vs straighter-line code |
+| `branch-miss` | stable | branch mispredicts | `unpredictable-branch` | `predictable-branch` | strongest when branch count is already high |
+| `l1-load-miss` | stable | L1D load misses | `random-pointer-chase` | `hot-seq-read` | clear memory-latency showcase |
+| `l1-store-miss` | stable | L1D store misses | `random-page-write` | `hot-seq-write` | store-heavy cold-page pattern |
+| `dtlb-miss` | stable | first-level data TLB misses | `page-stride-read` | `hot-seq-read` | page-granular data access |
+| `itlb-miss` | stable | instruction TLB misses | `random-instruction-pages` | `hot-instruction-loop` | generated executable stubs |
+| `l2-tlb-miss` | stable | second-level data TLB misses | `page-stride-read` | `hot-seq-read` | this project treats `L2_MISS` as TLB, not generic L2 cache |
+| `l1i-cache-miss` | experimental | L1I demand misses | `random-instruction-pages` | `hot-instruction-loop` | more code-shape sensitive |
+| `l1-load-miss-nonspec` | experimental | nonspec load misses | `random-pointer-chase` | `hot-seq-read` | semantics are more implementation-specific |
+| `l1-store-miss-nonspec` | experimental | nonspec store misses | `random-page-write` | `hot-seq-write` | write-allocate effects can complicate reading |
+
+## 3. Stability Tiers and Core-Type Caveats
+
+The project now uses explicit tiers:
+
+- `stable`: curated, validated showcase pairs intended to teach the counter clearly
+- `experimental`: visible and runnable, but not yet trusted as “production-ready teaching examples”
+
+On this M4 Max machine, demo interpretation is P-core-oriented by default.
+
+Why:
+
+- earlier reverse-engineering work showed counter behavior differs across logical CPUs and perflevels
+- the demo runner therefore defaults to best-effort P-core scheduling
+- `validate` also forces `--require-stable-cpu` and `--require-active-pmu`
+
+The library itself stays neutral. These P-core preferences are a demo-runner policy, not a `perf.h` requirement.
+
+## 4. Migration Notes
+
+The old constructor-heavy sampled API is no longer the recommended path.
+
+### Old sampled code
 
 ```cpp
 PerfScope guard("hot_path", CYCLES | L1_MISS, 1024);
 ```
 
-update it to:
+### New sampled code
 
 ```cpp
 PERF_SCOPE_SAMPLED("hot_path", CYCLES | L1_MISS, 1024);
 ```
 
-If you want the new low-overhead cached path for ordinary scopes, update:
+### Old ordinary scope
 
 ```cpp
 PerfScope guard("mixer_update", CYCLES | INSTRUCTIONS);
 ```
 
-to:
+### New ordinary scope
 
 ```cpp
 PERF_SCOPE("mixer_update", CYCLES | INSTRUCTIONS);
 ```
 
-The direct `PerfScope` constructor still exists for dynamic cases, but the macros are now the preferred production API.
+The direct `PerfScope` constructor still exists for dynamic cases, but the macros are now the intended production API because they cache per-callsite state.
 
-## Files
+## Repo Layout
 
-- [perf.h](/Users/eppie/codex_projects/cpu_counter/perf.h): single-header library
-- [main.cpp](/Users/eppie/codex_projects/cpu_counter/main.cpp): tiny usage example
-- [Makefile](/Users/eppie/codex_projects/cpu_counter/Makefile): builds the example
+- [perf.h](/Users/eppie/codex_projects/cpu_counter/perf.h): shipped single-header library
+- [main.cpp](/Users/eppie/codex_projects/cpu_counter/main.cpp): CLI demo runner
+- [demos/catalog.h](/Users/eppie/codex_projects/cpu_counter/demos/catalog.h): registry types and shared demo declarations
+- [demos/catalog.cpp](/Users/eppie/codex_projects/cpu_counter/demos/catalog.cpp): counter catalog and workload registry
+- [demos/workloads.cpp](/Users/eppie/codex_projects/cpu_counter/demos/workloads.cpp): curated microarchitecture workloads
+- [tests/api_compile.cpp](/Users/eppie/codex_projects/cpu_counter/tests/api_compile.cpp): public API smoke test
+- [tests/registry_check.cpp](/Users/eppie/codex_projects/cpu_counter/tests/registry_check.cpp): stable registry validation
