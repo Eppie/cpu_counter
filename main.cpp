@@ -9,6 +9,7 @@
 #include <iostream>
 #include <limits>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -393,6 +394,94 @@ double MeanWallNs(const WorkloadRunSummary &summary) {
   return total / static_cast<double>(summary.samples.size());
 }
 
+std::string AddThousandsSeparators(std::string digits) {
+  if (digits.empty()) {
+    return digits;
+  }
+  bool negative = false;
+  if (digits[0] == '-') {
+    negative = true;
+    digits.erase(digits.begin());
+  }
+  const std::size_t dot = digits.find('.');
+  std::string integer = dot == std::string::npos ? digits : digits.substr(0, dot);
+  const std::string fraction = dot == std::string::npos ? std::string() : digits.substr(dot);
+
+  std::string grouped;
+  grouped.reserve(integer.size() + integer.size() / 3);
+  for (std::size_t i = 0; i < integer.size(); ++i) {
+    if (i > 0 && ((integer.size() - i) % 3 == 0)) {
+      grouped.push_back(',');
+    }
+    grouped.push_back(integer[i]);
+  }
+  if (negative) {
+    grouped.insert(grouped.begin(), '-');
+  }
+  grouped += fraction;
+  return grouped;
+}
+
+std::string FormatDouble(double value, int precision = 2) {
+  if (std::isinf(value)) {
+    return value < 0.0 ? "-inf" : "inf";
+  }
+  std::ostringstream oss;
+  oss << std::fixed << std::setprecision(precision) << value;
+  return AddThousandsSeparators(oss.str());
+}
+
+std::string FormatInteger(std::uint64_t value) {
+  return AddThousandsSeparators(std::to_string(value));
+}
+
+std::string FormatWallNs(double ns) {
+  std::ostringstream oss;
+  oss << FormatDouble(ns, 0) << " ns";
+  if (ns >= 1'000'000.0) {
+    oss << " (" << FormatDouble(ns / 1'000'000.0, 3) << " ms)";
+  } else if (ns >= 1'000.0) {
+    oss << " (" << FormatDouble(ns / 1'000.0, 3) << " us)";
+  }
+  return oss.str();
+}
+
+std::string_view TrimBlock(std::string_view block) {
+  while (!block.empty() && (block.front() == '\n' || block.front() == '\r')) {
+    block.remove_prefix(1);
+  }
+  while (!block.empty() && (block.back() == '\n' || block.back() == '\r')) {
+    block.remove_suffix(1);
+  }
+  return block;
+}
+
+void PrintIndentedBlock(std::string_view block, std::string_view indent = "  ") {
+  block = TrimBlock(block);
+  std::size_t start = 0;
+  while (start <= block.size()) {
+    const std::size_t end = block.find('\n', start);
+    const std::string_view line =
+        end == std::string_view::npos ? block.substr(start) : block.substr(start, end - start);
+    std::cout << indent << line << '\n';
+    if (end == std::string_view::npos) {
+      break;
+    }
+    start = end + 1;
+  }
+}
+
+const demo::WorkloadExpectation *FindExpectation(const demo::WorkloadDefinition &workload,
+                                                 PerfCounter counter) {
+  const std::string label = CounterLabel(counter);
+  for (const auto &expectation : workload.expectations) {
+    if (expectation.counter_name == label) {
+      return &expectation;
+    }
+  }
+  return nullptr;
+}
+
 std::string MismatchReason(const PerfMeasurement &measurement, const demo::RunOptions &options) {
   std::ostringstream oss;
   oss << "sample rejected";
@@ -430,18 +519,47 @@ PerfCounterSet CounterMeasurementSet(const demo::CounterDefinition &definition) 
 void PrintWorkloadRunSummary(const WorkloadRunSummary &summary) {
   std::cout << "- workload: " << summary.workload->id << '\n';
   std::cout << "  " << summary.workload->summary << '\n';
-  std::cout << "  repeats=" << summary.samples.size() << " attempts=" << summary.attempts_used
-            << " mean_wall_ns=" << std::fixed << std::setprecision(0) << MeanWallNs(summary)
-            << '\n';
+  std::cout << "  repeats=" << summary.samples.size()
+            << " attempts=" << FormatInteger(summary.attempts_used)
+            << " mean_wall=" << FormatWallNs(MeanWallNs(summary)) << '\n';
 
+  std::size_t label_width = std::string("counter").size();
+  std::size_t value_width = std::string("mean").size();
+  std::vector<std::pair<PerfCounter, double>> measured;
   for (std::uint8_t i = 0; i < summary.measured_counters.count; ++i) {
     const PerfCounter counter = summary.measured_counters.items[i];
     const auto mean = MeanCounterValue(summary, counter);
     if (!mean.has_value()) {
       continue;
     }
-    std::cout << "  " << CounterLabel(counter) << '=' << std::fixed << std::setprecision(2)
-              << *mean << '\n';
+    measured.push_back({counter, *mean});
+    label_width = std::max(label_width, CounterLabel(counter).size());
+    value_width = std::max(value_width, FormatDouble(*mean).size());
+  }
+
+  if (!measured.empty()) {
+    std::cout << "  measured counters:\n";
+    std::cout << "    " << std::left << std::setw(static_cast<int>(label_width)) << "counter"
+              << "  " << std::right << std::setw(static_cast<int>(value_width)) << "mean"
+              << "  expected\n";
+    for (const auto &[counter, mean] : measured) {
+      const std::string label = CounterLabel(counter);
+      const demo::WorkloadExpectation *expectation = FindExpectation(*summary.workload, counter);
+      std::cout << "    " << std::left << std::setw(static_cast<int>(label_width)) << label << "  "
+                << std::right << std::setw(static_cast<int>(value_width)) << FormatDouble(mean)
+                << "  " << (expectation != nullptr ? expectation->level : "-") << '\n';
+      if (expectation != nullptr && !expectation->note.empty()) {
+        std::cout << "      note: " << expectation->note << '\n';
+      }
+    }
+  }
+
+  const auto cycles = MeanCounterValue(summary, CYCLES);
+  const auto instructions = MeanCounterValue(summary, INSTRUCTIONS);
+  if (cycles.has_value() && instructions.has_value() && *cycles > 0.0 && *instructions > 0.0) {
+    std::cout << "  derived:\n";
+    std::cout << "    IPC  " << FormatDouble(*instructions / *cycles, 3) << '\n';
+    std::cout << "    CPI  " << FormatDouble(*cycles / *instructions, 3) << '\n';
   }
 }
 
@@ -657,12 +775,19 @@ int ExplainDemo(const CliOptions &options) {
   std::cout << "- group: " << demo::ToString(workload->group) << '\n';
   std::cout << "- summary: " << workload->summary << '\n';
   std::cout << "- mechanism: " << workload->mechanism << '\n';
+  if (!workload->configuration.empty()) {
+    std::cout << "- configuration: " << workload->configuration << '\n';
+  }
   std::cout << "- default warmups: " << workload->default_warmups << '\n';
   std::cout << "- default repeats: " << workload->default_repeats << '\n';
   std::cout << "- expected counters:\n";
   for (const auto &expectation : workload->expectations) {
     std::cout << "  - " << expectation.counter_name << " -> " << expectation.level << ": "
               << expectation.note << '\n';
+  }
+  if (!workload->code_snippet.empty()) {
+    std::cout << "- representative code:\n";
+    PrintIndentedBlock(workload->code_snippet, "    ");
   }
   return 0;
 }
@@ -740,6 +865,14 @@ int RunDemo(CliOptions options) {
   std::cout << workload->title << " (" << workload->id << ")\n";
   std::cout << workload->summary << '\n';
   std::cout << workload->mechanism << '\n';
+  if (!workload->configuration.empty()) {
+    std::cout << "\nWorkload details:\n";
+    std::cout << "- configuration: " << workload->configuration << '\n';
+  }
+  if (!workload->code_snippet.empty()) {
+    std::cout << "- representative code:\n";
+    PrintIndentedBlock(workload->code_snippet, "    ");
+  }
   std::cout << "\nExpected counter behavior:\n";
   for (const auto &expectation : workload->expectations) {
     std::cout << "- " << expectation.counter_name << " -> " << expectation.level << ": "

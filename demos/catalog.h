@@ -117,6 +117,8 @@ struct WorkloadDefinition {
   std::string_view title;
   std::string_view summary;
   std::string_view mechanism;
+  std::string_view configuration;
+  std::string_view code_snippet;
   Group group = Group::CoreExecution;
   Tier tier = Tier::Stable;
   std::size_t default_repeats = 3;
