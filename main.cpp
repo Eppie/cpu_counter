@@ -622,6 +622,7 @@ void PrintDemoContrastSummary(const demo::WorkloadDefinition &primary,
   std::size_t metric_width = std::string("metric").size();
   std::size_t primary_width = primary.title.size();
   std::size_t contrast_width = contrast.title.size();
+  std::size_t ratio_width = std::string("ratio").size();
 
   struct Row {
     std::string metric;
@@ -651,18 +652,29 @@ void PrintDemoContrastSummary(const demo::WorkloadDefinition &primary,
     metric_width = std::max(metric_width, row.metric.size());
     primary_width = std::max(primary_width, row.primary_value.size());
     contrast_width = std::max(contrast_width, row.contrast_value.size());
+    ratio_width = std::max(ratio_width, row.ratio.size());
     rows.push_back(std::move(row));
   }
 
+  const auto dashes = [](std::size_t count) { return std::string(count, '-'); };
+
   std::cout << "  " << std::left << std::setw(static_cast<int>(metric_width)) << "metric"
-            << "  " << std::right << std::setw(static_cast<int>(primary_width)) << primary.title
-            << "  " << std::right << std::setw(static_cast<int>(contrast_width)) << contrast.title
-            << "  ratio\n";
+            << " | " << std::right << std::setw(static_cast<int>(primary_width)) << primary.title
+            << " | " << std::right << std::setw(static_cast<int>(contrast_width))
+            << contrast.title << " | " << std::right << std::setw(static_cast<int>(ratio_width))
+            << "ratio" << '\n';
+  std::cout << "  " << std::left << std::setw(static_cast<int>(metric_width))
+            << dashes(metric_width) << " | " << std::right
+            << std::setw(static_cast<int>(primary_width)) << dashes(primary_width) << " | "
+            << std::right << std::setw(static_cast<int>(contrast_width))
+            << dashes(contrast_width) << " | " << std::right
+            << std::setw(static_cast<int>(ratio_width)) << dashes(ratio_width) << '\n';
   for (const Row &row : rows) {
     std::cout << "  " << std::left << std::setw(static_cast<int>(metric_width)) << row.metric
-              << "  " << std::right << std::setw(static_cast<int>(primary_width))
-              << row.primary_value << "  " << std::right << std::setw(static_cast<int>(contrast_width))
-              << row.contrast_value << "  " << row.ratio << '\n';
+              << " | " << std::right << std::setw(static_cast<int>(primary_width))
+              << row.primary_value << " | " << std::right
+              << std::setw(static_cast<int>(contrast_width)) << row.contrast_value << " | "
+              << std::right << std::setw(static_cast<int>(ratio_width)) << row.ratio << '\n';
   }
 }
 
