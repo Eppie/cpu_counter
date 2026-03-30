@@ -418,6 +418,12 @@ std::string MismatchReason(const PerfMeasurement &measurement, const demo::RunOp
 }
 
 PerfCounterSet CounterMeasurementSet(const demo::CounterDefinition &definition) {
+  if (definition.counter == BRANCH_MISS) {
+    return CYCLES | INSTRUCTIONS | BRANCHES | BRANCH_MISS;
+  }
+  if (definition.counter == BRANCHES) {
+    return CYCLES | INSTRUCTIONS | BRANCHES;
+  }
   return CYCLES | INSTRUCTIONS | definition.counter;
 }
 

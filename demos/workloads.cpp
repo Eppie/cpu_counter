@@ -348,6 +348,20 @@ DemoEnvironment::ExecStub DemoEnvironment::ExecStubAt(std::size_t page) const {
 
 namespace workloads {
 
+[[gnu::noinline]] std::uint64_t BranchTakenPath(std::uint64_t sum, std::uint64_t x) {
+  asm volatile("" : "+r"(sum) : "r"(x) : "memory");
+  sum += (x * 3ULL) ^ 0x9e3779b97f4a7c15ULL;
+  sum ^= (sum << 7) + x + 17ULL;
+  return sum;
+}
+
+[[gnu::noinline]] std::uint64_t BranchNotTakenPath(std::uint64_t sum, std::uint64_t x) {
+  asm volatile("" : "+r"(sum) : "r"(x) : "memory");
+  sum += x + 1ULL;
+  sum ^= (sum >> 3) + 0x85ebca6bULL;
+  return sum;
+}
+
 [[gnu::noinline]] std::uint64_t DenseIntegerAlu(DemoEnvironment &) {
   std::uint64_t a = 0x12345678ULL;
   std::uint64_t b = 0x9abcdef0ULL;
@@ -430,15 +444,15 @@ namespace workloads {
 
 [[gnu::noinline]] std::uint64_t PredictableBranch(DemoEnvironment &state) {
   std::uint64_t sum = 0;
-  constexpr std::size_t kPasses = 64;
+  constexpr std::size_t kPasses = 16;
   for (std::size_t pass = 0; pass < kPasses; ++pass) {
 #pragma clang loop vectorize(disable)
 #pragma clang loop interleave(disable)
     for (std::size_t i = 0; i < state.branch_source.size(); ++i) {
       if ((i & 255ULL) != 0) {
-        sum += i + pass;
+        sum = BranchTakenPath(sum, i + pass);
       } else {
-        sum += 1;
+        sum = BranchNotTakenPath(sum, pass + 1);
       }
     }
   }
@@ -449,31 +463,16 @@ namespace workloads {
 [[gnu::noinline]] std::uint64_t UnpredictableBranch(DemoEnvironment &state) {
   const auto *data = state.branch_source.data();
   std::uint64_t sum = 0;
-  constexpr std::size_t kPasses = 64;
+  constexpr std::size_t kPasses = 16;
   for (std::size_t pass = 0; pass < kPasses; ++pass) {
 #pragma clang loop vectorize(disable)
 #pragma clang loop interleave(disable)
     for (std::size_t i = 0; i < state.branch_source.size(); ++i) {
-      const std::uint64_t bits = data[i];
+      const std::uint64_t bits = data[i] ^ static_cast<std::uint64_t>(pass);
       if (bits & 1ULL) {
-        sum += (i * 3ULL) ^ pass;
+        sum = BranchTakenPath(sum, bits + i);
       } else {
-        sum += i + pass + 1;
-      }
-      if (bits & 2ULL) {
-        sum ^= (sum << 7) + bits + i;
-      } else {
-        sum ^= (sum >> 3) + pass + 0x9e3779b97f4a7c15ULL;
-      }
-      if (bits & 4ULL) {
-        sum += bits ^ (i + pass);
-      } else {
-        sum += (bits >> 5) + i + 17ULL;
-      }
-      if (bits & 8ULL) {
-        sum ^= bits + (sum << 1);
-      } else {
-        sum ^= (bits >> 1) + (sum >> 1) + 3ULL;
+        sum = BranchNotTakenPath(sum, bits + pass + 1ULL);
       }
     }
   }

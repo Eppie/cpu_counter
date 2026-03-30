@@ -6,6 +6,7 @@ namespace demo {
 namespace {
 
 const WorkloadExpectation kDenseAluExpectations[] = {
+    {"cycles", "low", "The loop stays in registers and avoids long-latency miss penalties, so total cycle count stays comparatively low."},
     {"instructions", "high", "A tight integer ALU loop retires many instructions with almost no memory stalls."},
     {"branches", "low", "The loop body is mostly straight-line arithmetic, so branch density stays low."},
 };
@@ -38,13 +39,13 @@ const WorkloadExpectation kPageStrideExpectations[] = {
 };
 
 const WorkloadExpectation kPredictableBranchExpectations[] = {
-    {"branches", "high", "The loop executes a conditional every iteration, so retired branch count is high."},
+    {"branches", "high", "The loop executes an actual conditional branch every iteration, so retired branch count is high."},
     {"branch-miss", "low", "The condition is strongly biased, so the predictor stays accurate."},
 };
 
 const WorkloadExpectation kUnpredictableBranchExpectations[] = {
-    {"branches", "high", "The loop still executes a conditional every iteration."},
-    {"branch-miss", "high", "Random branch direction makes the predictor wrong much more often."},
+    {"branches", "high", "The loop still executes a real conditional branch every iteration."},
+    {"branch-miss", "high", "Random branch direction prevents the predictor from settling on an accurate history."},
 };
 
 const WorkloadExpectation kHotInstructionExpectations[] = {
@@ -201,7 +202,7 @@ const CounterDefinition kCounters[] = {
         Tier::Stable,
         CYCLES,
         "random-pointer-chase",
-        "hot-seq-read",
+        "dense-integer-alu",
         {3.0, 50'000},
     },
     {
