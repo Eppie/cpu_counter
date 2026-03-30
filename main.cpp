@@ -559,14 +559,19 @@ void PrintWorkloadRunSummary(const WorkloadRunSummary &summary) {
 
   std::size_t label_width = std::string("counter").size();
   std::size_t value_width = std::string("mean").size();
-  std::vector<std::pair<PerfCounter, double>> measured;
+  struct MeasuredRow {
+    PerfCounter counter;
+    double mean = 0.0;
+    const demo::WorkloadExpectation *expectation = nullptr;
+  };
+  std::vector<MeasuredRow> measured;
   for (std::uint8_t i = 0; i < summary.measured_counters.count; ++i) {
     const PerfCounter counter = summary.measured_counters.items[i];
     const auto mean = MeanCounterValue(summary, counter);
     if (!mean.has_value()) {
       continue;
     }
-    measured.push_back({counter, *mean});
+    measured.push_back({counter, *mean, FindExpectation(*summary.workload, counter)});
     label_width = std::max(label_width, CounterLabel(counter).size());
     value_width = std::max(value_width, FormatDouble(*mean).size());
   }
@@ -576,15 +581,25 @@ void PrintWorkloadRunSummary(const WorkloadRunSummary &summary) {
     std::cout << "    " << std::left << std::setw(static_cast<int>(label_width)) << "counter"
               << "  " << std::right << std::setw(static_cast<int>(value_width)) << "mean"
               << "  expected\n";
-    for (const auto &[counter, mean] : measured) {
-      const std::string label = CounterLabel(counter);
-      const demo::WorkloadExpectation *expectation = FindExpectation(*summary.workload, counter);
+    for (const MeasuredRow &row : measured) {
+      const std::string label = CounterLabel(row.counter);
       std::cout << "    " << std::left << std::setw(static_cast<int>(label_width)) << label << "  "
-                << std::right << std::setw(static_cast<int>(value_width)) << FormatDouble(mean)
-                << "  " << (expectation != nullptr ? expectation->level : "-") << '\n';
-      if (expectation != nullptr && !expectation->note.empty()) {
-        std::cout << "      note: " << expectation->note << '\n';
+                << std::right << std::setw(static_cast<int>(value_width))
+                << FormatDouble(row.mean) << "  "
+                << (row.expectation != nullptr ? row.expectation->level : "-") << '\n';
+    }
+
+    bool printed_notes = false;
+    for (const MeasuredRow &row : measured) {
+      if (row.expectation == nullptr || row.expectation->note.empty()) {
+        continue;
       }
+      if (!printed_notes) {
+        std::cout << "  expectation notes:\n";
+        printed_notes = true;
+      }
+      std::cout << "    - " << CounterLabel(row.counter) << " (" << row.expectation->level
+                << "): " << row.expectation->note << '\n';
     }
   }
 
