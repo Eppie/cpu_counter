@@ -1,6 +1,7 @@
 #include "demos/catalog.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -10,6 +11,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -451,44 +453,56 @@ bool ExecuteWorkload(const demo::WorkloadDefinition &workload, PerfCounterSet me
 
   const std::size_t warmups = options.warmup_override.value_or(workload.default_warmups);
   const std::size_t repeats = options.repeat_override.value_or(workload.default_repeats);
-
-  for (std::size_t i = 0; i < warmups; ++i) {
-    summary.last_sink = workload.run(environment);
-  }
-
-  for (std::size_t repeat = 0; repeat < repeats; ++repeat) {
-    bool captured = false;
-    PerfMeasurement last_measurement;
-    for (std::size_t attempt = 0; attempt < options.run_options.max_attempts; ++attempt) {
-      ++summary.attempts_used;
-      std::uint64_t sink = 0;
-      PerfMeasurement measurement = PerfMeasure(measured_counters, [&] { sink = workload.run(environment); });
-      summary.last_sink = sink;
-      last_measurement = measurement;
-
-      if (!measurement.valid) {
-        summary.error = measurement.error;
-        return false;
-      }
-      if (!demo::SampleMatches(measurement, options.run_options)) {
-        summary.error = MismatchReason(measurement, options.run_options);
-        continue;
-      }
-
-      summary.samples.push_back(measurement);
-      captured = true;
-      break;
+  std::thread worker([&] {
+    std::string worker_error;
+    if (!demo::ApplySchedulerPreference(options.run_options, worker_error)) {
+      summary.error = worker_error;
+      return;
     }
-    if (!captured) {
-      if (summary.error.empty()) {
-        summary.error = MismatchReason(last_measurement, options.run_options);
-      }
-      return false;
-    }
-  }
 
-  summary.valid = true;
-  return true;
+    for (std::size_t i = 0; i < warmups; ++i) {
+      summary.last_sink = workload.run(environment);
+    }
+
+    for (std::size_t repeat = 0; repeat < repeats; ++repeat) {
+      bool captured = false;
+      PerfMeasurement last_measurement;
+      for (std::size_t attempt = 0; attempt < options.run_options.max_attempts; ++attempt) {
+        ++summary.attempts_used;
+        std::uint64_t sink = 0;
+        PerfMeasurement measurement =
+            PerfMeasure(measured_counters, [&] { sink = workload.run(environment); });
+        summary.last_sink = sink;
+        last_measurement = measurement;
+
+        if (!measurement.valid) {
+          summary.error = measurement.error;
+          return;
+        }
+        if (!demo::SampleMatches(measurement, options.run_options)) {
+          summary.error = MismatchReason(measurement, options.run_options);
+          demo::ApplySchedulerPreference(options.run_options, worker_error);
+          std::this_thread::yield();
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          continue;
+        }
+
+        summary.samples.push_back(measurement);
+        captured = true;
+        break;
+      }
+      if (!captured) {
+        if (summary.error.empty()) {
+          summary.error = MismatchReason(last_measurement, options.run_options);
+        }
+        return;
+      }
+    }
+
+    summary.valid = true;
+  });
+  worker.join();
+  return summary.valid;
 }
 
 bool CompareCounterShowcase(const demo::CounterDefinition &definition, demo::DemoEnvironment &environment,
@@ -746,6 +760,7 @@ int Validate(CliOptions options) {
   options.tier_filter = TierFilter::Stable;
   options.run_options.require_active_pmu = true;
   options.run_options.require_stable_cpu = true;
+  options.run_options.max_attempts = std::max<std::size_t>(options.run_options.max_attempts, 64);
 
   demo::DemoEnvironment environment;
   demo::PerfLevelLayout layout;

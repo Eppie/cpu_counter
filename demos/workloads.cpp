@@ -294,7 +294,7 @@ bool DemoEnvironment::Initialize(std::string &error) {
   }
   std::mt19937_64 branch_rng(0xdeadbeefULL);
   for (std::size_t i = 0; i < branch_source.size(); ++i) {
-    branch_source[i] = branch_rng() & 1u ? 1ULL : 0ULL;
+    branch_source[i] = branch_rng();
   }
 
   page_count = kPageWorkingSetBytes / page_size;
@@ -432,6 +432,8 @@ namespace workloads {
   std::uint64_t sum = 0;
   constexpr std::size_t kPasses = 64;
   for (std::size_t pass = 0; pass < kPasses; ++pass) {
+#pragma clang loop vectorize(disable)
+#pragma clang loop interleave(disable)
     for (std::size_t i = 0; i < state.branch_source.size(); ++i) {
       if ((i & 255ULL) != 0) {
         sum += i + pass;
@@ -449,11 +451,29 @@ namespace workloads {
   std::uint64_t sum = 0;
   constexpr std::size_t kPasses = 64;
   for (std::size_t pass = 0; pass < kPasses; ++pass) {
+#pragma clang loop vectorize(disable)
+#pragma clang loop interleave(disable)
     for (std::size_t i = 0; i < state.branch_source.size(); ++i) {
-      if (data[i] & 1ULL) {
+      const std::uint64_t bits = data[i];
+      if (bits & 1ULL) {
         sum += (i * 3ULL) ^ pass;
       } else {
         sum += i + pass + 1;
+      }
+      if (bits & 2ULL) {
+        sum ^= (sum << 7) + bits + i;
+      } else {
+        sum ^= (sum >> 3) + pass + 0x9e3779b97f4a7c15ULL;
+      }
+      if (bits & 4ULL) {
+        sum += bits ^ (i + pass);
+      } else {
+        sum += (bits >> 5) + i + 17ULL;
+      }
+      if (bits & 8ULL) {
+        sum ^= bits + (sum << 1);
+      } else {
+        sum ^= (bits >> 1) + (sum >> 1) + 3ULL;
       }
     }
   }
