@@ -124,6 +124,7 @@ sudo ./cpu_counter help
 ./cpu_counter explain demo random-pointer-chase
 sudo ./cpu_counter run counter l1-load-miss
 sudo ./cpu_counter run demo page-stride-read
+sudo ./cpu_counter run demos --tier stable
 sudo ./cpu_counter validate
 ```
 

@@ -25,6 +25,7 @@ enum class CommandKind {
   ExplainDemo,
   RunCounter,
   RunDemo,
+  RunDemos,
   Validate,
 };
 
@@ -140,6 +141,7 @@ void PrintUsage() {
   std::cout << "  cpu_counter explain demo <id>\n";
   std::cout << "  cpu_counter run counter <name> [--repeat N] [--warmup N] [--prefer-pcore|--prefer-ecore|--prefer-cpu N] [--require-stable-cpu] [--require-active-pmu]\n";
   std::cout << "  cpu_counter run demo <id> [--repeat N] [--warmup N] [--prefer-pcore|--prefer-ecore|--prefer-cpu N] [--require-stable-cpu] [--require-active-pmu]\n";
+  std::cout << "  cpu_counter run demos [--tier stable|experimental|all] [--group <group>] [--repeat N] [--warmup N] [--prefer-pcore|--prefer-ecore|--prefer-cpu N] [--require-stable-cpu] [--require-active-pmu]\n";
   std::cout << "  cpu_counter validate [--group <group>] [--prefer-pcore|--prefer-ecore|--prefer-cpu N] [--require-stable-cpu] [--require-active-pmu]\n\n";
   std::cout << "Groups:\n";
   for (demo::Group group : {
@@ -340,21 +342,34 @@ bool ParseArgs(int argc, char **argv, CliOptions &options, std::string &error) {
   }
 
   if (arg1 == "run") {
-    if (argc < 4) {
-      error = "run requires 'counter <name>' or 'demo <id>'";
+    if (argc < 3) {
+      error = "run requires 'counter <name>', 'demo <id>', or 'demos'";
       return false;
     }
     const std::string_view subject = argv[2];
-    options.target = argv[3];
     if (subject == "counter") {
+      if (argc < 4) {
+        error = "run counter requires a counter name";
+        return false;
+      }
+      options.target = argv[3];
       options.command = CommandKind::RunCounter;
+      return ParseFlags(argc, argv, 4, options, error);
     } else if (subject == "demo") {
+      if (argc < 4) {
+        error = "run demo requires a demo id";
+        return false;
+      }
+      options.target = argv[3];
       options.command = CommandKind::RunDemo;
+      return ParseFlags(argc, argv, 4, options, error);
+    } else if (subject == "demos") {
+      options.command = CommandKind::RunDemos;
+      return ParseFlags(argc, argv, 3, options, error);
     } else {
-      error = "run requires 'counter <name>' or 'demo <id>'";
+      error = "run requires 'counter <name>', 'demo <id>', or 'demos'";
       return false;
     }
-    return ParseFlags(argc, argv, 4, options, error);
   }
 
   if (arg1 == "validate") {
@@ -915,6 +930,136 @@ int ExplainDemo(const CliOptions &options) {
   return 0;
 }
 
+std::vector<const demo::WorkloadDefinition *> FilteredDemos(const CliOptions &options) {
+  std::vector<const demo::WorkloadDefinition *> demos;
+  for (const demo::WorkloadDefinition &workload : demo::Workloads()) {
+    if (!TierMatches(workload.tier, options.tier_filter) ||
+        !GroupMatches(workload.group, options.group_filter)) {
+      continue;
+    }
+    demos.push_back(&workload);
+  }
+  return demos;
+}
+
+int RunDemoWorkload(const demo::WorkloadDefinition &workload, demo::DemoEnvironment &environment,
+                    const CliOptions &options) {
+  std::cout << workload.title << " (" << workload.id << ")\n";
+  std::cout << workload.summary << '\n';
+  std::cout << workload.mechanism << '\n';
+  if (!workload.configuration.empty()) {
+    std::cout << "\nWorkload details:\n";
+    std::cout << "- configuration: " << workload.configuration << '\n';
+  }
+  if (!workload.code_snippet.empty()) {
+    std::cout << "- representative code:\n";
+    PrintIndentedBlock(workload.code_snippet, "    ");
+  }
+  if (!workload.contrast_demo_id.empty()) {
+    if (const demo::WorkloadDefinition *contrast = demo::FindWorkload(workload.contrast_demo_id)) {
+      std::cout << "- contrast demo: " << contrast->title << " (" << contrast->id << ")\n";
+    }
+    if (!workload.contrast_blurb.empty()) {
+      std::cout << "- comparison goal: " << workload.contrast_blurb << '\n';
+    }
+  }
+  std::cout << "\nExpected counter behavior:\n";
+  for (const auto &expectation : workload.expectations) {
+    std::cout << "- " << expectation.counter_name << " -> " << expectation.level << ": "
+              << expectation.note << '\n';
+  }
+  std::cout << std::flush;
+
+  WorkloadRunSummary summary;
+  if (!ExecuteWorkload(workload, workload.measurement_counters, environment, options, summary)) {
+    std::cout << "\nRun failed: " << summary.error << '\n';
+    return 1;
+  }
+
+  DemoContrast contrast;
+  if (!workload.contrast_demo_id.empty()) {
+    contrast.workload = demo::FindWorkload(workload.contrast_demo_id);
+    if (contrast.workload == nullptr) {
+      std::cout << "\nRun failed: unknown contrast demo " << workload.contrast_demo_id << '\n';
+      return 1;
+    }
+    const PerfCounterSet contrast_set =
+        workload.measurement_counters | contrast.workload->measurement_counters;
+    if (contrast_set.overflow) {
+      std::cout << "\nRun failed: contrast measurement set exceeds PERF_MAX_SCOPE_EVENTS\n";
+      return 1;
+    }
+    if (!ExecuteWorkload(*contrast.workload, contrast_set, environment, options, contrast.summary)) {
+      std::cout << "\nRun failed: contrast demo failed: " << contrast.summary.error << '\n';
+      return 1;
+    }
+  }
+
+  std::cout << "\nMeasured output:\n";
+  PrintWorkloadRunSummary(summary);
+  if (contrast.workload != nullptr) {
+    std::cout << '\n';
+    PrintWorkloadRunSummary(contrast.summary);
+    PrintDemoContrastSummary(workload, summary, *contrast.workload, contrast.summary);
+  }
+
+  std::cout << "\nInterpretation:\n";
+  const auto ipc = MeanIpc(summary);
+  const auto cpi = MeanCpi(summary);
+  if (contrast.workload != nullptr) {
+    const auto contrast_ipc = MeanIpc(contrast.summary);
+    std::cout << "- " << workload.title << " took "
+              << FormatRatio(MeanWallNs(summary), MeanWallNs(contrast.summary))
+              << " the wall time of " << contrast.workload->title << ".\n";
+    if (const auto cycles = MeanCounterValue(summary, CYCLES);
+        cycles.has_value()) {
+      if (const auto contrast_cycles = MeanCounterValue(contrast.summary, CYCLES);
+          contrast_cycles.has_value()) {
+        std::cout << "- Cycle count changed by "
+                  << FormatRatio(*cycles, *contrast_cycles)
+                  << ", so the slowdown shows up directly in the core-cycle counter.\n";
+      }
+    }
+    if (const auto misses = MeanCounterValue(summary, L1_LOAD_MISS);
+        misses.has_value()) {
+      if (const auto contrast_misses = MeanCounterValue(contrast.summary, L1_LOAD_MISS);
+          contrast_misses.has_value()) {
+        std::cout << "- L1 load misses changed by "
+                  << FormatRatio(*misses, *contrast_misses)
+                  << ", which is the clearest signal that randomizing the chain destroyed locality.\n";
+      }
+    }
+    if (ipc.has_value() && contrast_ipc.has_value()) {
+      std::cout << "- IPC moved from " << FormatDouble(*contrast_ipc, 3) << " in "
+                << contrast.workload->id << " to " << FormatDouble(*ipc, 3) << " in "
+                << workload.id
+                << ", which means the random chase spent far more of its time stalled on miss latency.\n";
+    }
+    if (!workload.contrast_blurb.empty()) {
+      std::cout << "- " << workload.contrast_blurb << '\n';
+    }
+  } else {
+    if (ipc.has_value() && cpi.has_value()) {
+      std::cout << "- IPC is " << FormatDouble(*ipc, 3) << " and CPI is "
+                << FormatDouble(*cpi, 3) << ".\n";
+    }
+    for (const auto &expectation : workload.expectations) {
+      const demo::CounterDefinition *definition = demo::FindCounter(expectation.counter_name);
+      if (definition == nullptr) {
+        continue;
+      }
+      const auto mean = MeanCounterValue(summary, definition->counter);
+      if (!mean.has_value()) {
+        continue;
+      }
+      std::cout << "- " << expectation.counter_name << " measured "
+                << FormatDouble(*mean) << " and is expected to be " << expectation.level
+                << " here because " << expectation.note << '\n';
+    }
+  }
+  return 0;
+}
+
 int RunCounter(CliOptions options) {
   const demo::CounterDefinition *definition = demo::FindCounter(options.target);
   if (definition == nullptr) {
@@ -985,119 +1130,59 @@ int RunDemo(CliOptions options) {
 
   PrintRunSettings(options, layout);
   std::cout << '\n';
-  std::cout << workload->title << " (" << workload->id << ")\n";
-  std::cout << workload->summary << '\n';
-  std::cout << workload->mechanism << '\n';
-  if (!workload->configuration.empty()) {
-    std::cout << "\nWorkload details:\n";
-    std::cout << "- configuration: " << workload->configuration << '\n';
-  }
-  if (!workload->code_snippet.empty()) {
-    std::cout << "- representative code:\n";
-    PrintIndentedBlock(workload->code_snippet, "    ");
-  }
-  if (!workload->contrast_demo_id.empty()) {
-    if (const demo::WorkloadDefinition *contrast = demo::FindWorkload(workload->contrast_demo_id)) {
-      std::cout << "- contrast demo: " << contrast->title << " (" << contrast->id << ")\n";
-    }
-    if (!workload->contrast_blurb.empty()) {
-      std::cout << "- comparison goal: " << workload->contrast_blurb << '\n';
-    }
-  }
-  std::cout << "\nExpected counter behavior:\n";
-  for (const auto &expectation : workload->expectations) {
-    std::cout << "- " << expectation.counter_name << " -> " << expectation.level << ": "
-              << expectation.note << '\n';
-  }
-  std::cout << std::flush;
+  return RunDemoWorkload(*workload, environment, options);
+}
 
-  WorkloadRunSummary summary;
-  if (!ExecuteWorkload(*workload, workload->measurement_counters, environment, options, summary)) {
-    std::cout << "\nRun failed: " << summary.error << '\n';
+int RunDemos(CliOptions options) {
+  std::vector<const demo::WorkloadDefinition *> demos = FilteredDemos(options);
+  if (demos.empty()) {
+    std::cerr << "no demos matched the requested filters\n";
     return 1;
   }
 
-  DemoContrast contrast;
-  if (!workload->contrast_demo_id.empty()) {
-    contrast.workload = demo::FindWorkload(workload->contrast_demo_id);
-    if (contrast.workload == nullptr) {
-      std::cout << "\nRun failed: unknown contrast demo " << workload->contrast_demo_id << '\n';
-      return 1;
+  demo::DemoEnvironment environment;
+  demo::PerfLevelLayout layout;
+  std::string error;
+  if (!PrepareRunEnvironment(options, environment, layout, error)) {
+    std::cerr << error << '\n';
+    return 1;
+  }
+
+  PrintRunSettings(options, layout);
+  std::cout << "\nRunning " << demos.size() << " demo"
+            << (demos.size() == 1 ? "" : "s") << ".\n";
+  std::cout << std::flush;
+
+  std::size_t failures = 0;
+  std::vector<std::string> failed_ids;
+  for (std::size_t i = 0; i < demos.size(); ++i) {
+    if (i != 0) {
+      std::cout << "\n";
     }
-    const PerfCounterSet contrast_set = workload->measurement_counters | contrast.workload->measurement_counters;
-    if (contrast_set.overflow) {
-      std::cout << "\nRun failed: contrast measurement set exceeds PERF_MAX_SCOPE_EVENTS\n";
-      return 1;
-    }
-    if (!ExecuteWorkload(*contrast.workload, contrast_set, environment, options, contrast.summary)) {
-      std::cout << "\nRun failed: contrast demo failed: " << contrast.summary.error << '\n';
-      return 1;
+    std::cout << "============================================================\n";
+    std::cout << "[" << (i + 1) << "/" << demos.size() << "] " << demos[i]->title << " ("
+              << demos[i]->id << ")\n";
+    std::cout << "============================================================\n";
+    const int rc = RunDemoWorkload(*demos[i], environment, options);
+    if (rc != 0) {
+      ++failures;
+      failed_ids.push_back(std::string(demos[i]->id));
     }
   }
 
-  std::cout << "\nMeasured output:\n";
-  PrintWorkloadRunSummary(summary);
-  if (contrast.workload != nullptr) {
+  std::cout << "\nSummary:\n";
+  std::cout << "- demos run: " << demos.size() << '\n';
+  std::cout << "- successes: " << (demos.size() - failures) << '\n';
+  std::cout << "- failures: " << failures << '\n';
+  if (!failed_ids.empty()) {
+    std::cout << "- failed ids:";
+    for (const std::string &id : failed_ids) {
+      std::cout << ' ' << id;
+    }
     std::cout << '\n';
-    PrintWorkloadRunSummary(contrast.summary);
-    PrintDemoContrastSummary(*workload, summary, *contrast.workload, contrast.summary);
   }
 
-  std::cout << "\nInterpretation:\n";
-  const auto ipc = MeanIpc(summary);
-  const auto cpi = MeanCpi(summary);
-  if (contrast.workload != nullptr) {
-    const auto contrast_ipc = MeanIpc(contrast.summary);
-    std::cout << "- " << workload->title << " took "
-              << FormatRatio(MeanWallNs(summary), MeanWallNs(contrast.summary))
-              << " the wall time of " << contrast.workload->title << ".\n";
-    if (const auto cycles = MeanCounterValue(summary, CYCLES);
-        cycles.has_value()) {
-      if (const auto contrast_cycles = MeanCounterValue(contrast.summary, CYCLES);
-          contrast_cycles.has_value()) {
-        std::cout << "- Cycle count changed by "
-                  << FormatRatio(*cycles, *contrast_cycles)
-                  << ", so the slowdown shows up directly in the core-cycle counter.\n";
-      }
-    }
-    if (const auto misses = MeanCounterValue(summary, L1_LOAD_MISS);
-        misses.has_value()) {
-      if (const auto contrast_misses = MeanCounterValue(contrast.summary, L1_LOAD_MISS);
-          contrast_misses.has_value()) {
-        std::cout << "- L1 load misses changed by "
-                  << FormatRatio(*misses, *contrast_misses)
-                  << ", which is the clearest signal that randomizing the chain destroyed locality.\n";
-      }
-    }
-    if (ipc.has_value() && contrast_ipc.has_value()) {
-      std::cout << "- IPC moved from " << FormatDouble(*contrast_ipc, 3) << " in "
-                << contrast.workload->id << " to " << FormatDouble(*ipc, 3) << " in "
-                << workload->id
-                << ", which means the random chase spent far more of its time stalled on miss latency.\n";
-    }
-    if (!workload->contrast_blurb.empty()) {
-      std::cout << "- " << workload->contrast_blurb << '\n';
-    }
-  } else {
-    if (ipc.has_value() && cpi.has_value()) {
-      std::cout << "- IPC is " << FormatDouble(*ipc, 3) << " and CPI is "
-                << FormatDouble(*cpi, 3) << ".\n";
-    }
-    for (const auto &expectation : workload->expectations) {
-      const demo::CounterDefinition *definition = demo::FindCounter(expectation.counter_name);
-      if (definition == nullptr) {
-        continue;
-      }
-      const auto mean = MeanCounterValue(summary, definition->counter);
-      if (!mean.has_value()) {
-        continue;
-      }
-      std::cout << "- " << expectation.counter_name << " measured "
-                << FormatDouble(*mean) << " and is expected to be " << expectation.level
-                << " here because " << expectation.note << '\n';
-    }
-  }
-  return 0;
+  return failures == 0 ? 0 : 1;
 }
 
 int Validate(CliOptions options) {
@@ -1182,6 +1267,8 @@ int main(int argc, char **argv) {
       return RunCounter(options);
     case CommandKind::RunDemo:
       return RunDemo(options);
+    case CommandKind::RunDemos:
+      return RunDemos(options);
     case CommandKind::Validate:
       return Validate(options);
   }
