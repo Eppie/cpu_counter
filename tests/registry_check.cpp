@@ -49,5 +49,12 @@ int main() {
     }
   }
 
+  constexpr std::size_t kExpectedCounterCoverage = 63;
+  if (counter_names.size() != kExpectedCounterCoverage) {
+    std::cerr << "expected " << kExpectedCounterCoverage << " counters, saw "
+              << counter_names.size() << '\n';
+    ok = false;
+  }
+
   return ok ? 0 : 1;
 }

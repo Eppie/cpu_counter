@@ -14,6 +14,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <csignal>
 #include <cstdint>
 #include <cstring>
 #include <numeric>
@@ -25,6 +26,7 @@ namespace demo {
 namespace {
 
 volatile std::uint64_t g_sink = 0;
+volatile std::sig_atomic_t g_interrupt_signal_count = 0;
 
 template <typename T>
 std::optional<T> ReadSysctlIntegral(const char *name) {
@@ -101,6 +103,32 @@ std::uint64_t ReadUnaligned64(const std::uint8_t *ptr) {
 
 void WriteUnaligned64(std::uint8_t *ptr, std::uint64_t value) {
   *reinterpret_cast<volatile UnalignedU64 *>(ptr) = value;
+}
+
+void InterruptSignalHandler(int) {
+  g_interrupt_signal_count =
+      static_cast<std::sig_atomic_t>(g_interrupt_signal_count + static_cast<std::sig_atomic_t>(1));
+}
+
+template <typename T>
+inline T NonTemporalLoad(const T *ptr) {
+#if defined(__has_builtin)
+#if __has_builtin(__builtin_nontemporal_load)
+  return __builtin_nontemporal_load(ptr);
+#endif
+#endif
+  return *ptr;
+}
+
+template <typename T>
+inline void NonTemporalStore(T value, T *ptr) {
+#if defined(__has_builtin)
+#if __has_builtin(__builtin_nontemporal_store)
+  __builtin_nontemporal_store(value, ptr);
+  return;
+#endif
+#endif
+  *ptr = value;
 }
 
 std::uint32_t EncodeMovzX0(std::uint16_t imm16) {
@@ -609,6 +637,46 @@ namespace workloads {
   return g_sink;
 }
 
+[[gnu::noinline]] std::uint64_t InterruptStorm(DemoEnvironment &) {
+  struct sigaction action {};
+  struct sigaction old_action {};
+  action.sa_handler = &InterruptSignalHandler;
+  action.sa_flags = SA_RESTART;
+  sigemptyset(&action.sa_mask);
+  sigaction(SIGUSR1, &action, &old_action);
+
+  sigset_t set;
+  sigemptyset(&set);
+  sigaddset(&set, SIGUSR1);
+  pthread_sigmask(SIG_UNBLOCK, &set, nullptr);
+
+  std::atomic<bool> stop{false};
+  const pthread_t target = pthread_self();
+  std::thread sender([&] {
+    constexpr std::size_t kSignals = 100'000;
+    for (std::size_t i = 0; i < kSignals && !stop.load(std::memory_order_acquire); ++i) {
+      pthread_kill(target, SIGUSR1);
+    }
+  });
+
+  std::uint64_t a = 0x12345678ULL;
+  std::uint64_t b = 0x9abcdef0ULL;
+  constexpr std::size_t kIters = 50'000'000;
+  for (std::size_t i = 0; i < kIters; ++i) {
+    a += (b ^ static_cast<std::uint64_t>(i)) + 0x9e3779b97f4a7c15ULL;
+    b = (b << 9) | (b >> 55);
+    b ^= a + 0x85ebca6bULL;
+  }
+
+  stop.store(true, std::memory_order_release);
+  sender.join();
+  sigaction(SIGUSR1, &old_action, nullptr);
+
+  const std::uint64_t result = a ^ b ^ static_cast<std::uint64_t>(g_interrupt_signal_count);
+  g_sink ^= result;
+  return result;
+}
+
 [[gnu::noinline]] std::uint64_t PageStrideRead(DemoEnvironment &state) {
   volatile const std::uint64_t *base = state.page_base;
   std::uint64_t sum = 0;
@@ -619,6 +687,57 @@ namespace workloads {
       sum += base[page * stride];
     }
   }
+  g_sink ^= sum;
+  return sum;
+}
+
+[[gnu::noinline]] std::uint64_t NtStreamRead(DemoEnvironment &state) {
+  const std::uint64_t *data = state.stream_read.data();
+  std::uint64_t sum = 0;
+  constexpr std::size_t kPasses = 8;
+  for (std::size_t pass = 0; pass < kPasses; ++pass) {
+#pragma clang loop vectorize(disable)
+#pragma clang loop interleave(disable)
+    for (std::size_t i = 0; i < state.stream_read.size(); ++i) {
+      sum += NonTemporalLoad(data + i);
+    }
+  }
+  g_sink ^= sum;
+  return sum;
+}
+
+[[gnu::noinline]] std::uint64_t NtStreamWrite(DemoEnvironment &state) {
+  std::uint64_t *data = state.stream_store.data();
+  constexpr std::size_t kPasses = 8;
+  for (std::size_t pass = 0; pass < kPasses; ++pass) {
+#pragma clang loop vectorize(disable)
+#pragma clang loop interleave(disable)
+    for (std::size_t i = 0; i < state.stream_store.size(); ++i) {
+      const std::uint64_t value = data[i] + static_cast<std::uint64_t>(i + pass + 1);
+      NonTemporalStore(value, data + i);
+    }
+  }
+  g_sink ^= data[7];
+  return data[7];
+}
+
+[[gnu::noinline]] std::uint64_t FirstTouchFault(DemoEnvironment &state) {
+  constexpr std::size_t kFaultBytes = 256 * 1024 * 1024;
+  void *mapping = ::mmap(nullptr, kFaultBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+  if (mapping == MAP_FAILED) {
+    return 0;
+  }
+
+  auto *bytes = static_cast<volatile std::uint8_t *>(mapping);
+  std::uint64_t sum = 0;
+  const std::size_t pages = kFaultBytes / state.page_size;
+  for (std::size_t page = 0; page < pages; ++page) {
+    const std::size_t offset = page * state.page_size;
+    bytes[offset] = static_cast<std::uint8_t>(page);
+    sum += bytes[offset];
+  }
+
+  ::munmap(mapping, kFaultBytes);
   g_sink ^= sum;
   return sum;
 }
@@ -817,6 +936,44 @@ namespace workloads {
         sum = BranchNotTakenPath(sum, bits + pass + 1ULL);
       }
     }
+  }
+  g_sink ^= sum;
+  return sum;
+}
+
+[[gnu::noinline]] std::uint64_t StoreOrderFriendly(DemoEnvironment &) {
+  constexpr std::size_t kBaseWords = 1u << 15;
+  constexpr std::size_t kOffsetWords = 513;
+  constexpr std::size_t kMask = kBaseWords - 1;
+  constexpr std::size_t kIters = 8'000'000;
+  std::vector<std::uint64_t> storage(kBaseWords + kOffsetWords + 1, 0);
+  volatile std::uint64_t *stores = storage.data();
+  volatile const std::uint64_t *loads = storage.data() + kOffsetWords;
+  std::size_t index = 0;
+  std::uint64_t sum = 0;
+  for (std::size_t i = 0; i < kIters; ++i) {
+    index = (index * 1315423911ULL + 17ULL) & kMask;
+    stores[index] = static_cast<std::uint64_t>(i + sum);
+    sum += loads[index];
+  }
+  g_sink ^= sum;
+  return sum;
+}
+
+[[gnu::noinline]] std::uint64_t StoreOrderAlias(DemoEnvironment &) {
+  constexpr std::size_t kBaseWords = 1u << 15;
+  constexpr std::size_t kOffsetWords = 512;
+  constexpr std::size_t kMask = kBaseWords - 1;
+  constexpr std::size_t kIters = 8'000'000;
+  std::vector<std::uint64_t> storage(kBaseWords + kOffsetWords + 1, 0);
+  volatile std::uint64_t *stores = storage.data();
+  volatile const std::uint64_t *loads = storage.data() + kOffsetWords;
+  std::size_t index = 0;
+  std::uint64_t sum = 0;
+  for (std::size_t i = 0; i < kIters; ++i) {
+    index = (index * 1315423911ULL + 17ULL) & kMask;
+    stores[index] = static_cast<std::uint64_t>(i + sum);
+    sum += loads[index];
   }
   g_sink ^= sum;
   return sum;

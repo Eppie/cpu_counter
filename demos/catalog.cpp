@@ -11,6 +11,7 @@ const WorkloadExpectation kDenseAluExpectations[] = {
     {"inst-all", "high", "This is a dense compute loop, so the all-instruction counter should rise along with fixed instructions."},
     {"inst-int-alu", "high", "Most of the work is integer arithmetic on registers, which is exactly what this counter is meant to reflect."},
     {"branches", "low", "The loop body is mostly straight-line arithmetic, so branch density stays low."},
+    {"interrupt-pending", "low", "There are no deliberately injected asynchronous events here, so pending-interrupt pressure should stay near baseline."},
 };
 
 const WorkloadExpectation kHotReadExpectations[] = {
@@ -19,11 +20,18 @@ const WorkloadExpectation kHotReadExpectations[] = {
     {"dtlb-miss", "low", "The address footprint is tiny, so DTLB pressure stays near zero."},
     {"l2-tlb-miss", "low", "A tiny hot footprint should not walk into second-level data TLB misses."},
     {"dtlb-miss-nonspec", "low", "The same hot footprint also keeps the non-speculative DTLB miss counter near zero."},
+    {"mmu-virtual-memory-fault", "low", "This loop keeps touching already-hot pages, so it should not trigger fresh virtual-memory faults."},
 };
 
 const WorkloadExpectation kScalarStreamReadExpectations[] = {
     {"inst-int-ld", "high", "This loop intentionally disables vectorization and issues one scalar load per element."},
     {"inst-simd-ld", "low", "There are no explicit SIMD loads in the scalar version."},
+    {"ld-nt-uop", "low", "The baseline stream uses ordinary temporal loads rather than the non-temporal load path."},
+};
+
+const WorkloadExpectation kNtStreamReadExpectations[] = {
+    {"ld-nt-uop", "high", "This stream explicitly requests non-temporal loads, so the non-temporal load-uop counter is the headline signal."},
+    {"inst-int-ld", "high", "The code is still scalar and load-heavy, so scalar load retirement remains visible too."},
 };
 
 const WorkloadExpectation kSimdStreamReadExpectations[] = {
@@ -50,6 +58,12 @@ const WorkloadExpectation kHotWriteExpectations[] = {
 const WorkloadExpectation kScalarStreamWriteExpectations[] = {
     {"inst-int-st", "high", "This loop intentionally disables vectorization and performs scalar stores through the whole stream."},
     {"inst-simd-st", "low", "There are no explicit SIMD stores in the scalar version."},
+    {"st-nt-uop", "low", "The baseline stream uses ordinary temporal stores rather than the non-temporal store path."},
+};
+
+const WorkloadExpectation kNtStreamWriteExpectations[] = {
+    {"st-nt-uop", "high", "This stream explicitly requests non-temporal stores, so the non-temporal store-uop counter is the main signal to watch."},
+    {"inst-int-st", "high", "The body is still scalar and store-heavy, so scalar store retirement should remain visible."},
 };
 
 const WorkloadExpectation kSimdStreamWriteExpectations[] = {
@@ -76,6 +90,11 @@ const WorkloadExpectation kBarrierExpectations[] = {
     {"inst-barrier", "high", "The loop emits a real memory barrier every iteration, so barrier-instruction retirement should be the headline signal."},
 };
 
+const WorkloadExpectation kInterruptStormExpectations[] = {
+    {"interrupt-pending", "high", "A helper thread repeatedly sends signals to the measured thread, so pending-interrupt pressure should rise sharply versus a normal compute loop."},
+    {"cycles", "high", "The arithmetic body is repeatedly interrupted by signal delivery, so total cycle count rises even though the core work is otherwise simple."},
+};
+
 const WorkloadExpectation kPageStrideExpectations[] = {
     {"dtlb-miss", "high", "One demand access per shuffled page maximizes translation pressure."},
     {"l2-tlb-miss", "high", "Enough distinct pages overflow the first-level data TLB and spill into the next level."},
@@ -83,6 +102,12 @@ const WorkloadExpectation kPageStrideExpectations[] = {
     {"dtlb-access", "high", "Every sparse page access has to consult the translation machinery."},
     {"dtlb-fill", "high", "The hot DTLB entries get churned constantly, so fills rise alongside misses."},
     {"mmu-table-walk-data", "high", "This is one of the clearest data-side page-walk triggers in the lab."},
+};
+
+const WorkloadExpectation kFirstTouchFaultExpectations[] = {
+    {"mmu-virtual-memory-fault", "high", "This workload creates a fresh anonymous mapping and writes one byte per page, so the first touch has to instantiate each page."},
+    {"dtlb-miss", "high", "Those cold first touches also churn translation state because every page is newly visited."},
+    {"mmu-table-walk-data", "high", "The first-touch walk forces real data-side translation work while the mapping is populated."},
 };
 
 const WorkloadExpectation kAlignedX64Expectations[] = {
@@ -153,11 +178,17 @@ const WorkloadExpectation kDispatchSimdExpectations[] = {
 const WorkloadExpectation kFrontendHotRestartExpectations[] = {
     {"fetch-restart", "low", "One tiny hot stub should let the frontend fetch smoothly without frequent restart events."},
     {"flush-restart-other", "low", "The hot single-page code path should minimize non-branch frontend flush/restart activity."},
+    {"map-dispatch-bubble", "low", "One tiny hot stub is the low-bubble frontend baseline: fetch and dispatch should stay smooth."},
+    {"map-stall", "low", "This is the low-stall mapper baseline because the frontend stays hot and branch targets stay fixed."},
+    {"map-stall-dispatch", "low", "With one hot stub, dispatch-facing mapper stalls should stay comparatively rare."},
 };
 
 const WorkloadExpectation kFrontendRandomRestartExpectations[] = {
     {"fetch-restart", "high", "Jumping across many executable pages makes the frontend repeatedly rediscover and restart fetch from new locations."},
     {"flush-restart-other", "high", "The same code-page churn should amplify non-branch frontend flush/restart activity if this event is meaningful on the current core."},
+    {"map-dispatch-bubble", "high", "The frontend keeps tripping over new code pages, so dispatch bubbles are the intended high-level consequence."},
+    {"map-stall", "high", "The mapper should spend more time starved or stalled when fetch keeps restarting across many code pages."},
+    {"map-stall-dispatch", "high", "This workload is the intended high case for dispatch-facing mapper stalls because frontend locality is intentionally destroyed."},
 };
 
 const WorkloadExpectation kPredictableBranchExpectations[] = {
@@ -166,6 +197,7 @@ const WorkloadExpectation kPredictableBranchExpectations[] = {
     {"inst-branch-taken", "high", "The branch is taken almost every iteration in the biased pattern, so taken-branch count rises strongly."},
     {"branch-miss", "low", "The condition is strongly biased, so the predictor stays accurate."},
     {"branch-cond-miss", "low", "The conditional-branch-specific mispredict counter should stay low on the biased pattern."},
+    {"map-rewind", "low", "Because the predictor stays accurate, the mapper should need far fewer rewinds than in the random-direction branch case."},
 };
 
 const WorkloadExpectation kUnpredictableBranchExpectations[] = {
@@ -173,6 +205,7 @@ const WorkloadExpectation kUnpredictableBranchExpectations[] = {
     {"inst-branch-cond", "high", "Conditional branch count stays high because the loop shape is still branch-heavy."},
     {"branch-miss", "high", "Random branch direction prevents the predictor from settling on an accurate history."},
     {"branch-cond-miss", "high", "This is the conditional-branch-specific version of the same misprediction story."},
+    {"map-rewind", "high", "Frequent branch redirections should force the mapper to throw away more speculative work and rewind more often."},
 };
 
 const WorkloadExpectation kHotInstructionExpectations[] = {
@@ -185,6 +218,11 @@ const WorkloadExpectation kHotInstructionExpectations[] = {
     {"l1i-cache-miss", "low", "The same stub stays resident in the instruction cache."},
     {"l2-tlb-miss-instruction", "low", "A single hot code page should not spill into second-level instruction-side TLB misses."},
     {"mmu-table-walk-instruction", "low", "There is almost no instruction-side page walking once the hot page is installed."},
+    {"branch-call-indir-miss", "low", "The indirect call target never changes, so the indirect-call predictor should settle quickly."},
+    {"branch-indir-miss", "low", "A stable function-pointer target is the low-mispredict baseline for indirect branches."},
+    {"branch-ret-indir-miss", "low", "The same tiny stub returns to the same site every time, which is friendly to return prediction."},
+    {"map-dispatch-bubble-ic", "low", "One hot code page minimizes instruction-cache-driven dispatch bubbles."},
+    {"map-dispatch-bubble-itlb", "low", "One hot code page also minimizes ITLB-driven dispatch bubbles."},
 };
 
 const WorkloadExpectation kRandomInstructionExpectations[] = {
@@ -196,6 +234,19 @@ const WorkloadExpectation kRandomInstructionExpectations[] = {
     {"l1i-cache-miss", "high", "Randomized code-page order also defeats L1I locality."},
     {"l2-tlb-miss-instruction", "high", "Enough code pages spill beyond the first-level ITLB and show up in the next level too."},
     {"mmu-table-walk-instruction", "high", "The frontend has to perform real instruction-side page walks as it rediscovers code pages."},
+    {"branch-call-indir-miss", "high", "The indirect call target keeps changing across many stubs, which is the cleanest indirect-call mispredict trigger in the current lab."},
+    {"branch-indir-miss", "high", "This is also a changing indirect-branch target stream, so general indirect-branch mispredicts should rise too."},
+    {"branch-ret-indir-miss", "high", "The call/return stream jumps across many indirect targets, which is the strongest return-side indirect-branch stress case we currently have."},
+    {"map-dispatch-bubble-ic", "high", "Randomized code-page execution is exactly the kind of instruction-cache churn that should show up as dispatch bubbles."},
+    {"map-dispatch-bubble-itlb", "high", "The same code-page churn also keeps the instruction-side translation path busy, making ITLB-related dispatch bubbles the intended high case."},
+};
+
+const WorkloadExpectation kStoreOrderFriendlyExpectations[] = {
+    {"st-memory-order-violation", "low", "The load stream is shifted so it no longer 4K-aliases the preceding store stream, which is the low-conflict baseline."},
+};
+
+const WorkloadExpectation kStoreOrderAliasExpectations[] = {
+    {"st-memory-order-violation", "high", "The load stream is forced to 4K-alias the preceding store stream, which is the most plausible store-order-conflict trigger in the current lab."},
 };
 
 constexpr std::string_view kDenseAluConfig =
@@ -227,6 +278,15 @@ constexpr std::string_view kScalarStreamReadCode = R"cpp(
 #pragma clang loop vectorize(disable)
 for (std::size_t i = 0; i < state.stream_read.size(); ++i) {
   sum += data[i];
+}
+)cpp";
+
+constexpr std::string_view kNtStreamReadConfig =
+    "8 passes over the same 64 MiB stream, but using explicit non-temporal scalar loads.";
+constexpr std::string_view kNtStreamReadCode = R"cpp(
+#pragma clang loop vectorize(disable)
+for (std::size_t i = 0; i < state.stream_read.size(); ++i) {
+  sum += __builtin_nontemporal_load(data + i);
 }
 )cpp";
 
@@ -274,6 +334,16 @@ constexpr std::string_view kScalarStreamWriteCode = R"cpp(
 #pragma clang loop vectorize(disable)
 for (std::size_t i = 0; i < state.stream_store.size(); ++i) {
   data[i] += static_cast<std::uint64_t>(i + pass + 1);
+}
+)cpp";
+
+constexpr std::string_view kNtStreamWriteConfig =
+    "8 passes over the same 64 MiB stream, but using explicit non-temporal scalar stores.";
+constexpr std::string_view kNtStreamWriteCode = R"cpp(
+#pragma clang loop vectorize(disable)
+for (std::size_t i = 0; i < state.stream_store.size(); ++i) {
+  const std::uint64_t value = data[i] + static_cast<std::uint64_t>(i + pass + 1);
+  __builtin_nontemporal_store(value, data + i);
 }
 )cpp";
 
@@ -332,6 +402,20 @@ for (std::size_t i = 0; i < 20'000'000; ++i) {
 }
 )cpp";
 
+constexpr std::string_view kInterruptStormConfig =
+    "50,000,000 arithmetic iterations while a helper thread repeatedly signals the measured thread with SIGUSR1.";
+constexpr std::string_view kInterruptStormCode = R"cpp(
+std::thread sender([&] {
+  for (std::size_t i = 0; i < 100'000; ++i) {
+    pthread_kill(target_thread, SIGUSR1);
+  }
+});
+for (std::size_t i = 0; i < 50'000'000; ++i) {
+  a += (b ^ i) + 0x9e3779b97f4a7c15ULL;
+  b = (b << 9) | (b >> 55);
+}
+)cpp";
+
 constexpr std::string_view kPageStrideConfig =
     "256 passes; one load per shuffled page across a 64 MiB footprint.";
 constexpr std::string_view kPageStrideCode = R"cpp(
@@ -341,6 +425,17 @@ for (std::size_t pass = 0; pass < 256; ++pass) {
     sum += base[page * stride];
   }
 }
+)cpp";
+
+constexpr std::string_view kFirstTouchFaultConfig =
+    "Create a fresh 256 MiB anonymous mapping and write one byte per page exactly once.";
+constexpr std::string_view kFirstTouchFaultCode = R"cpp(
+void *mapping = mmap(nullptr, 256 * 1024 * 1024, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANON, -1, 0);
+for (std::size_t page = 0; page < pages; ++page) {
+  bytes[page * state.page_size] = static_cast<std::uint8_t>(page);
+}
+munmap(mapping, 256 * 1024 * 1024);
 )cpp";
 
 constexpr std::string_view kAlignedX64Config =
@@ -472,6 +567,24 @@ if (bits & 1ULL) {
 }
 )cpp";
 
+constexpr std::string_view kStoreOrderFriendlyConfig =
+    "8,000,000 store-then-load iterations where the load stream is shifted by 4,104 bytes and avoids 4 KiB aliasing.";
+constexpr std::string_view kStoreOrderFriendlyCode = R"cpp(
+volatile std::uint64_t *stores = storage.data();
+volatile const std::uint64_t *loads = storage.data() + 513;
+stores[index] = i + sum;
+sum += loads[index];
+)cpp";
+
+constexpr std::string_view kStoreOrderAliasConfig =
+    "8,000,000 store-then-load iterations where the load stream is shifted by exactly 4,096 bytes and 4 KiB-aliases the store stream.";
+constexpr std::string_view kStoreOrderAliasCode = R"cpp(
+volatile std::uint64_t *stores = storage.data();
+volatile const std::uint64_t *loads = storage.data() + 512;
+stores[index] = i + sum;
+sum += loads[index];
+)cpp";
+
 constexpr std::string_view kHotInstructionConfig =
     "32,000,000 calls to the same tiny executable stub on one hot code page.";
 constexpr std::string_view kHotInstructionCode = R"cpp(
@@ -539,6 +652,24 @@ const WorkloadDefinition kWorkloads[] = {
             PerfCounter::Named("INST_SIMD_LD"),
         std::span<const WorkloadExpectation>(kScalarStreamReadExpectations),
         &workloads::ScalarStreamRead,
+    },
+    {
+        "nt-stream-read",
+        "Non-Temporal Stream Read",
+        "A large sequential read stream using explicit non-temporal scalar loads.",
+        "This keeps the same basic streaming footprint as the scalar read baseline, but requests the non-temporal load path explicitly so the NT load-uop counter has a dedicated showcase.",
+        kNtStreamReadConfig,
+        kNtStreamReadCode,
+        Group::MemoryCache,
+        Tier::Experimental,
+        3,
+        1,
+        CYCLES | INSTRUCTIONS | PerfCounter::Named("LD_NT_UOP") |
+            PerfCounter::Named("INST_INT_LD"),
+        std::span<const WorkloadExpectation>(kNtStreamReadExpectations),
+        &workloads::NtStreamRead,
+        "scalar-stream-read",
+        "Both demos sweep the same 64 MiB array with scalar code. The main difference is whether each load uses the ordinary temporal path or explicitly requests non-temporal behavior.",
     },
     {
         "simd-stream-read",
@@ -620,6 +751,24 @@ const WorkloadDefinition kWorkloads[] = {
             PerfCounter::Named("INST_SIMD_ST"),
         std::span<const WorkloadExpectation>(kScalarStreamWriteExpectations),
         &workloads::ScalarStreamWrite,
+    },
+    {
+        "nt-stream-write",
+        "Non-Temporal Stream Write",
+        "A large sequential write stream using explicit non-temporal scalar stores.",
+        "This keeps the same wide store footprint as the scalar write baseline, but requests the non-temporal store path so the NT store-uop counter has a dedicated teaching case.",
+        kNtStreamWriteConfig,
+        kNtStreamWriteCode,
+        Group::StoreOrdering,
+        Tier::Experimental,
+        3,
+        1,
+        CYCLES | INSTRUCTIONS | PerfCounter::Named("ST_NT_UOP") |
+            PerfCounter::Named("INST_INT_ST"),
+        std::span<const WorkloadExpectation>(kNtStreamWriteExpectations),
+        &workloads::NtStreamWrite,
+        "scalar-stream-write",
+        "Both demos sweep the same 64 MiB array with scalar code. The main difference is whether each store uses the ordinary temporal path or explicitly requests non-temporal behavior.",
     },
     {
         "simd-stream-write",
@@ -706,6 +855,55 @@ const WorkloadDefinition kWorkloads[] = {
         "Both demos are tight register-heavy loops. The main difference is that this version executes a full memory barrier in every iteration.",
     },
     {
+        "interrupt-storm",
+        "Interrupt Storm",
+        "A dense arithmetic loop while a helper thread repeatedly interrupts the measured thread.",
+        "This is the dedicated asynchronous-event showcase: the core work is still simple arithmetic, but signal delivery keeps inserting interrupt pressure into the measured thread.",
+        kInterruptStormConfig,
+        kInterruptStormCode,
+        Group::CoreExecution,
+        Tier::Experimental,
+        3,
+        1,
+        CYCLES | INSTRUCTIONS | PerfCounter::Named("INTERRUPT_PENDING"),
+        std::span<const WorkloadExpectation>(kInterruptStormExpectations),
+        &workloads::InterruptStorm,
+        "dense-integer-alu",
+        "Both demos are arithmetic-heavy loops. The main difference is that this version is repeatedly interrupted by helper-thread signals while the dense ALU baseline runs uninterrupted.",
+    },
+    {
+        "store-order-friendly",
+        "Store Order Friendly",
+        "A store-then-load loop that avoids 4 KiB aliasing between the two streams.",
+        "This is the low-conflict baseline for the store-order-violation counter: the load stream stays offset just enough to avoid the classic 4 KiB alias pattern.",
+        kStoreOrderFriendlyConfig,
+        kStoreOrderFriendlyCode,
+        Group::StoreOrdering,
+        Tier::Experimental,
+        3,
+        1,
+        CYCLES | INSTRUCTIONS | PerfCounter::Named("ST_MEMORY_ORDER_VIOLATION_NONSPEC"),
+        std::span<const WorkloadExpectation>(kStoreOrderFriendlyExpectations),
+        &workloads::StoreOrderFriendly,
+    },
+    {
+        "store-order-alias",
+        "Store Order Alias",
+        "A store-then-load loop that forces 4 KiB aliasing between the two streams.",
+        "This is the high-conflict counterpart to the friendly case: the load stream is shifted by exactly 4 KiB so the low address bits match the earlier store stream.",
+        kStoreOrderAliasConfig,
+        kStoreOrderAliasCode,
+        Group::StoreOrdering,
+        Tier::Experimental,
+        3,
+        1,
+        CYCLES | INSTRUCTIONS | PerfCounter::Named("ST_MEMORY_ORDER_VIOLATION_NONSPEC"),
+        std::span<const WorkloadExpectation>(kStoreOrderAliasExpectations),
+        &workloads::StoreOrderAlias,
+        "store-order-friendly",
+        "Both demos issue the same store-then-load pattern. The main difference is whether the load stream is offset by 4,104 bytes and avoids 4 KiB aliasing, or offset by exactly 4,096 bytes and collides in the low address bits.",
+    },
+    {
         "page-stride-read",
         "Page-Stride Read",
         "One demand load per shuffled page.",
@@ -720,6 +918,24 @@ const WorkloadDefinition kWorkloads[] = {
             PerfCounter::Named("L1D_TLB_MISS_NONSPEC"),
         std::span<const WorkloadExpectation>(kPageStrideExpectations),
         &workloads::PageStrideRead,
+    },
+    {
+        "first-touch-fault",
+        "First-Touch Fault",
+        "Create a fresh anonymous mapping and touch each page exactly once.",
+        "This is the dedicated virtual-memory-fault showcase: the data is not just translation-hostile, it is genuinely absent until the first write instantiates each page.",
+        kFirstTouchFaultConfig,
+        kFirstTouchFaultCode,
+        Group::TlbPageWalk,
+        Tier::Experimental,
+        3,
+        1,
+        CYCLES | INSTRUCTIONS | DTLB_MISS | PerfCounter::Named("MMU_TABLE_WALK_DATA") |
+            PerfCounter::Named("MMU_VIRTUAL_MEMORY_FAULT_NONSPEC"),
+        std::span<const WorkloadExpectation>(kFirstTouchFaultExpectations),
+        &workloads::FirstTouchFault,
+        "hot-seq-read",
+        "Both demos ultimately touch memory, but this one creates a brand-new mapping and faults every page in on first write while the hot read baseline stays on already-resident data.",
     },
     {
         "aligned-x64-load",
@@ -1212,6 +1428,18 @@ const CounterDefinition kCounters[] = {
         {2.0, 100},
     },
     {
+        "interrupt-pending",
+        "Interrupt Pending",
+        "Pending-interrupt pressure observed by the core.",
+        "This is intentionally experimental because it depends on asynchronous signal delivery, but the interrupt-storm demo gives it a dedicated trigger instead of relying on background system noise.",
+        Group::CoreExecution,
+        Tier::Experimental,
+        PerfCounter::Named("INTERRUPT_PENDING"),
+        "interrupt-storm",
+        "dense-integer-alu",
+        {2.0, 100},
+    },
+    {
         "inst-int-alu",
         "Integer ALU Instructions",
         "Retired integer ALU instructions.",
@@ -1284,6 +1512,18 @@ const CounterDefinition kCounters[] = {
         {2.0, 100},
     },
     {
+        "ld-nt-uop",
+        "Non-Temporal Load Uops",
+        "Load-side uops that use the non-temporal path.",
+        "The non-temporal stream-read demo keeps the footprint fixed and changes only the load path, which is the cleanest teaching case available here.",
+        Group::MemoryCache,
+        Tier::Experimental,
+        PerfCounter::Named("LD_NT_UOP"),
+        "nt-stream-read",
+        "scalar-stream-read",
+        {2.0, 100},
+    },
+    {
         "inst-simd-st",
         "SIMD Store Instructions",
         "Retired SIMD store instructions.",
@@ -1329,6 +1569,30 @@ const CounterDefinition kCounters[] = {
         PerfCounter::Named("INST_INT_ST"),
         "random-page-write",
         "dense-integer-alu",
+        {2.0, 100},
+    },
+    {
+        "st-nt-uop",
+        "Non-Temporal Store Uops",
+        "Store-side uops that use the non-temporal path.",
+        "The non-temporal stream-write demo keeps the footprint fixed and changes only the store path, which is the cleanest teaching case available here.",
+        Group::StoreOrdering,
+        Tier::Experimental,
+        PerfCounter::Named("ST_NT_UOP"),
+        "nt-stream-write",
+        "scalar-stream-write",
+        {2.0, 100},
+    },
+    {
+        "st-memory-order-violation",
+        "Store Memory Order Violation",
+        "Non-speculative store/load ordering violations.",
+        "This remains experimental because the exact trigger is subtle, but the 4 KiB alias pair gives it a deliberate high/low contrast instead of relying on incidental conflicts.",
+        Group::StoreOrdering,
+        Tier::Experimental,
+        PerfCounter::Named("ST_MEMORY_ORDER_VIOLATION_NONSPEC"),
+        "store-order-alias",
+        "store-order-friendly",
         {2.0, 100},
     },
     {
@@ -1428,6 +1692,18 @@ const CounterDefinition kCounters[] = {
         {2.0, 100},
     },
     {
+        "mmu-virtual-memory-fault",
+        "Virtual Memory Fault",
+        "Non-speculative virtual-memory fault events on the data side.",
+        "This is the one counter in the lab that deliberately wants a truly absent page, so the first-touch-fault workload creates a brand-new mapping for every measurement run.",
+        Group::TlbPageWalk,
+        Tier::Experimental,
+        PerfCounter::Named("MMU_VIRTUAL_MEMORY_FAULT_NONSPEC"),
+        "first-touch-fault",
+        "hot-seq-read",
+        {2.0, 100},
+    },
+    {
         "inst-barrier",
         "Barrier Instructions",
         "Retired barrier instructions such as full memory fences.",
@@ -1486,6 +1762,18 @@ const CounterDefinition kCounters[] = {
         "unpredictable-branch",
         "predictable-branch",
         {4.0, 100},
+    },
+    {
+        "map-rewind",
+        "Map Rewind",
+        "Mapper rewind events caused by speculative work being discarded.",
+        "This is still an interpretive counter, but unpredictable branches are the cleanest rewind-heavy case currently in the lab.",
+        Group::BranchControl,
+        Tier::Experimental,
+        PerfCounter::Named("MAP_REWIND"),
+        "unpredictable-branch",
+        "predictable-branch",
+        {2.0, 100},
     },
     {
         "inst-branch-cond",
@@ -1548,6 +1836,42 @@ const CounterDefinition kCounters[] = {
         {2.0, 100},
     },
     {
+        "branch-call-indir-miss",
+        "Indirect Call Mispredict",
+        "Indirect-call-specific misprediction counter.",
+        "The randomized instruction-page sweep keeps changing the function-pointer target, which is the strongest indirect-call mispredict trigger in the current lab.",
+        Group::InstructionSide,
+        Tier::Experimental,
+        PerfCounter::Named("BRANCH_CALL_INDIR_MISPRED_NONSPEC"),
+        "random-instruction-pages",
+        "hot-instruction-loop",
+        {2.0, 100},
+    },
+    {
+        "branch-indir-miss",
+        "Indirect Branch Mispredict",
+        "General indirect-branch misprediction counter.",
+        "The instruction-side function-pointer workloads already give us a clean changing-target versus fixed-target contrast for this event.",
+        Group::InstructionSide,
+        Tier::Experimental,
+        PerfCounter::Named("BRANCH_INDIR_MISPRED_NONSPEC"),
+        "random-instruction-pages",
+        "hot-instruction-loop",
+        {2.0, 100},
+    },
+    {
+        "branch-ret-indir-miss",
+        "Indirect Return Mispredict",
+        "Return-side indirect-branch misprediction counter.",
+        "Experimental because return prediction is subtler than direct branch direction, but the randomized instruction-page sweep is still the strongest return-target stress case in this lab.",
+        Group::InstructionSide,
+        Tier::Experimental,
+        PerfCounter::Named("BRANCH_RET_INDIR_MISPRED_NONSPEC"),
+        "random-instruction-pages",
+        "hot-instruction-loop",
+        {2.0, 100},
+    },
+    {
         "l1i-tlb-fill",
         "ITLB Fill",
         "Instruction-side first-level TLB fills.",
@@ -1603,6 +1927,66 @@ const CounterDefinition kCounters[] = {
         Group::InstructionSide,
         Tier::Experimental,
         PerfCounter::Named("FLUSH_RESTART_OTHER_NONSPEC"),
+        "frontend-random-restart",
+        "frontend-hot-restart",
+        {2.0, 100},
+    },
+    {
+        "map-dispatch-bubble",
+        "Map Dispatch Bubble",
+        "Dispatch bubbles attributed to the mapper/front-end path.",
+        "The randomized executable-page walk is the intended high case because it keeps fetch and decode from settling into a smooth steady state.",
+        Group::InstructionSide,
+        Tier::Experimental,
+        PerfCounter::Named("MAP_DISPATCH_BUBBLE"),
+        "frontend-random-restart",
+        "frontend-hot-restart",
+        {2.0, 100},
+    },
+    {
+        "map-dispatch-bubble-ic",
+        "Map Dispatch Bubble IC",
+        "Dispatch bubbles attributed specifically to instruction-cache pressure.",
+        "The instruction-page sweep is the clearest way to create repeated code-cache rediscovery in this project.",
+        Group::InstructionSide,
+        Tier::Experimental,
+        PerfCounter::Named("MAP_DISPATCH_BUBBLE_IC"),
+        "random-instruction-pages",
+        "hot-instruction-loop",
+        {2.0, 100},
+    },
+    {
+        "map-dispatch-bubble-itlb",
+        "Map Dispatch Bubble ITLB",
+        "Dispatch bubbles attributed specifically to instruction-TLB pressure.",
+        "The random instruction-page walk intentionally destroys code-page locality, which is the cleanest ITLB-bubble showcase we currently have.",
+        Group::InstructionSide,
+        Tier::Experimental,
+        PerfCounter::Named("MAP_DISPATCH_BUBBLE_ITLB"),
+        "random-instruction-pages",
+        "hot-instruction-loop",
+        {2.0, 100},
+    },
+    {
+        "map-stall",
+        "Map Stall",
+        "Mapper stall events.",
+        "This is still an interpretive frontend counter, but the hot-stub versus randomized-code-page pair gives it an explicit locality-based contrast.",
+        Group::InstructionSide,
+        Tier::Experimental,
+        PerfCounter::Named("MAP_STALL"),
+        "frontend-random-restart",
+        "frontend-hot-restart",
+        {2.0, 100},
+    },
+    {
+        "map-stall-dispatch",
+        "Map Stall Dispatch",
+        "Dispatch-facing mapper stall events.",
+        "Use the same hot-versus-randomized frontend pair here; the goal is to expose whether fetch instability turns into dispatch-visible mapper stalls.",
+        Group::InstructionSide,
+        Tier::Experimental,
+        PerfCounter::Named("MAP_STALL_DISPATCH"),
         "frontend-random-restart",
         "frontend-hot-restart",
         {2.0, 100},
