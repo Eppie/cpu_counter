@@ -21,6 +21,16 @@ const WorkloadExpectation kHotReadExpectations[] = {
     {"dtlb-miss-nonspec", "low", "The same hot footprint also keeps the non-speculative DTLB miss counter near zero."},
 };
 
+const WorkloadExpectation kScalarStreamReadExpectations[] = {
+    {"inst-int-ld", "high", "This loop intentionally disables vectorization and issues one scalar load per element."},
+    {"inst-simd-ld", "low", "There are no explicit SIMD loads in the scalar version."},
+};
+
+const WorkloadExpectation kSimdStreamReadExpectations[] = {
+    {"inst-simd-ld", "high", "The loop uses explicit NEON vector loads, so SIMD load instructions should dominate."},
+    {"inst-int-ld", "low", "The data stream is the same, but the vectorized version should retire far fewer scalar load instructions."},
+};
+
 const WorkloadExpectation kRandomPointerExpectations[] = {
     {"cycles", "high", "Each dependent load waits on the previous random miss, stretching cycle count sharply."},
     {"instructions", "low", "The loop body is instruction-light; most time is latency, not retire bandwidth."},
@@ -35,6 +45,16 @@ const WorkloadExpectation kLinearPointerExpectations[] = {
 
 const WorkloadExpectation kHotWriteExpectations[] = {
     {"l1-store-miss", "low", "Repeated stores revisit the same hot cache lines, so store misses stay low."},
+};
+
+const WorkloadExpectation kScalarStreamWriteExpectations[] = {
+    {"inst-int-st", "high", "This loop intentionally disables vectorization and performs scalar stores through the whole stream."},
+    {"inst-simd-st", "low", "There are no explicit SIMD stores in the scalar version."},
+};
+
+const WorkloadExpectation kSimdStreamWriteExpectations[] = {
+    {"inst-simd-st", "high", "The loop uses explicit NEON stores, so SIMD store instructions should dominate."},
+    {"inst-int-st", "low", "The vectorized store path should retire far fewer scalar store instructions."},
 };
 
 const WorkloadExpectation kRandomWriteExpectations[] = {
@@ -89,6 +109,11 @@ const WorkloadExpectation kAlignedPageStoreExpectations[] = {
 const WorkloadExpectation kCrossPageStoreExpectations[] = {
     {"ldst-xpg-uop", "high", "Starting a 64-bit store four bytes before the page boundary forces a true cross-page store."},
     {"ldst-x64-uop", "high", "That same store also straddles a 64-byte region, so both split counters should rise together."},
+};
+
+const WorkloadExpectation kSimdAluExpectations[] = {
+    {"inst-simd-alu", "high", "The loop body is explicit NEON arithmetic on vectors, so SIMD ALU retirement should be the headline counter."},
+    {"inst-int-alu", "low", "The math stays in vector lanes rather than scalar integer ALUs for most of the body."},
 };
 
 const WorkloadExpectation kPredictableBranchExpectations[] = {
@@ -152,6 +177,23 @@ for (std::size_t i = 0; i < 32'000'000; ++i) {
 }
 )cpp";
 
+constexpr std::string_view kScalarStreamReadConfig =
+    "8 passes over a 64 MiB uint64_t array with vectorization disabled.";
+constexpr std::string_view kScalarStreamReadCode = R"cpp(
+#pragma clang loop vectorize(disable)
+for (std::size_t i = 0; i < state.stream_read.size(); ++i) {
+  sum += data[i];
+}
+)cpp";
+
+constexpr std::string_view kSimdStreamReadConfig =
+    "8 passes over the same 64 MiB stream, but using explicit NEON 128-bit loads.";
+constexpr std::string_view kSimdStreamReadCode = R"cpp(
+for (std::size_t i = 0; i < state.stream_read.size(); i += 2) {
+  acc = vaddq_u64(acc, vld1q_u64(data + i));
+}
+)cpp";
+
 constexpr std::string_view kRandomPointerConfig =
     "2,000,000 dependent loads through a 32 MiB randomized ring.";
 constexpr std::string_view kRandomPointerCode = R"cpp(
@@ -179,6 +221,24 @@ for (std::size_t pass = 0; pass < 8192; ++pass) {
   for (std::size_t i = 0; i < state.hot_store.size(); ++i) {
     data[i] += static_cast<std::uint64_t>(i + pass);
   }
+}
+)cpp";
+
+constexpr std::string_view kScalarStreamWriteConfig =
+    "8 passes over a 64 MiB uint64_t array with vectorization disabled.";
+constexpr std::string_view kScalarStreamWriteCode = R"cpp(
+#pragma clang loop vectorize(disable)
+for (std::size_t i = 0; i < state.stream_store.size(); ++i) {
+  data[i] += static_cast<std::uint64_t>(i + pass + 1);
+}
+)cpp";
+
+constexpr std::string_view kSimdStreamWriteConfig =
+    "8 passes over the same 64 MiB stream, but using explicit NEON 128-bit stores.";
+constexpr std::string_view kSimdStreamWriteCode = R"cpp(
+for (std::size_t i = 0; i < state.stream_store.size(); i += 2) {
+  const uint64x2_t value = vaddq_u64(vld1q_u64(data + i), bias);
+  vst1q_u64(data + i, value);
 }
 )cpp";
 
@@ -267,6 +327,17 @@ for (std::size_t page = 0; page < state.page_count; ++page) {
 }
 )cpp";
 
+constexpr std::string_view kSimdAluConfig =
+    "20,000,000 iterations of register-resident NEON integer vector arithmetic.";
+constexpr std::string_view kSimdAluCode = R"cpp(
+for (std::size_t i = 0; i < 20'000'000; ++i) {
+  a = vaddq_u64(a, b);
+  b = veorq_u64(vshlq_n_u64(b, 1), c);
+  c = vaddq_u64(c, vorrq_u64(a, d));
+  d = veorq_u64(d, vshrq_n_u64(a, 7));
+}
+)cpp";
+
 constexpr std::string_view kPredictableBranchConfig =
     "16 passes over 1,048,576 elements with a strongly biased taken/not-taken pattern.";
 constexpr std::string_view kPredictableBranchCode = R"cpp(
@@ -343,6 +414,40 @@ const WorkloadDefinition kWorkloads[] = {
         &workloads::HotSequentialRead,
     },
     {
+        "scalar-stream-read",
+        "Scalar Stream Read",
+        "A large sequential read stream compiled to stay scalar.",
+        "Use this as the scalar load baseline: the data stream is simple and sequential, but the code path deliberately avoids SIMD loads.",
+        kScalarStreamReadConfig,
+        kScalarStreamReadCode,
+        Group::MemoryCache,
+        Tier::Experimental,
+        3,
+        1,
+        CYCLES | INSTRUCTIONS | PerfCounter::Named("INST_INT_LD") |
+            PerfCounter::Named("INST_SIMD_LD"),
+        std::span<const WorkloadExpectation>(kScalarStreamReadExpectations),
+        &workloads::ScalarStreamRead,
+    },
+    {
+        "simd-stream-read",
+        "SIMD Stream Read",
+        "A large sequential read stream using explicit NEON vector loads.",
+        "This keeps the data pattern the same as the scalar stream read, but moves the work into SIMD load instructions.",
+        kSimdStreamReadConfig,
+        kSimdStreamReadCode,
+        Group::MemoryCache,
+        Tier::Experimental,
+        3,
+        1,
+        CYCLES | INSTRUCTIONS | PerfCounter::Named("INST_INT_LD") |
+            PerfCounter::Named("INST_SIMD_LD"),
+        std::span<const WorkloadExpectation>(kSimdStreamReadExpectations),
+        &workloads::SimdStreamRead,
+        "scalar-stream-read",
+        "Both demos walk the same 64 MiB stream. The main difference is whether the loads retire as scalar integer loads or explicit NEON vector loads.",
+    },
+    {
         "linear-pointer-chase",
         "Linear Pointer Chase",
         "A same-size dependent load chain, but with linear address order.",
@@ -388,6 +493,40 @@ const WorkloadDefinition kWorkloads[] = {
         CYCLES | INSTRUCTIONS | L1_STORE_MISS,
         std::span<const WorkloadExpectation>(kHotWriteExpectations),
         &workloads::HotSequentialWrite,
+    },
+    {
+        "scalar-stream-write",
+        "Scalar Stream Write",
+        "A large sequential write stream compiled to stay scalar.",
+        "Use this as the scalar store baseline: the footprint is wide, but the code path deliberately avoids SIMD stores.",
+        kScalarStreamWriteConfig,
+        kScalarStreamWriteCode,
+        Group::StoreOrdering,
+        Tier::Experimental,
+        3,
+        1,
+        CYCLES | INSTRUCTIONS | PerfCounter::Named("INST_INT_ST") |
+            PerfCounter::Named("INST_SIMD_ST"),
+        std::span<const WorkloadExpectation>(kScalarStreamWriteExpectations),
+        &workloads::ScalarStreamWrite,
+    },
+    {
+        "simd-stream-write",
+        "SIMD Stream Write",
+        "A large sequential write stream using explicit NEON vector stores.",
+        "This keeps the store pattern the same as the scalar stream write, but moves the work into SIMD store instructions.",
+        kSimdStreamWriteConfig,
+        kSimdStreamWriteCode,
+        Group::StoreOrdering,
+        Tier::Experimental,
+        3,
+        1,
+        CYCLES | INSTRUCTIONS | PerfCounter::Named("INST_INT_ST") |
+            PerfCounter::Named("INST_SIMD_ST"),
+        std::span<const WorkloadExpectation>(kSimdStreamWriteExpectations),
+        &workloads::SimdStreamWrite,
+        "scalar-stream-write",
+        "Both demos walk the same 64 MiB store stream. The main difference is whether the stores retire as scalar integer stores or explicit NEON vector stores.",
     },
     {
         "random-page-write",
@@ -555,6 +694,24 @@ const WorkloadDefinition kWorkloads[] = {
         &workloads::CrossPageStore,
         "aligned-page-store",
         "Both demos touch one 64-bit word per page. The difference is that this version starts four bytes before the boundary, so each store has to span two pages.",
+    },
+    {
+        "simd-vector-alu",
+        "SIMD Vector ALU",
+        "A dense compute loop built from NEON integer vector arithmetic.",
+        "This is the SIMD-compute counterpart to dense integer ALU: the working set stays in registers, but the arithmetic retires on vector lanes instead of scalar integer ALUs.",
+        kSimdAluConfig,
+        kSimdAluCode,
+        Group::SimdUopMapping,
+        Tier::Experimental,
+        3,
+        1,
+        CYCLES | INSTRUCTIONS | PerfCounter::Named("INST_SIMD_ALU") |
+            PerfCounter::Named("INST_INT_ALU"),
+        std::span<const WorkloadExpectation>(kSimdAluExpectations),
+        &workloads::SimdVectorAlu,
+        "dense-integer-alu",
+        "Both demos are dense compute loops with almost no memory pressure. The main difference is whether the arithmetic retires in SIMD lanes or scalar integer ALUs.",
     },
     {
         "predictable-branch",
@@ -800,6 +957,18 @@ const CounterDefinition kCounters[] = {
         {2.0, 100},
     },
     {
+        "inst-simd-ld",
+        "SIMD Load Instructions",
+        "Retired SIMD load instructions.",
+        "The scalar and SIMD stream-read pair keeps the data pattern fixed while changing only the instruction class.",
+        Group::MemoryCache,
+        Tier::Experimental,
+        PerfCounter::Named("INST_SIMD_LD"),
+        "simd-stream-read",
+        "scalar-stream-read",
+        {2.0, 100},
+    },
+    {
         "inst-int-ld",
         "Integer Load Instructions",
         "Retired integer load instructions.",
@@ -809,6 +978,18 @@ const CounterDefinition kCounters[] = {
         PerfCounter::Named("INST_INT_LD"),
         "random-pointer-chase",
         "dense-integer-alu",
+        {2.0, 100},
+    },
+    {
+        "inst-simd-st",
+        "SIMD Store Instructions",
+        "Retired SIMD store instructions.",
+        "The scalar and SIMD stream-write pair keeps the store pattern fixed while changing only the instruction class.",
+        Group::StoreOrdering,
+        Tier::Experimental,
+        PerfCounter::Named("INST_SIMD_ST"),
+        "simd-stream-write",
+        "scalar-stream-write",
         {2.0, 100},
     },
     {
@@ -905,6 +1086,18 @@ const CounterDefinition kCounters[] = {
         PerfCounter::Named("MMU_TABLE_WALK_DATA"),
         "page-stride-read",
         "hot-seq-read",
+        {2.0, 100},
+    },
+    {
+        "inst-simd-alu",
+        "SIMD ALU Instructions",
+        "Retired SIMD arithmetic instructions.",
+        "This is the vector-compute counterpart to the scalar integer ALU counter.",
+        Group::SimdUopMapping,
+        Tier::Experimental,
+        PerfCounter::Named("INST_SIMD_ALU"),
+        "simd-vector-alu",
+        "dense-integer-alu",
         {2.0, 100},
     },
     {

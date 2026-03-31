@@ -162,9 +162,13 @@ namespace workloads {
 
 std::uint64_t DenseIntegerAlu(DemoEnvironment &state);
 std::uint64_t HotSequentialRead(DemoEnvironment &state);
+std::uint64_t ScalarStreamRead(DemoEnvironment &state);
+std::uint64_t SimdStreamRead(DemoEnvironment &state);
 std::uint64_t LinearPointerChase(DemoEnvironment &state);
 std::uint64_t RandomPointerChase(DemoEnvironment &state);
 std::uint64_t HotSequentialWrite(DemoEnvironment &state);
+std::uint64_t ScalarStreamWrite(DemoEnvironment &state);
+std::uint64_t SimdStreamWrite(DemoEnvironment &state);
 std::uint64_t RandomPageWrite(DemoEnvironment &state);
 std::uint64_t PageStrideRead(DemoEnvironment &state);
 std::uint64_t AlignedX64Load(DemoEnvironment &state);
@@ -175,6 +179,7 @@ std::uint64_t AlignedX64Store(DemoEnvironment &state);
 std::uint64_t CrossX64Store(DemoEnvironment &state);
 std::uint64_t AlignedPageStore(DemoEnvironment &state);
 std::uint64_t CrossPageStore(DemoEnvironment &state);
+std::uint64_t SimdVectorAlu(DemoEnvironment &state);
 std::uint64_t PredictableBranch(DemoEnvironment &state);
 std::uint64_t UnpredictableBranch(DemoEnvironment &state);
 std::uint64_t HotInstructionLoop(DemoEnvironment &state);

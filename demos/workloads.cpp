@@ -1,5 +1,9 @@
 #include "demos/catalog.h"
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 #include <libkern/OSCacheControl.h>
 #include <pthread/qos.h>
 #include <sys/mman.h>
@@ -100,6 +104,12 @@ void WriteUnaligned64(std::uint8_t *ptr, std::uint64_t value) {
 std::uint32_t EncodeMovzX0(std::uint16_t imm16) {
   return 0xD2800000u | (static_cast<std::uint32_t>(imm16) << 5);
 }
+
+#if defined(__aarch64__)
+std::uint64_t ReduceU64x2(uint64x2_t value) {
+  return vgetq_lane_u64(value, 0) + vgetq_lane_u64(value, 1);
+}
+#endif
 
 }  // namespace
 
@@ -401,6 +411,39 @@ namespace workloads {
   return index;
 }
 
+[[gnu::noinline]] std::uint64_t ScalarStreamRead(DemoEnvironment &state) {
+  volatile const std::uint64_t *data = state.stream_read.data();
+  std::uint64_t sum = 0;
+  constexpr std::size_t kPasses = 8;
+  for (std::size_t pass = 0; pass < kPasses; ++pass) {
+#pragma clang loop vectorize(disable)
+#pragma clang loop interleave(disable)
+    for (std::size_t i = 0; i < state.stream_read.size(); ++i) {
+      sum += data[i];
+    }
+  }
+  g_sink ^= sum;
+  return sum;
+}
+
+[[gnu::noinline]] std::uint64_t SimdStreamRead(DemoEnvironment &state) {
+#if defined(__aarch64__)
+  const std::uint64_t *data = state.stream_read.data();
+  uint64x2_t acc = vdupq_n_u64(0);
+  constexpr std::size_t kPasses = 8;
+  for (std::size_t pass = 0; pass < kPasses; ++pass) {
+    for (std::size_t i = 0; i < state.stream_read.size(); i += 2) {
+      acc = vaddq_u64(acc, vld1q_u64(data + i));
+    }
+  }
+  const std::uint64_t sum = ReduceU64x2(acc);
+  g_sink ^= sum;
+  return sum;
+#else
+  return ScalarStreamRead(state);
+#endif
+}
+
 [[gnu::noinline]] std::uint64_t LinearPointerChase(DemoEnvironment &state) {
   volatile const std::uint32_t *ring = state.linear_ring.data();
   std::uint32_t index = 0;
@@ -435,6 +478,39 @@ namespace workloads {
   }
   g_sink ^= data[7];
   return data[7];
+}
+
+[[gnu::noinline]] std::uint64_t ScalarStreamWrite(DemoEnvironment &state) {
+  volatile std::uint64_t *data = state.stream_store.data();
+  constexpr std::size_t kPasses = 8;
+  for (std::size_t pass = 0; pass < kPasses; ++pass) {
+#pragma clang loop vectorize(disable)
+#pragma clang loop interleave(disable)
+    for (std::size_t i = 0; i < state.stream_store.size(); ++i) {
+      data[i] += static_cast<std::uint64_t>(i + pass + 1);
+    }
+  }
+  g_sink ^= data[7];
+  return data[7];
+}
+
+[[gnu::noinline]] std::uint64_t SimdStreamWrite(DemoEnvironment &state) {
+#if defined(__aarch64__)
+  std::uint64_t *data = state.stream_store.data();
+  constexpr std::size_t kPasses = 8;
+  for (std::size_t pass = 0; pass < kPasses; ++pass) {
+    const uint64x2_t bias =
+        vsetq_lane_u64(static_cast<std::uint64_t>(pass + 2), vdupq_n_u64(pass + 1), 1);
+    for (std::size_t i = 0; i < state.stream_store.size(); i += 2) {
+      const uint64x2_t value = vaddq_u64(vld1q_u64(data + i), bias);
+      vst1q_u64(data + i, value);
+    }
+  }
+  g_sink ^= data[7];
+  return data[7];
+#else
+  return ScalarStreamWrite(state);
+#endif
 }
 
 [[gnu::noinline]] std::uint64_t RandomPageWrite(DemoEnvironment &state) {
@@ -584,6 +660,45 @@ namespace workloads {
       ReadUnaligned64(bytes + (state.page_count - 1) * state.page_size + state.page_size - 4);
   g_sink ^= value;
   return value;
+}
+
+[[gnu::noinline]] std::uint64_t SimdVectorAlu(DemoEnvironment &) {
+#if defined(__aarch64__)
+  const std::uint64_t init_a[2] = {0x1234567812345678ULL, 0x89abcdef00112233ULL};
+  const std::uint64_t init_b[2] = {0x55aa55aa55aa55aaULL, 0xf0f0f0f00f0f0f0fULL};
+  const std::uint64_t init_c[2] = {0x0fedcba987654321ULL, 0x13579bdf2468ace0ULL};
+  const std::uint64_t init_d[2] = {0x1111222233334444ULL, 0xaaaabbbbccccddddULL};
+  uint64x2_t a = vld1q_u64(init_a);
+  uint64x2_t b = vld1q_u64(init_b);
+  uint64x2_t c = vld1q_u64(init_c);
+  uint64x2_t d = vld1q_u64(init_d);
+  constexpr std::size_t kIters = 20'000'000;
+  for (std::size_t i = 0; i < kIters; ++i) {
+    a = vaddq_u64(a, b);
+    b = veorq_u64(vshlq_n_u64(b, 1), c);
+    c = vaddq_u64(c, vorrq_u64(a, d));
+    d = veorq_u64(d, vshrq_n_u64(a, 7));
+  }
+  const std::uint64_t sum =
+      ReduceU64x2(a) ^ ReduceU64x2(b) ^ ReduceU64x2(c) ^ ReduceU64x2(d);
+  g_sink ^= sum;
+  return sum;
+#else
+  std::uint64_t a = 0x1234567812345678ULL;
+  std::uint64_t b = 0x55aa55aa55aa55aaULL;
+  std::uint64_t c = 0x0fedcba987654321ULL;
+  std::uint64_t d = 0x1111222233334444ULL;
+  constexpr std::size_t kIters = 20'000'000;
+  for (std::size_t i = 0; i < kIters; ++i) {
+    a += b;
+    b ^= (b << 1) + c;
+    c += (a | d);
+    d ^= (a >> 7);
+  }
+  const std::uint64_t sum = a ^ b ^ c ^ d;
+  g_sink ^= sum;
+  return sum;
+#endif
 }
 
 [[gnu::noinline]] std::uint64_t PredictableBranch(DemoEnvironment &state) {

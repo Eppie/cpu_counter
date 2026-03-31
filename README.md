@@ -184,14 +184,19 @@ Stable showcase workloads currently include:
 
 Experimental showcase workloads currently include:
 
+- `scalar-stream-read`
+- `simd-stream-read`
 - `aligned-x64-load`
 - `cross-x64-load`
 - `aligned-page-load`
 - `cross-page-load`
+- `scalar-stream-write`
+- `simd-stream-write`
 - `aligned-x64-store`
 - `cross-x64-store`
 - `aligned-page-store`
 - `cross-page-store`
+- `simd-vector-alu`
 
 ### Counter Support Table
 
@@ -211,7 +216,10 @@ Experimental showcase workloads currently include:
 | `l1-store-miss-nonspec` | experimental | nonspec store misses | `random-page-write` | `hot-seq-write` | write-allocate effects can complicate reading |
 | `inst-all` | experimental | aggregate retired instructions | `dense-integer-alu` | `random-pointer-chase` | PMU-event view of overall retired instructions |
 | `inst-int-alu` | experimental | retired integer ALU instructions | `dense-integer-alu` | `hot-seq-read` | pure compute versus memory-heavy access |
+| `inst-simd-alu` | experimental | retired SIMD arithmetic instructions | `simd-vector-alu` | `dense-integer-alu` | vector-compute counterpart to scalar integer ALU |
+| `inst-simd-ld` | experimental | retired SIMD load instructions | `simd-stream-read` | `scalar-stream-read` | same stream, different load instruction class |
 | `inst-int-ld` | experimental | retired integer load instructions | `random-pointer-chase` | `dense-integer-alu` | good load-heavy versus register-only contrast |
+| `inst-simd-st` | experimental | retired SIMD store instructions | `simd-stream-write` | `scalar-stream-write` | same stream, different store instruction class |
 | `inst-int-st` | experimental | retired integer store instructions | `random-page-write` | `dense-integer-alu` | clearest store-side trigger in the current lab |
 | `inst-ldst` | experimental | retired load/store instructions | `random-pointer-chase` | `dense-integer-alu` | broad memory-instruction mix signal |
 | `ld-unit-uop` | experimental | load-unit micro-ops | `random-pointer-chase` | `dense-integer-alu` | often tracks load pressure more directly than retired instructions |
