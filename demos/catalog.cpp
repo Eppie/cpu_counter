@@ -62,6 +62,20 @@ const WorkloadExpectation kRandomWriteExpectations[] = {
     {"dtlb-miss", "high", "Random page order churns the DTLB while issuing those stores."},
 };
 
+const WorkloadExpectation kUncontendedAtomicExpectations[] = {
+    {"atomic-succ", "high", "Every compare-exchange should usually succeed on the first try when no other thread is touching the same word."},
+    {"atomic-fail", "low", "With no competing writers, the retry path should stay close to zero."},
+};
+
+const WorkloadExpectation kContendedAtomicExpectations[] = {
+    {"atomic-succ", "high", "The measured thread still eventually commits successful atomic updates."},
+    {"atomic-fail", "high", "Competing helper threads keep invalidating the expected value, so failed atomic attempts rise sharply."},
+};
+
+const WorkloadExpectation kBarrierExpectations[] = {
+    {"inst-barrier", "high", "The loop emits a real memory barrier every iteration, so barrier-instruction retirement should be the headline signal."},
+};
+
 const WorkloadExpectation kPageStrideExpectations[] = {
     {"dtlb-miss", "high", "One demand access per shuffled page maximizes translation pressure."},
     {"l2-tlb-miss", "high", "Enough distinct pages overflow the first-level data TLB and spill into the next level."},
@@ -249,6 +263,42 @@ for (std::size_t pass = 0; pass < 256; ++pass) {
   for (std::size_t page : state.page_order) {
     base[page * stride] += static_cast<std::uint64_t>(pass + 1);
   }
+}
+)cpp";
+
+constexpr std::string_view kUncontendedAtomicConfig =
+    "4,000,000 compare-exchange increments on one private atomic word.";
+constexpr std::string_view kUncontendedAtomicCode = R"cpp(
+for (std::size_t i = 0; i < 4'000'000; ++i) {
+  std::uint64_t expected = value.load(std::memory_order_relaxed);
+  while (!value.compare_exchange_weak(expected, expected + 1,
+                                      std::memory_order_acq_rel,
+                                      std::memory_order_relaxed)) {
+  }
+}
+)cpp";
+
+constexpr std::string_view kContendedAtomicConfig =
+    "2,000,000 compare-exchange increments from the measured thread while three helpers race on the same atomic word.";
+constexpr std::string_view kContendedAtomicCode = R"cpp(
+std::array<std::thread, 3> helpers = { ... };
+start.store(true, std::memory_order_release);
+for (std::size_t i = 0; i < 2'000'000; ++i) {
+  std::uint64_t expected = value.load(std::memory_order_relaxed);
+  while (!value.compare_exchange_weak(expected, expected + 1,
+                                      std::memory_order_acq_rel,
+                                      std::memory_order_relaxed)) {
+  }
+}
+)cpp";
+
+constexpr std::string_view kBarrierLoopConfig =
+    "20,000,000 arithmetic iterations with an explicit full memory barrier in each one.";
+constexpr std::string_view kBarrierLoopCode = R"cpp(
+for (std::size_t i = 0; i < 20'000'000; ++i) {
+  a += (b ^ i) + 0x9e3779b97f4a7c15ULL;
+  asm volatile("dmb ish" ::: "memory");
+  b ^= a + (a >> 7);
 }
 )cpp";
 
@@ -542,6 +592,57 @@ const WorkloadDefinition kWorkloads[] = {
         CYCLES | INSTRUCTIONS | L1_STORE_MISS | DTLB_MISS | L2_TLB_MISS,
         std::span<const WorkloadExpectation>(kRandomWriteExpectations),
         &workloads::RandomPageWrite,
+    },
+    {
+        "uncontended-atomic-cas",
+        "Uncontended Atomic CAS",
+        "Repeated compare-exchange updates to a private atomic word.",
+        "This is the low-failure atomic baseline: the measured thread performs atomic updates without any competing writers.",
+        kUncontendedAtomicConfig,
+        kUncontendedAtomicCode,
+        Group::StoreOrdering,
+        Tier::Experimental,
+        3,
+        1,
+        CYCLES | INSTRUCTIONS | PerfCounter::Named("ATOMIC_OR_EXCLUSIVE_SUCC") |
+            PerfCounter::Named("ATOMIC_OR_EXCLUSIVE_FAIL"),
+        std::span<const WorkloadExpectation>(kUncontendedAtomicExpectations),
+        &workloads::UncontendedAtomicCas,
+    },
+    {
+        "contended-atomic-cas",
+        "Contended Atomic CAS",
+        "Repeated compare-exchange updates while helper threads race on the same atomic word.",
+        "This is the high-failure atomic showcase: the measured thread runs the same compare-exchange loop, but competing writers keep forcing retries.",
+        kContendedAtomicConfig,
+        kContendedAtomicCode,
+        Group::StoreOrdering,
+        Tier::Experimental,
+        3,
+        1,
+        CYCLES | INSTRUCTIONS | PerfCounter::Named("ATOMIC_OR_EXCLUSIVE_SUCC") |
+            PerfCounter::Named("ATOMIC_OR_EXCLUSIVE_FAIL"),
+        std::span<const WorkloadExpectation>(kContendedAtomicExpectations),
+        &workloads::ContendedAtomicCas,
+        "uncontended-atomic-cas",
+        "Both demos use the same compare-exchange loop. The main difference is whether other threads are simultaneously racing on the same atomic word.",
+    },
+    {
+        "barrier-loop",
+        "Barrier Loop",
+        "A tight arithmetic loop with an explicit full memory barrier in every iteration.",
+        "Use this to make barrier retirement visible directly: the arithmetic body stays simple, but each iteration executes a real ordering instruction.",
+        kBarrierLoopConfig,
+        kBarrierLoopCode,
+        Group::StoreOrdering,
+        Tier::Experimental,
+        3,
+        1,
+        CYCLES | INSTRUCTIONS | PerfCounter::Named("INST_BARRIER"),
+        std::span<const WorkloadExpectation>(kBarrierExpectations),
+        &workloads::BarrierLoop,
+        "dense-integer-alu",
+        "Both demos are tight register-heavy loops. The main difference is that this version executes a full memory barrier in every iteration.",
     },
     {
         "page-stride-read",
@@ -993,6 +1094,30 @@ const CounterDefinition kCounters[] = {
         {2.0, 100},
     },
     {
+        "atomic-succ",
+        "Atomic Success",
+        "Successful atomic or exclusive operations.",
+        "Uncontended compare-exchange is the clean success baseline; dense ALU code is the obvious low case.",
+        Group::StoreOrdering,
+        Tier::Experimental,
+        PerfCounter::Named("ATOMIC_OR_EXCLUSIVE_SUCC"),
+        "uncontended-atomic-cas",
+        "dense-integer-alu",
+        {2.0, 100},
+    },
+    {
+        "atomic-fail",
+        "Atomic Failure",
+        "Failed atomic or exclusive operations.",
+        "The contended compare-exchange demo is designed to force retries; the uncontended version should stay near zero.",
+        Group::StoreOrdering,
+        Tier::Experimental,
+        PerfCounter::Named("ATOMIC_OR_EXCLUSIVE_FAIL"),
+        "contended-atomic-cas",
+        "uncontended-atomic-cas",
+        {2.0, 100},
+    },
+    {
         "inst-int-st",
         "Integer Store Instructions",
         "Retired integer store instructions.",
@@ -1086,6 +1211,18 @@ const CounterDefinition kCounters[] = {
         PerfCounter::Named("MMU_TABLE_WALK_DATA"),
         "page-stride-read",
         "hot-seq-read",
+        {2.0, 100},
+    },
+    {
+        "inst-barrier",
+        "Barrier Instructions",
+        "Retired barrier instructions such as full memory fences.",
+        "This is an ordering-focused teaching counter; the dedicated barrier loop should make it explicit.",
+        Group::StoreOrdering,
+        Tier::Experimental,
+        PerfCounter::Named("INST_BARRIER"),
+        "barrier-loop",
+        "dense-integer-alu",
         {2.0, 100},
     },
     {

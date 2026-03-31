@@ -192,6 +192,9 @@ Experimental showcase workloads currently include:
 - `cross-page-load`
 - `scalar-stream-write`
 - `simd-stream-write`
+- `uncontended-atomic-cas`
+- `contended-atomic-cas`
+- `barrier-loop`
 - `aligned-x64-store`
 - `cross-x64-store`
 - `aligned-page-store`
@@ -220,11 +223,14 @@ Experimental showcase workloads currently include:
 | `inst-simd-ld` | experimental | retired SIMD load instructions | `simd-stream-read` | `scalar-stream-read` | same stream, different load instruction class |
 | `inst-int-ld` | experimental | retired integer load instructions | `random-pointer-chase` | `dense-integer-alu` | good load-heavy versus register-only contrast |
 | `inst-simd-st` | experimental | retired SIMD store instructions | `simd-stream-write` | `scalar-stream-write` | same stream, different store instruction class |
+| `atomic-succ` | experimental | successful atomic/exclusive ops | `uncontended-atomic-cas` | `dense-integer-alu` | direct atomic-success teaching counter |
+| `atomic-fail` | experimental | failed atomic/exclusive ops | `contended-atomic-cas` | `uncontended-atomic-cas` | retry-heavy compare-exchange under contention |
 | `inst-int-st` | experimental | retired integer store instructions | `random-page-write` | `dense-integer-alu` | clearest store-side trigger in the current lab |
 | `inst-ldst` | experimental | retired load/store instructions | `random-pointer-chase` | `dense-integer-alu` | broad memory-instruction mix signal |
 | `ld-unit-uop` | experimental | load-unit micro-ops | `random-pointer-chase` | `dense-integer-alu` | often tracks load pressure more directly than retired instructions |
 | `st-unit-uop` | experimental | store-unit micro-ops | `random-page-write` | `dense-integer-alu` | store pressure teaching counter |
 | `l1d-writeback` | experimental | L1D writebacks | `random-page-write` | `hot-seq-write` | useful for dirty-line eviction behavior |
+| `inst-barrier` | experimental | retired barrier instructions | `barrier-loop` | `dense-integer-alu` | ordering-heavy versus straight compute |
 | `dtlb-access` | experimental | DTLB accesses | `page-stride-read` | `hot-seq-read` | shows translation activity before misses alone |
 | `dtlb-fill` | experimental | DTLB fills | `page-stride-read` | `hot-seq-read` | emphasizes refills of translation entries |
 | `mmu-table-walk-data` | experimental | data-side page table walks | `page-stride-read` | `hot-seq-read` | clearest real table-walk trigger in the lab |

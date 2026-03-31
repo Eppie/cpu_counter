@@ -12,12 +12,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <numeric>
 #include <random>
 #include <sstream>
+#include <thread>
 
 namespace demo {
 namespace {
@@ -110,6 +112,27 @@ std::uint64_t ReduceU64x2(uint64x2_t value) {
   return vgetq_lane_u64(value, 0) + vgetq_lane_u64(value, 1);
 }
 #endif
+
+[[gnu::noinline]] std::uint64_t AtomicCasLoop(std::atomic<std::uint64_t> &value,
+                                              std::size_t iterations) {
+  std::uint64_t observed = 0;
+  for (std::size_t i = 0; i < iterations; ++i) {
+    std::uint64_t expected = value.load(std::memory_order_relaxed);
+    while (!value.compare_exchange_weak(expected, expected + 1, std::memory_order_acq_rel,
+                                        std::memory_order_relaxed)) {
+    }
+    observed += expected;
+  }
+  return observed;
+}
+
+[[gnu::noinline]] void EmitBarrier() {
+#if defined(__aarch64__)
+  asm volatile("dmb ish" ::: "memory");
+#else
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+#endif
+}
 
 }  // namespace
 
@@ -524,6 +547,66 @@ namespace workloads {
   }
   g_sink += base[state.page_order.front() * stride];
   return base[state.page_order.front() * stride];
+}
+
+[[gnu::noinline]] std::uint64_t UncontendedAtomicCas(DemoEnvironment &) {
+  std::atomic<std::uint64_t> value{0};
+  constexpr std::size_t kIters = 4'000'000;
+  const std::uint64_t observed = AtomicCasLoop(value, kIters);
+  const std::uint64_t result = observed ^ value.load(std::memory_order_relaxed);
+  g_sink ^= result;
+  return result;
+}
+
+[[gnu::noinline]] std::uint64_t ContendedAtomicCas(DemoEnvironment &) {
+  std::atomic<std::uint64_t> value{0};
+  std::atomic<int> ready{0};
+  std::atomic<bool> start{false};
+  std::atomic<bool> stop{false};
+  constexpr std::size_t kHelpers = 3;
+  constexpr std::size_t kIters = 2'000'000;
+
+  auto helper = [&]() {
+    ready.fetch_add(1, std::memory_order_release);
+    while (!start.load(std::memory_order_acquire)) {
+    }
+    while (!stop.load(std::memory_order_acquire)) {
+      std::uint64_t expected = value.load(std::memory_order_relaxed);
+      while (!value.compare_exchange_weak(expected, expected + 1, std::memory_order_acq_rel,
+                                          std::memory_order_relaxed)) {
+      }
+    }
+  };
+
+  std::array<std::thread, kHelpers> threads;
+  for (std::thread &thread : threads) {
+    thread = std::thread(helper);
+  }
+  while (ready.load(std::memory_order_acquire) != static_cast<int>(kHelpers)) {
+  }
+  start.store(true, std::memory_order_release);
+  const std::uint64_t observed = AtomicCasLoop(value, kIters);
+  stop.store(true, std::memory_order_release);
+  for (std::thread &thread : threads) {
+    thread.join();
+  }
+
+  const std::uint64_t result = observed ^ value.load(std::memory_order_relaxed);
+  g_sink ^= result;
+  return result;
+}
+
+[[gnu::noinline]] std::uint64_t BarrierLoop(DemoEnvironment &) {
+  std::uint64_t a = 0x12345678ULL;
+  std::uint64_t b = 0x9abcdef0ULL;
+  constexpr std::size_t kIters = 20'000'000;
+  for (std::size_t i = 0; i < kIters; ++i) {
+    a += (b ^ static_cast<std::uint64_t>(i)) + 0x9e3779b97f4a7c15ULL;
+    EmitBarrier();
+    b ^= a + (a >> 7);
+  }
+  g_sink ^= (a + b);
+  return g_sink;
 }
 
 [[gnu::noinline]] std::uint64_t PageStrideRead(DemoEnvironment &state) {
