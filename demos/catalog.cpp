@@ -130,6 +130,36 @@ const WorkloadExpectation kSimdAluExpectations[] = {
     {"inst-int-alu", "low", "The math stays in vector lanes rather than scalar integer ALUs for most of the body."},
 };
 
+const WorkloadExpectation kDispatchIntExpectations[] = {
+    {"core-active-cycle", "high", "The core spends most of its time actively issuing useful work instead of waiting on misses."},
+    {"retire-uop", "high", "A dense scalar compute loop should retire a large stream of micro-ops."},
+    {"map-uop", "high", "The mapper keeps feeding uops from a steady stream of scalar integer operations."},
+    {"map-int-uop", "high", "Most of those mapped uops are scalar integer work rather than loads or SIMD instructions."},
+};
+
+const WorkloadExpectation kDispatchMemoryExpectations[] = {
+    {"retire-uop", "high", "A long streaming loop still retires a large body of micro-ops, even though the mix is load-heavy."},
+    {"map-uop", "high", "The mapper stays busy issuing uops for the steady-state streaming loop."},
+    {"map-ldst-uop", "high", "The dominant mapped work is load/store traffic rather than scalar ALU or SIMD arithmetic."},
+};
+
+const WorkloadExpectation kDispatchSimdExpectations[] = {
+    {"core-active-cycle", "high", "The vector loop stays register-resident and keeps the core actively working."},
+    {"retire-uop", "high", "A dense SIMD compute loop should still retire a large stream of uops."},
+    {"map-uop", "high", "The mapper keeps feeding uops from a dense vector arithmetic loop."},
+    {"map-simd-uop", "high", "Most of those mapped uops are SIMD arithmetic rather than scalar integer work."},
+};
+
+const WorkloadExpectation kFrontendHotRestartExpectations[] = {
+    {"fetch-restart", "low", "One tiny hot stub should let the frontend fetch smoothly without frequent restart events."},
+    {"flush-restart-other", "low", "The hot single-page code path should minimize non-branch frontend flush/restart activity."},
+};
+
+const WorkloadExpectation kFrontendRandomRestartExpectations[] = {
+    {"fetch-restart", "high", "Jumping across many executable pages makes the frontend repeatedly rediscover and restart fetch from new locations."},
+    {"flush-restart-other", "high", "The same code-page churn should amplify non-branch frontend flush/restart activity if this event is meaningful on the current core."},
+};
+
 const WorkloadExpectation kPredictableBranchExpectations[] = {
     {"branches", "high", "The loop executes an actual conditional branch every iteration, so retired branch count is high."},
     {"inst-branch-cond", "high", "Every iteration still uses a conditional branch, even though the predictor handles it well."},
@@ -385,6 +415,37 @@ for (std::size_t i = 0; i < 20'000'000; ++i) {
   b = veorq_u64(vshlq_n_u64(b, 1), c);
   c = vaddq_u64(c, vorrq_u64(a, d));
   d = veorq_u64(d, vshrq_n_u64(a, 7));
+}
+)cpp";
+
+constexpr std::string_view kDispatchIntConfig =
+    "Same dense scalar integer ALU loop, but measured with active-cycle and uop-mapping counters.";
+constexpr std::string_view kDispatchIntCode = kDenseAluCode;
+
+constexpr std::string_view kDispatchMemoryConfig =
+    "Same scalar 64 MiB sequential read stream, but measured with active-cycle and mapper/uop counters.";
+constexpr std::string_view kDispatchMemoryCode = kScalarStreamReadCode;
+
+constexpr std::string_view kDispatchSimdConfig =
+    "Same NEON vector ALU loop, but measured with active-cycle and SIMD mapper/uop counters.";
+constexpr std::string_view kDispatchSimdCode = kSimdAluCode;
+
+constexpr std::string_view kFrontendHotRestartConfig =
+    "Same tiny hot executable stub loop, but measured with frontend restart counters.";
+constexpr std::string_view kFrontendHotRestartCode = R"cpp(
+const auto fn = state.ExecStubAt(0);
+for (std::size_t i = 0; i < 32'000'000; ++i) {
+  sum += fn();
+}
+)cpp";
+
+constexpr std::string_view kFrontendRandomRestartConfig =
+    "Same randomized executable-page walk, but measured with frontend restart counters.";
+constexpr std::string_view kFrontendRandomRestartCode = R"cpp(
+for (std::size_t pass = 0; pass < 128; ++pass) {
+  for (std::size_t page : state.exec_page_order) {
+    sum += state.ExecStubAt(page)();
+  }
 }
 )cpp";
 
@@ -815,6 +876,63 @@ const WorkloadDefinition kWorkloads[] = {
         "Both demos are dense compute loops with almost no memory pressure. The main difference is whether the arithmetic retires in SIMD lanes or scalar integer ALUs.",
     },
     {
+        "dispatch-int-alu",
+        "Dispatch Int ALU",
+        "The dense scalar integer ALU loop measured through active-cycle and mapper/uop counters.",
+        "Use this when you want to inspect how a clean scalar compute loop looks to the mapper and retire stages rather than focusing on high-level instructions alone.",
+        kDispatchIntConfig,
+        kDispatchIntCode,
+        Group::SimdUopMapping,
+        Tier::Experimental,
+        3,
+        1,
+        CYCLES | INSTRUCTIONS | PerfCounter::Named("CORE_ACTIVE_CYCLE") |
+            PerfCounter::Named("RETIRE_UOP") | PerfCounter::Named("MAP_UOP") |
+            PerfCounter::Named("MAP_INT_UOP"),
+        std::span<const WorkloadExpectation>(kDispatchIntExpectations),
+        &workloads::DenseIntegerAlu,
+        "dispatch-simd-alu",
+        "Both demos are dense register-resident compute loops. The main difference is whether the mapper sees mostly scalar integer uops or mostly SIMD uops.",
+    },
+    {
+        "dispatch-memory-stream",
+        "Dispatch Memory Stream",
+        "The scalar stream-read loop measured through active-cycle and mapper/uop counters.",
+        "This keeps the code simple but shifts the mapped work toward load/store uops instead of scalar or SIMD arithmetic.",
+        kDispatchMemoryConfig,
+        kDispatchMemoryCode,
+        Group::SimdUopMapping,
+        Tier::Experimental,
+        3,
+        1,
+        CYCLES | INSTRUCTIONS | PerfCounter::Named("CORE_ACTIVE_CYCLE") |
+            PerfCounter::Named("RETIRE_UOP") | PerfCounter::Named("MAP_UOP") |
+            PerfCounter::Named("MAP_LDST_UOP"),
+        std::span<const WorkloadExpectation>(kDispatchMemoryExpectations),
+        &workloads::ScalarStreamRead,
+        "dispatch-int-alu",
+        "Both demos are steady-state loops with little control-flow noise. The difference is whether the mapped work is mostly scalar integer arithmetic or mostly load/store traffic.",
+    },
+    {
+        "dispatch-simd-alu",
+        "Dispatch SIMD ALU",
+        "The dense NEON vector ALU loop measured through active-cycle and mapper/uop counters.",
+        "This is the SIMD-side mapper view: it keeps the loop register-resident while shifting the mapped work into vector uops.",
+        kDispatchSimdConfig,
+        kDispatchSimdCode,
+        Group::SimdUopMapping,
+        Tier::Experimental,
+        3,
+        1,
+        CYCLES | INSTRUCTIONS | PerfCounter::Named("CORE_ACTIVE_CYCLE") |
+            PerfCounter::Named("RETIRE_UOP") | PerfCounter::Named("MAP_UOP") |
+            PerfCounter::Named("MAP_SIMD_UOP"),
+        std::span<const WorkloadExpectation>(kDispatchSimdExpectations),
+        &workloads::SimdVectorAlu,
+        "dispatch-int-alu",
+        "Both demos are dense register-resident compute loops. The main difference is whether the mapper sees mostly SIMD uops or mostly scalar integer uops.",
+    },
+    {
         "predictable-branch",
         "Predictable Branch",
         "A branch-heavy loop with strongly biased direction.",
@@ -885,6 +1003,42 @@ const WorkloadDefinition kWorkloads[] = {
             PerfCounter::Named("MMU_TABLE_WALK_INSTRUCTION"),
         std::span<const WorkloadExpectation>(kRandomInstructionExpectations),
         &workloads::RandomInstructionPages,
+    },
+    {
+        "frontend-hot-restart",
+        "Frontend Hot Restart",
+        "The tiny hot executable stub loop measured through frontend restart counters.",
+        "This is the low-restart frontend baseline: one small hot code page should let fetch run smoothly.",
+        kFrontendHotRestartConfig,
+        kFrontendHotRestartCode,
+        Group::InstructionSide,
+        Tier::Experimental,
+        3,
+        1,
+        CYCLES | INSTRUCTIONS | PerfCounter::Named("FETCH_RESTART") |
+            PerfCounter::Named("FLUSH_RESTART_OTHER_NONSPEC") |
+            PerfCounter::Named("CORE_ACTIVE_CYCLE"),
+        std::span<const WorkloadExpectation>(kFrontendHotRestartExpectations),
+        &workloads::HotInstructionLoop,
+    },
+    {
+        "frontend-random-restart",
+        "Frontend Random Restart",
+        "The randomized executable-page walk measured through frontend restart counters.",
+        "This is the high-restart frontend showcase: the code footprint keeps moving, so fetch repeatedly has to restart from new places.",
+        kFrontendRandomRestartConfig,
+        kFrontendRandomRestartCode,
+        Group::InstructionSide,
+        Tier::Experimental,
+        3,
+        1,
+        CYCLES | INSTRUCTIONS | PerfCounter::Named("FETCH_RESTART") |
+            PerfCounter::Named("FLUSH_RESTART_OTHER_NONSPEC") |
+            PerfCounter::Named("CORE_ACTIVE_CYCLE"),
+        std::span<const WorkloadExpectation>(kFrontendRandomRestartExpectations),
+        &workloads::RandomInstructionPages,
+        "frontend-hot-restart",
+        "Both demos repeatedly call generated executable stubs. The difference is whether execution stays on one hot code page or jumps across many pages in randomized order.",
     },
 };
 
@@ -1046,6 +1200,18 @@ const CounterDefinition kCounters[] = {
         {2.0, 100},
     },
     {
+        "core-active-cycle",
+        "Core Active Cycle",
+        "Cycles where the core is actively doing useful work rather than sitting idle or fully stalled.",
+        "Dense compute is the intended high case; pointer-chase latency is the intended low case.",
+        Group::CoreExecution,
+        Tier::Experimental,
+        PerfCounter::Named("CORE_ACTIVE_CYCLE"),
+        "dispatch-int-alu",
+        "random-pointer-chase",
+        {2.0, 100},
+    },
+    {
         "inst-int-alu",
         "Integer ALU Instructions",
         "Retired integer ALU instructions.",
@@ -1055,6 +1221,42 @@ const CounterDefinition kCounters[] = {
         PerfCounter::Named("INST_INT_ALU"),
         "dense-integer-alu",
         "hot-seq-read",
+        {2.0, 100},
+    },
+    {
+        "retire-uop",
+        "Retire Uops",
+        "Micro-ops retired by the backend.",
+        "This is a lower-level counterpart to instruction retirement; dense compute should be the clearest trigger.",
+        Group::SimdUopMapping,
+        Tier::Experimental,
+        PerfCounter::Named("RETIRE_UOP"),
+        "dispatch-int-alu",
+        "random-pointer-chase",
+        {2.0, 100},
+    },
+    {
+        "map-uop",
+        "Mapped Uops",
+        "Micro-ops produced by the mapper.",
+        "Use this as the broad frontend-to-backend uop flow counter before splitting into integer, SIMD, or load/store subclasses.",
+        Group::SimdUopMapping,
+        Tier::Experimental,
+        PerfCounter::Named("MAP_UOP"),
+        "dispatch-int-alu",
+        "random-pointer-chase",
+        {2.0, 100},
+    },
+    {
+        "map-int-uop",
+        "Mapped Integer Uops",
+        "Integer-class uops produced by the mapper.",
+        "The scalar integer ALU loop is the intended high case; the SIMD dispatch loop is the low contrast.",
+        Group::SimdUopMapping,
+        Tier::Experimental,
+        PerfCounter::Named("MAP_INT_UOP"),
+        "dispatch-int-alu",
+        "dispatch-simd-alu",
         {2.0, 100},
     },
     {
@@ -1139,6 +1341,18 @@ const CounterDefinition kCounters[] = {
         PerfCounter::Named("INST_LDST"),
         "random-pointer-chase",
         "dense-integer-alu",
+        {2.0, 100},
+    },
+    {
+        "map-ldst-uop",
+        "Mapped Load/Store Uops",
+        "Load/store-class uops produced by the mapper.",
+        "The streaming memory demo is the intended high case; the scalar ALU loop is the low baseline.",
+        Group::SimdUopMapping,
+        Tier::Experimental,
+        PerfCounter::Named("MAP_LDST_UOP"),
+        "dispatch-memory-stream",
+        "dispatch-int-alu",
         {2.0, 100},
     },
     {
@@ -1235,6 +1449,18 @@ const CounterDefinition kCounters[] = {
         PerfCounter::Named("INST_SIMD_ALU"),
         "simd-vector-alu",
         "dense-integer-alu",
+        {2.0, 100},
+    },
+    {
+        "map-simd-uop",
+        "Mapped SIMD Uops",
+        "SIMD-class uops produced by the mapper.",
+        "The vector ALU loop is the intended high case; the scalar dispatch loop is the low baseline.",
+        Group::SimdUopMapping,
+        Tier::Experimental,
+        PerfCounter::Named("MAP_SIMD_UOP"),
+        "dispatch-simd-alu",
+        "dispatch-int-alu",
         {2.0, 100},
     },
     {
@@ -1355,6 +1581,30 @@ const CounterDefinition kCounters[] = {
         PerfCounter::Named("MMU_TABLE_WALK_INSTRUCTION"),
         "random-instruction-pages",
         "hot-instruction-loop",
+        {2.0, 100},
+    },
+    {
+        "fetch-restart",
+        "Fetch Restart",
+        "Frontend fetch restart events.",
+        "The random executable-page walk is the intended high case; a single hot stub is the low baseline.",
+        Group::InstructionSide,
+        Tier::Experimental,
+        PerfCounter::Named("FETCH_RESTART"),
+        "frontend-random-restart",
+        "frontend-hot-restart",
+        {2.0, 100},
+    },
+    {
+        "flush-restart-other",
+        "Flush Restart Other",
+        "Non-branch frontend flush/restart events.",
+        "Experimental because the exact microarchitectural meaning is more opaque than the stable miss counters, but code-page churn is the intended high case.",
+        Group::InstructionSide,
+        Tier::Experimental,
+        PerfCounter::Named("FLUSH_RESTART_OTHER_NONSPEC"),
+        "frontend-random-restart",
+        "frontend-hot-restart",
         {2.0, 100},
     },
     {

@@ -200,6 +200,11 @@ Experimental showcase workloads currently include:
 - `aligned-page-store`
 - `cross-page-store`
 - `simd-vector-alu`
+- `dispatch-int-alu`
+- `dispatch-memory-stream`
+- `dispatch-simd-alu`
+- `frontend-hot-restart`
+- `frontend-random-restart`
 
 ### Counter Support Table
 
@@ -218,8 +223,13 @@ Experimental showcase workloads currently include:
 | `l1-load-miss-nonspec` | experimental | nonspec load misses | `random-pointer-chase` | `hot-seq-read` | semantics are more implementation-specific |
 | `l1-store-miss-nonspec` | experimental | nonspec store misses | `random-page-write` | `hot-seq-write` | write-allocate effects can complicate reading |
 | `inst-all` | experimental | aggregate retired instructions | `dense-integer-alu` | `random-pointer-chase` | PMU-event view of overall retired instructions |
+| `core-active-cycle` | experimental | cycles where the core stayed actively busy | `dispatch-int-alu` | `random-pointer-chase` | dense compute versus latency-stalled pointer chasing |
 | `inst-int-alu` | experimental | retired integer ALU instructions | `dense-integer-alu` | `hot-seq-read` | pure compute versus memory-heavy access |
+| `retire-uop` | experimental | retired micro-ops | `dispatch-int-alu` | `random-pointer-chase` | lower-level counterpart to instruction retirement |
+| `map-uop` | experimental | mapped micro-ops | `dispatch-int-alu` | `random-pointer-chase` | broad frontend-to-backend uop flow |
+| `map-int-uop` | experimental | mapped integer-class uops | `dispatch-int-alu` | `dispatch-simd-alu` | scalar integer mapping versus SIMD mapping |
 | `inst-simd-alu` | experimental | retired SIMD arithmetic instructions | `simd-vector-alu` | `dense-integer-alu` | vector-compute counterpart to scalar integer ALU |
+| `map-simd-uop` | experimental | mapped SIMD-class uops | `dispatch-simd-alu` | `dispatch-int-alu` | SIMD mapping versus scalar integer mapping |
 | `inst-simd-ld` | experimental | retired SIMD load instructions | `simd-stream-read` | `scalar-stream-read` | same stream, different load instruction class |
 | `inst-int-ld` | experimental | retired integer load instructions | `random-pointer-chase` | `dense-integer-alu` | good load-heavy versus register-only contrast |
 | `inst-simd-st` | experimental | retired SIMD store instructions | `simd-stream-write` | `scalar-stream-write` | same stream, different store instruction class |
@@ -227,6 +237,7 @@ Experimental showcase workloads currently include:
 | `atomic-fail` | experimental | failed atomic/exclusive ops | `contended-atomic-cas` | `uncontended-atomic-cas` | retry-heavy compare-exchange under contention |
 | `inst-int-st` | experimental | retired integer store instructions | `random-page-write` | `dense-integer-alu` | clearest store-side trigger in the current lab |
 | `inst-ldst` | experimental | retired load/store instructions | `random-pointer-chase` | `dense-integer-alu` | broad memory-instruction mix signal |
+| `map-ldst-uop` | experimental | mapped load/store uops | `dispatch-memory-stream` | `dispatch-int-alu` | separates memory-stream mapping from scalar compute |
 | `ld-unit-uop` | experimental | load-unit micro-ops | `random-pointer-chase` | `dense-integer-alu` | often tracks load pressure more directly than retired instructions |
 | `st-unit-uop` | experimental | store-unit micro-ops | `random-page-write` | `dense-integer-alu` | store pressure teaching counter |
 | `l1d-writeback` | experimental | L1D writebacks | `random-page-write` | `hot-seq-write` | useful for dirty-line eviction behavior |
@@ -241,6 +252,8 @@ Experimental showcase workloads currently include:
 | `inst-branch-call` | experimental | retired call branches | `hot-instruction-loop` | `dense-integer-alu` | direct way to expose repeated stub calls |
 | `inst-branch-ret` | experimental | retired return branches | `hot-instruction-loop` | `dense-integer-alu` | pairs naturally with the same stub-call loop |
 | `inst-branch-indir` | experimental | retired indirect branches | `hot-instruction-loop` | `dense-integer-alu` | function-pointer call is the teaching case |
+| `fetch-restart` | experimental | frontend fetch restart events | `frontend-random-restart` | `frontend-hot-restart` | code-page churn versus one hot stub |
+| `flush-restart-other` | experimental | non-branch frontend flush/restart events | `frontend-random-restart` | `frontend-hot-restart` | more opaque than the stable frontend miss counters |
 | `l1i-tlb-fill` | experimental | instruction-side TLB fills | `random-instruction-pages` | `hot-instruction-loop` | code-page churn refill signal |
 | `l2-tlb-miss-instruction` | experimental | second-level instruction TLB misses | `random-instruction-pages` | `hot-instruction-loop` | instruction-side analogue of the data TLB story |
 | `mmu-table-walk-instruction` | experimental | instruction-side page walks | `random-instruction-pages` | `hot-instruction-loop` | frontend page-walk teaching counter |
