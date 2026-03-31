@@ -188,6 +188,10 @@ Experimental showcase workloads currently include:
 - `cross-x64-load`
 - `aligned-page-load`
 - `cross-page-load`
+- `aligned-x64-store`
+- `cross-x64-store`
+- `aligned-page-store`
+- `cross-page-store`
 
 ### Counter Support Table
 

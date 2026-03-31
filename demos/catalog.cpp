@@ -71,6 +71,26 @@ const WorkloadExpectation kCrossPageExpectations[] = {
     {"ldst-x64-uop", "high", "That same offset also straddles a 64-byte region, so both split counters should rise together."},
 };
 
+const WorkloadExpectation kAlignedX64StoreExpectations[] = {
+    {"ldst-x64-uop", "low", "An aligned 64-bit store at the start of each 64-byte region should not need a split-64B micro-op."},
+    {"ldst-xpg-uop", "low", "The store stays fully inside both the 64-byte region and the page."},
+};
+
+const WorkloadExpectation kCrossX64StoreExpectations[] = {
+    {"ldst-x64-uop", "high", "Starting each 64-bit store at byte 60 forces it to straddle a 64-byte boundary."},
+    {"ldst-xpg-uop", "low", "The store stream is still page-local; this demo is about 64-byte splits, not page splits."},
+};
+
+const WorkloadExpectation kAlignedPageStoreExpectations[] = {
+    {"ldst-xpg-uop", "low", "A store to the start of each page stays completely inside that page."},
+    {"ldst-x64-uop", "low", "The aligned page-start store also avoids 64-byte splits."},
+};
+
+const WorkloadExpectation kCrossPageStoreExpectations[] = {
+    {"ldst-xpg-uop", "high", "Starting a 64-bit store four bytes before the page boundary forces a true cross-page store."},
+    {"ldst-x64-uop", "high", "That same store also straddles a 64-byte region, so both split counters should rise together."},
+};
+
 const WorkloadExpectation kPredictableBranchExpectations[] = {
     {"branches", "high", "The loop executes an actual conditional branch every iteration, so retired branch count is high."},
     {"inst-branch-cond", "high", "Every iteration still uses a conditional branch, even though the predictor handles it well."},
@@ -212,6 +232,38 @@ constexpr std::string_view kCrossPageConfig =
 constexpr std::string_view kCrossPageCode = R"cpp(
 for (std::size_t page = 0; page < state.page_count; ++page) {
   sum += ReadUnaligned64(bytes + page * state.page_size + state.page_size - 4);
+}
+)cpp";
+
+constexpr std::string_view kAlignedX64StoreConfig =
+    "16 passes of 64-bit stores to the start of each 64-byte region across the page-backed working set.";
+constexpr std::string_view kAlignedX64StoreCode = R"cpp(
+for (std::size_t offset = 0; offset <= limit; offset += 64) {
+  WriteUnaligned64(bytes + offset, stamp);
+}
+)cpp";
+
+constexpr std::string_view kCrossX64StoreConfig =
+    "16 passes of 64-bit stores starting at byte 60 of each 64-byte region.";
+constexpr std::string_view kCrossX64StoreCode = R"cpp(
+for (std::size_t offset = 0; offset <= limit; offset += 64) {
+  WriteUnaligned64(bytes + offset + 60, stamp);
+}
+)cpp";
+
+constexpr std::string_view kAlignedPageStoreConfig =
+    "256 passes of one 64-bit store to the start of each page.";
+constexpr std::string_view kAlignedPageStoreCode = R"cpp(
+for (std::size_t page = 0; page < state.page_count; ++page) {
+  WriteUnaligned64(bytes + page * state.page_size, stamp);
+}
+)cpp";
+
+constexpr std::string_view kCrossPageStoreConfig =
+    "256 passes of one 64-bit store starting four bytes before each page boundary.";
+constexpr std::string_view kCrossPageStoreCode = R"cpp(
+for (std::size_t page = 0; page < state.page_count; ++page) {
+  WriteUnaligned64(bytes + page * state.page_size + state.page_size - 4, stamp);
 }
 )cpp";
 
@@ -435,6 +487,74 @@ const WorkloadDefinition kWorkloads[] = {
         &workloads::CrossPageLoad,
         "aligned-page-load",
         "Both demos touch one 64-bit word per page. The difference is that this version starts four bytes before the boundary, so each load has to span two pages.",
+    },
+    {
+        "aligned-x64-store",
+        "Aligned 64B-Region Store",
+        "Store 64 bits at the start of each 64-byte region.",
+        "This is the low split-store baseline: the store stream is wide, but every store stays aligned inside its 64-byte region.",
+        kAlignedX64StoreConfig,
+        kAlignedX64StoreCode,
+        Group::SimdUopMapping,
+        Tier::Experimental,
+        3,
+        1,
+        CYCLES | INSTRUCTIONS | PerfCounter::Named("LDST_X64_UOP") |
+            PerfCounter::Named("LDST_XPG_UOP"),
+        std::span<const WorkloadExpectation>(kAlignedX64StoreExpectations),
+        &workloads::AlignedX64Store,
+    },
+    {
+        "cross-x64-store",
+        "Cross 64B-Region Store",
+        "Store 64 bits starting at byte 60 of each 64-byte region.",
+        "This isolates 64-byte split stores. The footprint and stride are otherwise the same as the aligned store baseline.",
+        kCrossX64StoreConfig,
+        kCrossX64StoreCode,
+        Group::SimdUopMapping,
+        Tier::Experimental,
+        3,
+        1,
+        CYCLES | INSTRUCTIONS | PerfCounter::Named("LDST_X64_UOP") |
+            PerfCounter::Named("LDST_XPG_UOP"),
+        std::span<const WorkloadExpectation>(kCrossX64StoreExpectations),
+        &workloads::CrossX64Store,
+        "aligned-x64-store",
+        "Both demos issue the same number of 64-bit stores over the same backing store. The main difference is that this version forces each store to straddle a 64-byte boundary.",
+    },
+    {
+        "aligned-page-store",
+        "Aligned Page Store",
+        "Store 64 bits at the start of each page.",
+        "This is the low cross-page store baseline: each store stays completely inside one page and one 64-byte region.",
+        kAlignedPageStoreConfig,
+        kAlignedPageStoreCode,
+        Group::SimdUopMapping,
+        Tier::Experimental,
+        3,
+        1,
+        CYCLES | INSTRUCTIONS | PerfCounter::Named("LDST_X64_UOP") |
+            PerfCounter::Named("LDST_XPG_UOP"),
+        std::span<const WorkloadExpectation>(kAlignedPageStoreExpectations),
+        &workloads::AlignedPageStore,
+    },
+    {
+        "cross-page-store",
+        "Cross Page Store",
+        "Store 64 bits starting four bytes before each page boundary.",
+        "This forces every store to span two pages. On this machine that offset also crosses a 64-byte region boundary, so both split counters should rise.",
+        kCrossPageStoreConfig,
+        kCrossPageStoreCode,
+        Group::SimdUopMapping,
+        Tier::Experimental,
+        3,
+        1,
+        CYCLES | INSTRUCTIONS | PerfCounter::Named("LDST_X64_UOP") |
+            PerfCounter::Named("LDST_XPG_UOP"),
+        std::span<const WorkloadExpectation>(kCrossPageStoreExpectations),
+        &workloads::CrossPageStore,
+        "aligned-page-store",
+        "Both demos touch one 64-bit word per page. The difference is that this version starts four bytes before the boundary, so each store has to span two pages.",
     },
     {
         "predictable-branch",

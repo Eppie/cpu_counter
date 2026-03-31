@@ -93,6 +93,10 @@ std::uint64_t ReadUnaligned64(const std::uint8_t *ptr) {
   return *reinterpret_cast<const volatile UnalignedU64 *>(ptr);
 }
 
+void WriteUnaligned64(std::uint8_t *ptr, std::uint64_t value) {
+  *reinterpret_cast<volatile UnalignedU64 *>(ptr) = value;
+}
+
 std::uint32_t EncodeMovzX0(std::uint16_t imm16) {
   return 0xD2800000u | (static_cast<std::uint32_t>(imm16) << 5);
 }
@@ -514,6 +518,72 @@ namespace workloads {
   }
   g_sink ^= sum;
   return sum;
+}
+
+[[gnu::noinline]] std::uint64_t AlignedX64Store(DemoEnvironment &state) {
+  auto *bytes = reinterpret_cast<std::uint8_t *>(state.page_base);
+  const std::size_t total_bytes = state.page_count * state.page_size;
+  const std::size_t limit = total_bytes - 128;
+  std::uint64_t stamp = 0;
+  constexpr std::size_t kPasses = 16;
+  for (std::size_t pass = 0; pass < kPasses; ++pass) {
+    for (std::size_t offset = 0; offset <= limit; offset += 64) {
+      stamp += static_cast<std::uint64_t>(offset + pass + 1);
+      WriteUnaligned64(bytes + offset, stamp);
+    }
+  }
+  const std::uint64_t value = ReadUnaligned64(bytes + limit);
+  g_sink ^= value;
+  return value;
+}
+
+[[gnu::noinline]] std::uint64_t CrossX64Store(DemoEnvironment &state) {
+  auto *bytes = reinterpret_cast<std::uint8_t *>(state.page_base);
+  const std::size_t total_bytes = state.page_count * state.page_size;
+  const std::size_t limit = total_bytes - 128;
+  std::uint64_t stamp = 0;
+  constexpr std::size_t kPasses = 16;
+  for (std::size_t pass = 0; pass < kPasses; ++pass) {
+    for (std::size_t offset = 0; offset <= limit; offset += 64) {
+      stamp += static_cast<std::uint64_t>(offset + pass + 1);
+      WriteUnaligned64(bytes + offset + 60, stamp);
+    }
+  }
+  const std::uint64_t value = ReadUnaligned64(bytes + limit + 60);
+  g_sink ^= value;
+  return value;
+}
+
+[[gnu::noinline]] std::uint64_t AlignedPageStore(DemoEnvironment &state) {
+  auto *bytes = reinterpret_cast<std::uint8_t *>(state.page_base);
+  std::uint64_t stamp = 0;
+  constexpr std::size_t kPasses = 256;
+  for (std::size_t pass = 0; pass < kPasses; ++pass) {
+    for (std::size_t page = 0; page < state.page_count; ++page) {
+      stamp += static_cast<std::uint64_t>(page + pass + 1);
+      WriteUnaligned64(bytes + page * state.page_size, stamp);
+    }
+  }
+  const std::uint64_t value =
+      ReadUnaligned64(bytes + (state.page_count - 1) * state.page_size);
+  g_sink ^= value;
+  return value;
+}
+
+[[gnu::noinline]] std::uint64_t CrossPageStore(DemoEnvironment &state) {
+  auto *bytes = reinterpret_cast<std::uint8_t *>(state.page_base);
+  std::uint64_t stamp = 0;
+  constexpr std::size_t kPasses = 256;
+  for (std::size_t pass = 0; pass < kPasses; ++pass) {
+    for (std::size_t page = 0; page < state.page_count; ++page) {
+      stamp += static_cast<std::uint64_t>(page + pass + 1);
+      WriteUnaligned64(bytes + page * state.page_size + state.page_size - 4, stamp);
+    }
+  }
+  const std::uint64_t value =
+      ReadUnaligned64(bytes + (state.page_count - 1) * state.page_size + state.page_size - 4);
+  g_sink ^= value;
+  return value;
 }
 
 [[gnu::noinline]] std::uint64_t PredictableBranch(DemoEnvironment &state) {
