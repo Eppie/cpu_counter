@@ -87,6 +87,12 @@ std::vector<std::size_t> BuildShuffledSequence(std::size_t count, std::uint64_t 
   return order;
 }
 
+using UnalignedU64 = std::uint64_t __attribute__((aligned(1)));
+
+std::uint64_t ReadUnaligned64(const std::uint8_t *ptr) {
+  return *reinterpret_cast<const volatile UnalignedU64 *>(ptr);
+}
+
 std::uint32_t EncodeMovzX0(std::uint16_t imm16) {
   return 0xD2800000u | (static_cast<std::uint32_t>(imm16) << 5);
 }
@@ -448,6 +454,62 @@ namespace workloads {
   for (std::size_t pass = 0; pass < kPasses; ++pass) {
     for (std::size_t page : state.page_order) {
       sum += base[page * stride];
+    }
+  }
+  g_sink ^= sum;
+  return sum;
+}
+
+[[gnu::noinline]] std::uint64_t AlignedX64Load(DemoEnvironment &state) {
+  const auto *bytes = reinterpret_cast<const std::uint8_t *>(state.page_base);
+  const std::size_t total_bytes = state.page_count * state.page_size;
+  const std::size_t limit = total_bytes - 128;
+  std::uint64_t sum = 0;
+  constexpr std::size_t kPasses = 16;
+  for (std::size_t pass = 0; pass < kPasses; ++pass) {
+    for (std::size_t offset = 0; offset <= limit; offset += 64) {
+      sum += ReadUnaligned64(bytes + offset);
+    }
+  }
+  g_sink ^= sum;
+  return sum;
+}
+
+[[gnu::noinline]] std::uint64_t CrossX64Load(DemoEnvironment &state) {
+  const auto *bytes = reinterpret_cast<const std::uint8_t *>(state.page_base);
+  const std::size_t total_bytes = state.page_count * state.page_size;
+  const std::size_t limit = total_bytes - 128;
+  std::uint64_t sum = 0;
+  constexpr std::size_t kPasses = 16;
+  for (std::size_t pass = 0; pass < kPasses; ++pass) {
+    for (std::size_t offset = 0; offset <= limit; offset += 64) {
+      sum += ReadUnaligned64(bytes + offset + 60);
+    }
+  }
+  g_sink ^= sum;
+  return sum;
+}
+
+[[gnu::noinline]] std::uint64_t AlignedPageLoad(DemoEnvironment &state) {
+  const auto *bytes = reinterpret_cast<const std::uint8_t *>(state.page_base);
+  std::uint64_t sum = 0;
+  constexpr std::size_t kPasses = 256;
+  for (std::size_t pass = 0; pass < kPasses; ++pass) {
+    for (std::size_t page = 0; page < state.page_count; ++page) {
+      sum += ReadUnaligned64(bytes + page * state.page_size);
+    }
+  }
+  g_sink ^= sum;
+  return sum;
+}
+
+[[gnu::noinline]] std::uint64_t CrossPageLoad(DemoEnvironment &state) {
+  const auto *bytes = reinterpret_cast<const std::uint8_t *>(state.page_base);
+  std::uint64_t sum = 0;
+  constexpr std::size_t kPasses = 256;
+  for (std::size_t pass = 0; pass < kPasses; ++pass) {
+    for (std::size_t page = 0; page < state.page_count; ++page) {
+      sum += ReadUnaligned64(bytes + page * state.page_size + state.page_size - 4);
     }
   }
   g_sink ^= sum;

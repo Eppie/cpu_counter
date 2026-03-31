@@ -44,6 +44,26 @@ const WorkloadExpectation kPageStrideExpectations[] = {
     {"l2-tlb-miss", "high", "Enough distinct pages overflow the first-level data TLB and spill into the next level."},
 };
 
+const WorkloadExpectation kAlignedX64Expectations[] = {
+    {"ldst-x64-uop", "low", "An aligned 64-bit load at the start of each 64-byte region should not need a split-64B micro-op."},
+    {"ldst-xpg-uop", "low", "The access stays fully inside both the 64-byte region and the page."},
+};
+
+const WorkloadExpectation kCrossX64Expectations[] = {
+    {"ldst-x64-uop", "high", "Starting each 64-bit load at byte 60 forces it to straddle a 64-byte boundary."},
+    {"ldst-xpg-uop", "low", "Most accesses still stay inside a page; this workload is about 64-byte splits, not page splits."},
+};
+
+const WorkloadExpectation kAlignedPageExpectations[] = {
+    {"ldst-xpg-uop", "low", "A load from the start of each page stays completely inside that page."},
+    {"ldst-x64-uop", "low", "The aligned page-start access also avoids 64-byte splits."},
+};
+
+const WorkloadExpectation kCrossPageExpectations[] = {
+    {"ldst-xpg-uop", "high", "Starting a 64-bit load four bytes before the page boundary forces a true cross-page access."},
+    {"ldst-x64-uop", "high", "That same offset also straddles a 64-byte region, so both split counters should rise together."},
+};
+
 const WorkloadExpectation kPredictableBranchExpectations[] = {
     {"branches", "high", "The loop executes an actual conditional branch every iteration, so retired branch count is high."},
     {"branch-miss", "low", "The condition is strongly biased, so the predictor stays accurate."},
@@ -136,6 +156,38 @@ for (std::size_t pass = 0; pass < 256; ++pass) {
   for (std::size_t page : state.page_order) {
     sum += base[page * stride];
   }
+}
+)cpp";
+
+constexpr std::string_view kAlignedX64Config =
+    "16 passes of 64-bit loads from the start of each 64-byte region across the page-backed working set.";
+constexpr std::string_view kAlignedX64Code = R"cpp(
+for (std::size_t offset = 0; offset <= limit; offset += 64) {
+  sum += ReadUnaligned64(bytes + offset);
+}
+)cpp";
+
+constexpr std::string_view kCrossX64Config =
+    "16 passes of 64-bit loads starting at byte 60 of each 64-byte region.";
+constexpr std::string_view kCrossX64Code = R"cpp(
+for (std::size_t offset = 0; offset <= limit; offset += 64) {
+  sum += ReadUnaligned64(bytes + offset + 60);
+}
+)cpp";
+
+constexpr std::string_view kAlignedPageConfig =
+    "256 passes of one 64-bit load from the start of each page.";
+constexpr std::string_view kAlignedPageCode = R"cpp(
+for (std::size_t page = 0; page < state.page_count; ++page) {
+  sum += ReadUnaligned64(bytes + page * state.page_size);
+}
+)cpp";
+
+constexpr std::string_view kCrossPageConfig =
+    "256 passes of one 64-bit load starting four bytes before each page boundary.";
+constexpr std::string_view kCrossPageCode = R"cpp(
+for (std::size_t page = 0; page < state.page_count; ++page) {
+  sum += ReadUnaligned64(bytes + page * state.page_size + state.page_size - 4);
 }
 )cpp";
 
@@ -288,6 +340,74 @@ const WorkloadDefinition kWorkloads[] = {
         CYCLES | INSTRUCTIONS | DTLB_MISS | L2_TLB_MISS,
         std::span<const WorkloadExpectation>(kPageStrideExpectations),
         &workloads::PageStrideRead,
+    },
+    {
+        "aligned-x64-load",
+        "Aligned 64B-Region Load",
+        "Load from the start of each 64-byte region.",
+        "This is the low split-load baseline: the access pattern is wide, but every load stays aligned inside its 64-byte region.",
+        kAlignedX64Config,
+        kAlignedX64Code,
+        Group::SimdUopMapping,
+        Tier::Experimental,
+        3,
+        1,
+        CYCLES | INSTRUCTIONS | PerfCounter::Named("LDST_X64_UOP") |
+            PerfCounter::Named("LDST_XPG_UOP"),
+        std::span<const WorkloadExpectation>(kAlignedX64Expectations),
+        &workloads::AlignedX64Load,
+    },
+    {
+        "cross-x64-load",
+        "Cross 64B-Region Load",
+        "Load 64 bits starting at byte 60 of each 64-byte region.",
+        "This isolates 64-byte split accesses. The data footprint is otherwise linear, so the main difference is the forced split at each region boundary.",
+        kCrossX64Config,
+        kCrossX64Code,
+        Group::SimdUopMapping,
+        Tier::Experimental,
+        3,
+        1,
+        CYCLES | INSTRUCTIONS | PerfCounter::Named("LDST_X64_UOP") |
+            PerfCounter::Named("LDST_XPG_UOP"),
+        std::span<const WorkloadExpectation>(kCrossX64Expectations),
+        &workloads::CrossX64Load,
+        "aligned-x64-load",
+        "Both demos issue the same number of 64-bit loads over the same backing store. The main difference is that this version forces each load to straddle a 64-byte boundary.",
+    },
+    {
+        "aligned-page-load",
+        "Aligned Page Load",
+        "Load from the start of each page.",
+        "This is the low cross-page baseline: each access touches one page and one 64-byte region only.",
+        kAlignedPageConfig,
+        kAlignedPageCode,
+        Group::SimdUopMapping,
+        Tier::Experimental,
+        3,
+        1,
+        CYCLES | INSTRUCTIONS | PerfCounter::Named("LDST_X64_UOP") |
+            PerfCounter::Named("LDST_XPG_UOP"),
+        std::span<const WorkloadExpectation>(kAlignedPageExpectations),
+        &workloads::AlignedPageLoad,
+    },
+    {
+        "cross-page-load",
+        "Cross Page Load",
+        "Load 64 bits starting four bytes before each page boundary.",
+        "This forces every access to straddle a page boundary. On this machine that offset also crosses a 64-byte region boundary, so both split counters should rise.",
+        kCrossPageConfig,
+        kCrossPageCode,
+        Group::SimdUopMapping,
+        Tier::Experimental,
+        3,
+        1,
+        CYCLES | INSTRUCTIONS | PerfCounter::Named("LDST_X64_UOP") |
+            PerfCounter::Named("LDST_XPG_UOP"),
+        std::span<const WorkloadExpectation>(kCrossPageExpectations),
+        &workloads::CrossPageLoad,
+        "aligned-page-load",
+        "Both demos touch one 64-bit word per page. The difference is that this version starts four bytes before the boundary, so each load has to span two pages.",
     },
     {
         "predictable-branch",
@@ -495,6 +615,138 @@ const CounterDefinition kCounters[] = {
         "random-page-write",
         "hot-seq-write",
         {2.0, 100},
+    },
+    {
+        "inst-int-ld",
+        "Integer Load Instructions",
+        "Retired integer load instructions.",
+        "Use this to distinguish load-heavy kernels from register-only compute. The random and linear pointer chases are both good triggers.",
+        Group::MemoryCache,
+        Tier::Experimental,
+        PerfCounter::Named("INST_INT_LD"),
+        "random-pointer-chase",
+        "dense-integer-alu",
+        {2.0, 100},
+    },
+    {
+        "inst-int-st",
+        "Integer Store Instructions",
+        "Retired integer store instructions.",
+        "The random-page-write workload is the clearest store-side trigger in the current lab.",
+        Group::StoreOrdering,
+        Tier::Experimental,
+        PerfCounter::Named("INST_INT_ST"),
+        "random-page-write",
+        "dense-integer-alu",
+        {2.0, 100},
+    },
+    {
+        "inst-ldst",
+        "Load/Store Instructions",
+        "Retired load/store instructions of either kind.",
+        "This is a broader memory-instruction mix counter, so the pointer-chase pair is a good teaching case.",
+        Group::MemoryCache,
+        Tier::Experimental,
+        PerfCounter::Named("INST_LDST"),
+        "random-pointer-chase",
+        "dense-integer-alu",
+        {2.0, 100},
+    },
+    {
+        "ld-unit-uop",
+        "Load-Unit Uops",
+        "Micro-ops sent to the load unit.",
+        "This tends to track load pressure more directly than retired load instructions.",
+        Group::SimdUopMapping,
+        Tier::Experimental,
+        PerfCounter::Named("LD_UNIT_UOP"),
+        "random-pointer-chase",
+        "dense-integer-alu",
+        {2.0, 100},
+    },
+    {
+        "st-unit-uop",
+        "Store-Unit Uops",
+        "Micro-ops sent to the store unit.",
+        "The random page write is again the main high case; dense ALU code is the clean low case.",
+        Group::StoreOrdering,
+        Tier::Experimental,
+        PerfCounter::Named("ST_UNIT_UOP"),
+        "random-page-write",
+        "dense-integer-alu",
+        {2.0, 100},
+    },
+    {
+        "l1d-writeback",
+        "L1D Writeback",
+        "L1 data-cache writebacks.",
+        "Cold scattered stores are the clearest way to make dirty lines leave L1D in this suite.",
+        Group::StoreOrdering,
+        Tier::Experimental,
+        PerfCounter::Named("L1D_CACHE_WRITEBACK"),
+        "random-page-write",
+        "hot-seq-write",
+        {2.0, 100},
+    },
+    {
+        "dtlb-access",
+        "DTLB Access",
+        "Data-side first-level TLB accesses.",
+        "Sparse page-stride access makes the translation machinery visible even before looking at misses.",
+        Group::TlbPageWalk,
+        Tier::Experimental,
+        PerfCounter::Named("L1D_TLB_ACCESS"),
+        "page-stride-read",
+        "hot-seq-read",
+        {2.0, 100},
+    },
+    {
+        "dtlb-fill",
+        "DTLB Fill",
+        "Data-side first-level TLB fills.",
+        "This rises when page working sets spill beyond the hot DTLB entries and translations have to be reinstalled.",
+        Group::TlbPageWalk,
+        Tier::Experimental,
+        PerfCounter::Named("L1D_TLB_FILL"),
+        "page-stride-read",
+        "hot-seq-read",
+        {2.0, 100},
+    },
+    {
+        "mmu-table-walk-data",
+        "MMU Table Walk Data",
+        "Data-side page table walks.",
+        "A page-granular scattered footprint is the cleanest way to force real data-side walks.",
+        Group::TlbPageWalk,
+        Tier::Experimental,
+        PerfCounter::Named("MMU_TABLE_WALK_DATA"),
+        "page-stride-read",
+        "hot-seq-read",
+        {2.0, 100},
+    },
+    {
+        "ldst-x64-uop",
+        "64B Split Load/Store Uops",
+        "Micro-ops created when an access straddles a 64-byte region boundary.",
+        "This is best taught with aligned versus deliberately split 64-bit loads.",
+        Group::SimdUopMapping,
+        Tier::Experimental,
+        PerfCounter::Named("LDST_X64_UOP"),
+        "cross-x64-load",
+        "aligned-x64-load",
+        {8.0, 100},
+    },
+    {
+        "ldst-xpg-uop",
+        "Cross-Page Load/Store Uops",
+        "Micro-ops created when an access spans a page boundary.",
+        "Use the aligned-page versus cross-page load pair to make this obvious.",
+        Group::SimdUopMapping,
+        Tier::Experimental,
+        PerfCounter::Named("LDST_XPG_UOP"),
+        "cross-page-load",
+        "aligned-page-load",
+        {8.0, 100},
     },
 };
 

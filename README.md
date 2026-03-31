@@ -172,6 +172,7 @@ Stable showcase workloads currently include:
 
 - `dense-integer-alu`
 - `hot-seq-read`
+- `linear-pointer-chase`
 - `random-pointer-chase`
 - `hot-seq-write`
 - `random-page-write`
@@ -181,11 +182,18 @@ Stable showcase workloads currently include:
 - `hot-instruction-loop`
 - `random-instruction-pages`
 
+Experimental showcase workloads currently include:
+
+- `aligned-x64-load`
+- `cross-x64-load`
+- `aligned-page-load`
+- `cross-page-load`
+
 ### Counter Support Table
 
 | CLI name | Tier | Meaning | High demo | Low demo | Notes |
 | --- | --- | --- | --- | --- | --- |
-| `cycles` | stable | fixed cycle count | `random-pointer-chase` | `hot-seq-read` | best read with instruction or miss context |
+| `cycles` | stable | fixed cycle count | `random-pointer-chase` | `dense-integer-alu` | best read with instruction or miss context |
 | `instructions` | stable | fixed retired instructions | `dense-integer-alu` | `random-pointer-chase` | shows instruction density, not stalls |
 | `branches` | stable | retired branch instructions | `unpredictable-branch` | `dense-integer-alu` | branch-heavy vs straighter-line code |
 | `branch-miss` | stable | branch mispredicts | `unpredictable-branch` | `predictable-branch` | strongest when branch count is already high |
@@ -197,6 +205,17 @@ Stable showcase workloads currently include:
 | `l1i-cache-miss` | experimental | L1I demand misses | `random-instruction-pages` | `hot-instruction-loop` | more code-shape sensitive |
 | `l1-load-miss-nonspec` | experimental | nonspec load misses | `random-pointer-chase` | `hot-seq-read` | semantics are more implementation-specific |
 | `l1-store-miss-nonspec` | experimental | nonspec store misses | `random-page-write` | `hot-seq-write` | write-allocate effects can complicate reading |
+| `inst-int-ld` | experimental | retired integer load instructions | `random-pointer-chase` | `dense-integer-alu` | good load-heavy versus register-only contrast |
+| `inst-int-st` | experimental | retired integer store instructions | `random-page-write` | `dense-integer-alu` | clearest store-side trigger in the current lab |
+| `inst-ldst` | experimental | retired load/store instructions | `random-pointer-chase` | `dense-integer-alu` | broad memory-instruction mix signal |
+| `ld-unit-uop` | experimental | load-unit micro-ops | `random-pointer-chase` | `dense-integer-alu` | often tracks load pressure more directly than retired instructions |
+| `st-unit-uop` | experimental | store-unit micro-ops | `random-page-write` | `dense-integer-alu` | store pressure teaching counter |
+| `l1d-writeback` | experimental | L1D writebacks | `random-page-write` | `hot-seq-write` | useful for dirty-line eviction behavior |
+| `dtlb-access` | experimental | DTLB accesses | `page-stride-read` | `hot-seq-read` | shows translation activity before misses alone |
+| `dtlb-fill` | experimental | DTLB fills | `page-stride-read` | `hot-seq-read` | emphasizes refills of translation entries |
+| `mmu-table-walk-data` | experimental | data-side page table walks | `page-stride-read` | `hot-seq-read` | clearest real table-walk trigger in the lab |
+| `ldst-x64-uop` | experimental | 64-byte split load/store uops | `cross-x64-load` | `aligned-x64-load` | teaches 64B split accesses directly |
+| `ldst-xpg-uop` | experimental | cross-page load/store uops | `cross-page-load` | `aligned-page-load` | teaches page-spanning accesses directly |
 
 ## 3. Stability Tiers and Core-Type Caveats
 
