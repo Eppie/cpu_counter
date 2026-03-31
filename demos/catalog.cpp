@@ -8,6 +8,8 @@ namespace {
 const WorkloadExpectation kDenseAluExpectations[] = {
     {"cycles", "low", "The loop stays in registers and avoids long-latency miss penalties, so total cycle count stays comparatively low."},
     {"instructions", "high", "A tight integer ALU loop retires many instructions with almost no memory stalls."},
+    {"inst-all", "high", "This is a dense compute loop, so the all-instruction counter should rise along with fixed instructions."},
+    {"inst-int-alu", "high", "Most of the work is integer arithmetic on registers, which is exactly what this counter is meant to reflect."},
     {"branches", "low", "The loop body is mostly straight-line arithmetic, so branch density stays low."},
 };
 
@@ -16,6 +18,7 @@ const WorkloadExpectation kHotReadExpectations[] = {
     {"l1-load-miss", "low", "Dependent loads stay resident in L1D instead of falling through to lower levels."},
     {"dtlb-miss", "low", "The address footprint is tiny, so DTLB pressure stays near zero."},
     {"l2-tlb-miss", "low", "A tiny hot footprint should not walk into second-level data TLB misses."},
+    {"dtlb-miss-nonspec", "low", "The same hot footprint also keeps the non-speculative DTLB miss counter near zero."},
 };
 
 const WorkloadExpectation kRandomPointerExpectations[] = {
@@ -42,6 +45,10 @@ const WorkloadExpectation kRandomWriteExpectations[] = {
 const WorkloadExpectation kPageStrideExpectations[] = {
     {"dtlb-miss", "high", "One demand access per shuffled page maximizes translation pressure."},
     {"l2-tlb-miss", "high", "Enough distinct pages overflow the first-level data TLB and spill into the next level."},
+    {"dtlb-miss-nonspec", "high", "The same page-scattered access pattern also keeps the non-speculative miss view elevated."},
+    {"dtlb-access", "high", "Every sparse page access has to consult the translation machinery."},
+    {"dtlb-fill", "high", "The hot DTLB entries get churned constantly, so fills rise alongside misses."},
+    {"mmu-table-walk-data", "high", "This is one of the clearest data-side page-walk triggers in the lab."},
 };
 
 const WorkloadExpectation kAlignedX64Expectations[] = {
@@ -66,23 +73,40 @@ const WorkloadExpectation kCrossPageExpectations[] = {
 
 const WorkloadExpectation kPredictableBranchExpectations[] = {
     {"branches", "high", "The loop executes an actual conditional branch every iteration, so retired branch count is high."},
+    {"inst-branch-cond", "high", "Every iteration still uses a conditional branch, even though the predictor handles it well."},
+    {"inst-branch-taken", "high", "The branch is taken almost every iteration in the biased pattern, so taken-branch count rises strongly."},
     {"branch-miss", "low", "The condition is strongly biased, so the predictor stays accurate."},
+    {"branch-cond-miss", "low", "The conditional-branch-specific mispredict counter should stay low on the biased pattern."},
 };
 
 const WorkloadExpectation kUnpredictableBranchExpectations[] = {
     {"branches", "high", "The loop still executes a real conditional branch every iteration."},
+    {"inst-branch-cond", "high", "Conditional branch count stays high because the loop shape is still branch-heavy."},
     {"branch-miss", "high", "Random branch direction prevents the predictor from settling on an accurate history."},
+    {"branch-cond-miss", "high", "This is the conditional-branch-specific version of the same misprediction story."},
 };
 
 const WorkloadExpectation kHotInstructionExpectations[] = {
     {"cycles", "low", "Calling the same tiny stub repeatedly keeps the frontend hot."},
+    {"inst-branch-call", "high", "Every iteration makes a real function call into the stub."},
+    {"inst-branch-ret", "high", "Each stub invocation returns immediately, so return-branch count rises too."},
+    {"inst-branch-indir", "high", "The function pointer call is an indirect branch every iteration."},
     {"itlb-miss", "low", "One hot code page should not create ITLB pressure."},
+    {"l1i-tlb-fill", "low", "With one hot code page there is very little need to refill the instruction-side TLB."},
     {"l1i-cache-miss", "low", "The same stub stays resident in the instruction cache."},
+    {"l2-tlb-miss-instruction", "low", "A single hot code page should not spill into second-level instruction-side TLB misses."},
+    {"mmu-table-walk-instruction", "low", "There is almost no instruction-side page walking once the hot page is installed."},
 };
 
 const WorkloadExpectation kRandomInstructionExpectations[] = {
+    {"inst-branch-call", "high", "The workload is still a stream of indirect calls, one per visited code page."},
+    {"inst-branch-ret", "high", "Every visited stub also returns, so return count remains high."},
+    {"inst-branch-indir", "high", "The changing function-pointer target makes indirect branch activity obvious."},
     {"itlb-miss", "high", "Jumping across many executable pages churns the ITLB."},
+    {"l1i-tlb-fill", "high", "The instruction-side TLB needs constant refills as code-page locality disappears."},
     {"l1i-cache-miss", "high", "Randomized code-page order also defeats L1I locality."},
+    {"l2-tlb-miss-instruction", "high", "Enough code pages spill beyond the first-level ITLB and show up in the next level too."},
+    {"mmu-table-walk-instruction", "high", "The frontend has to perform real instruction-side page walks as it rediscovers code pages."},
 };
 
 constexpr std::string_view kDenseAluConfig =
@@ -245,7 +269,8 @@ const WorkloadDefinition kWorkloads[] = {
         Tier::Stable,
         3,
         1,
-        CYCLES | INSTRUCTIONS | BRANCHES,
+        CYCLES | INSTRUCTIONS | BRANCHES | PerfCounter::Named("INST_ALL") |
+            PerfCounter::Named("INST_INT_ALU"),
         std::span<const WorkloadExpectation>(kDenseAluExpectations),
         &workloads::DenseIntegerAlu,
     },
@@ -260,7 +285,8 @@ const WorkloadDefinition kWorkloads[] = {
         Tier::Stable,
         3,
         1,
-        CYCLES | INSTRUCTIONS | L1_LOAD_MISS | DTLB_MISS | L2_TLB_MISS,
+        CYCLES | INSTRUCTIONS | L1_LOAD_MISS | DTLB_MISS | L2_TLB_MISS |
+            PerfCounter::Named("L1D_TLB_MISS_NONSPEC"),
         std::span<const WorkloadExpectation>(kHotReadExpectations),
         &workloads::HotSequentialRead,
     },
@@ -337,7 +363,8 @@ const WorkloadDefinition kWorkloads[] = {
         Tier::Stable,
         3,
         1,
-        CYCLES | INSTRUCTIONS | DTLB_MISS | L2_TLB_MISS,
+        CYCLES | INSTRUCTIONS | DTLB_MISS | L2_TLB_MISS |
+            PerfCounter::Named("L1D_TLB_MISS_NONSPEC"),
         std::span<const WorkloadExpectation>(kPageStrideExpectations),
         &workloads::PageStrideRead,
     },
@@ -420,7 +447,10 @@ const WorkloadDefinition kWorkloads[] = {
         Tier::Stable,
         3,
         1,
-        CYCLES | INSTRUCTIONS | BRANCHES | BRANCH_MISS,
+        CYCLES | INSTRUCTIONS | BRANCHES | BRANCH_MISS |
+            PerfCounter::Named("INST_BRANCH_COND") |
+            PerfCounter::Named("BRANCH_COND_MISPRED_NONSPEC") |
+            PerfCounter::Named("INST_BRANCH_TAKEN"),
         std::span<const WorkloadExpectation>(kPredictableBranchExpectations),
         &workloads::PredictableBranch,
     },
@@ -435,7 +465,10 @@ const WorkloadDefinition kWorkloads[] = {
         Tier::Stable,
         3,
         1,
-        CYCLES | INSTRUCTIONS | BRANCHES | BRANCH_MISS,
+        CYCLES | INSTRUCTIONS | BRANCHES | BRANCH_MISS |
+            PerfCounter::Named("INST_BRANCH_COND") |
+            PerfCounter::Named("BRANCH_COND_MISPRED_NONSPEC") |
+            PerfCounter::Named("INST_BRANCH_TAKEN"),
         std::span<const WorkloadExpectation>(kUnpredictableBranchExpectations),
         &workloads::UnpredictableBranch,
     },
@@ -450,7 +483,10 @@ const WorkloadDefinition kWorkloads[] = {
         Tier::Stable,
         3,
         1,
-        CYCLES | INSTRUCTIONS | ITLB_MISS | PerfCounter::Named("L1I_CACHE_MISS_DEMAND"),
+        CYCLES | INSTRUCTIONS | ITLB_MISS | PerfCounter::Named("L1I_CACHE_MISS_DEMAND") |
+            PerfCounter::Named("L1I_TLB_FILL") |
+            PerfCounter::Named("L2_TLB_MISS_INSTRUCTION") |
+            PerfCounter::Named("MMU_TABLE_WALK_INSTRUCTION"),
         std::span<const WorkloadExpectation>(kHotInstructionExpectations),
         &workloads::HotInstructionLoop,
     },
@@ -465,7 +501,10 @@ const WorkloadDefinition kWorkloads[] = {
         Tier::Stable,
         3,
         1,
-        CYCLES | INSTRUCTIONS | ITLB_MISS | PerfCounter::Named("L1I_CACHE_MISS_DEMAND"),
+        CYCLES | INSTRUCTIONS | ITLB_MISS | PerfCounter::Named("L1I_CACHE_MISS_DEMAND") |
+            PerfCounter::Named("L1I_TLB_FILL") |
+            PerfCounter::Named("L2_TLB_MISS_INSTRUCTION") |
+            PerfCounter::Named("MMU_TABLE_WALK_INSTRUCTION"),
         std::span<const WorkloadExpectation>(kRandomInstructionExpectations),
         &workloads::RandomInstructionPages,
     },
@@ -617,6 +656,30 @@ const CounterDefinition kCounters[] = {
         {2.0, 100},
     },
     {
+        "inst-all",
+        "All Instructions",
+        "Aggregate retired instruction count from the PMU event database.",
+        "This should broadly track the fixed instruction counter, but it is kept experimental until it has been cross-checked more heavily.",
+        Group::CoreExecution,
+        Tier::Experimental,
+        PerfCounter::Named("INST_ALL"),
+        "dense-integer-alu",
+        "random-pointer-chase",
+        {2.0, 100},
+    },
+    {
+        "inst-int-alu",
+        "Integer ALU Instructions",
+        "Retired integer ALU instructions.",
+        "Dense integer compute is the cleanest trigger; memory and branch workloads should stay much lower.",
+        Group::CoreExecution,
+        Tier::Experimental,
+        PerfCounter::Named("INST_INT_ALU"),
+        "dense-integer-alu",
+        "hot-seq-read",
+        {2.0, 100},
+    },
+    {
         "inst-int-ld",
         "Integer Load Instructions",
         "Retired integer load instructions.",
@@ -722,6 +785,126 @@ const CounterDefinition kCounters[] = {
         PerfCounter::Named("MMU_TABLE_WALK_DATA"),
         "page-stride-read",
         "hot-seq-read",
+        {2.0, 100},
+    },
+    {
+        "dtlb-miss-nonspec",
+        "DTLB Miss Nonspec",
+        "Non-speculative variant of the first-level data-side TLB miss counter.",
+        "This should tell the same story as the stable DTLB miss counter, but with slightly different implementation semantics.",
+        Group::TlbPageWalk,
+        Tier::Experimental,
+        PerfCounter::Named("L1D_TLB_MISS_NONSPEC"),
+        "page-stride-read",
+        "hot-seq-read",
+        {2.0, 100},
+    },
+    {
+        "branch-cond-miss",
+        "Conditional Branch Mispredict",
+        "Conditional-branch-specific misprediction counter.",
+        "Use this when you want the branch-miss story without including unrelated branch classes.",
+        Group::BranchControl,
+        Tier::Experimental,
+        PerfCounter::Named("BRANCH_COND_MISPRED_NONSPEC"),
+        "unpredictable-branch",
+        "predictable-branch",
+        {4.0, 100},
+    },
+    {
+        "inst-branch-cond",
+        "Conditional Branch Instructions",
+        "Retired conditional branch instructions.",
+        "Branch-heavy loops are the obvious trigger; straight-line ALU code is the low case.",
+        Group::BranchControl,
+        Tier::Experimental,
+        PerfCounter::Named("INST_BRANCH_COND"),
+        "unpredictable-branch",
+        "dense-integer-alu",
+        {2.0, 100},
+    },
+    {
+        "inst-branch-taken",
+        "Taken Branch Instructions",
+        "Retired taken branches.",
+        "The biased branch workload is almost always taken, making it a good high case.",
+        Group::BranchControl,
+        Tier::Experimental,
+        PerfCounter::Named("INST_BRANCH_TAKEN"),
+        "predictable-branch",
+        "dense-integer-alu",
+        {2.0, 100},
+    },
+    {
+        "inst-branch-call",
+        "Call Instructions",
+        "Retired branch-call instructions.",
+        "The instruction-side workloads explicitly call a stub every iteration, so they are a natural teaching case.",
+        Group::InstructionSide,
+        Tier::Experimental,
+        PerfCounter::Named("INST_BRANCH_CALL"),
+        "hot-instruction-loop",
+        "dense-integer-alu",
+        {2.0, 100},
+    },
+    {
+        "inst-branch-ret",
+        "Return Instructions",
+        "Retired branch-return instructions.",
+        "Each stub invocation returns immediately, which makes the hot instruction loop the clean high case.",
+        Group::InstructionSide,
+        Tier::Experimental,
+        PerfCounter::Named("INST_BRANCH_RET"),
+        "hot-instruction-loop",
+        "dense-integer-alu",
+        {2.0, 100},
+    },
+    {
+        "inst-branch-indir",
+        "Indirect Branch Instructions",
+        "Retired indirect branch instructions.",
+        "The function-pointer stub call is an indirect branch, so the instruction-side workloads expose this clearly.",
+        Group::InstructionSide,
+        Tier::Experimental,
+        PerfCounter::Named("INST_BRANCH_INDIR"),
+        "hot-instruction-loop",
+        "dense-integer-alu",
+        {2.0, 100},
+    },
+    {
+        "l1i-tlb-fill",
+        "ITLB Fill",
+        "Instruction-side first-level TLB fills.",
+        "The random instruction-page sweep is the clearest high case because it keeps rediscovering code pages.",
+        Group::InstructionSide,
+        Tier::Experimental,
+        PerfCounter::Named("L1I_TLB_FILL"),
+        "random-instruction-pages",
+        "hot-instruction-loop",
+        {2.0, 100},
+    },
+    {
+        "l2-tlb-miss-instruction",
+        "L2 Instruction TLB Miss",
+        "Second-level instruction-side TLB misses.",
+        "A wide randomized code footprint is the intended trigger; one hot code page is the low baseline.",
+        Group::InstructionSide,
+        Tier::Experimental,
+        PerfCounter::Named("L2_TLB_MISS_INSTRUCTION"),
+        "random-instruction-pages",
+        "hot-instruction-loop",
+        {2.0, 100},
+    },
+    {
+        "mmu-table-walk-instruction",
+        "MMU Table Walk Instruction",
+        "Instruction-side page table walks.",
+        "This is the instruction-fetch analogue of the data-side walk counter.",
+        Group::InstructionSide,
+        Tier::Experimental,
+        PerfCounter::Named("MMU_TABLE_WALK_INSTRUCTION"),
+        "random-instruction-pages",
+        "hot-instruction-loop",
         {2.0, 100},
     },
     {

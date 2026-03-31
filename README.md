@@ -205,6 +205,8 @@ Experimental showcase workloads currently include:
 | `l1i-cache-miss` | experimental | L1I demand misses | `random-instruction-pages` | `hot-instruction-loop` | more code-shape sensitive |
 | `l1-load-miss-nonspec` | experimental | nonspec load misses | `random-pointer-chase` | `hot-seq-read` | semantics are more implementation-specific |
 | `l1-store-miss-nonspec` | experimental | nonspec store misses | `random-page-write` | `hot-seq-write` | write-allocate effects can complicate reading |
+| `inst-all` | experimental | aggregate retired instructions | `dense-integer-alu` | `random-pointer-chase` | PMU-event view of overall retired instructions |
+| `inst-int-alu` | experimental | retired integer ALU instructions | `dense-integer-alu` | `hot-seq-read` | pure compute versus memory-heavy access |
 | `inst-int-ld` | experimental | retired integer load instructions | `random-pointer-chase` | `dense-integer-alu` | good load-heavy versus register-only contrast |
 | `inst-int-st` | experimental | retired integer store instructions | `random-page-write` | `dense-integer-alu` | clearest store-side trigger in the current lab |
 | `inst-ldst` | experimental | retired load/store instructions | `random-pointer-chase` | `dense-integer-alu` | broad memory-instruction mix signal |
@@ -214,6 +216,16 @@ Experimental showcase workloads currently include:
 | `dtlb-access` | experimental | DTLB accesses | `page-stride-read` | `hot-seq-read` | shows translation activity before misses alone |
 | `dtlb-fill` | experimental | DTLB fills | `page-stride-read` | `hot-seq-read` | emphasizes refills of translation entries |
 | `mmu-table-walk-data` | experimental | data-side page table walks | `page-stride-read` | `hot-seq-read` | clearest real table-walk trigger in the lab |
+| `dtlb-miss-nonspec` | experimental | nonspec DTLB misses | `page-stride-read` | `hot-seq-read` | alternate view of the same sparse-page translation story |
+| `branch-cond-miss` | experimental | conditional branch mispredicts | `unpredictable-branch` | `predictable-branch` | branch-miss story limited to conditional branches |
+| `inst-branch-cond` | experimental | retired conditional branches | `unpredictable-branch` | `dense-integer-alu` | branch-heavy versus mostly straight-line code |
+| `inst-branch-taken` | experimental | retired taken branches | `predictable-branch` | `dense-integer-alu` | biased-taken branch pattern is the clean high case |
+| `inst-branch-call` | experimental | retired call branches | `hot-instruction-loop` | `dense-integer-alu` | direct way to expose repeated stub calls |
+| `inst-branch-ret` | experimental | retired return branches | `hot-instruction-loop` | `dense-integer-alu` | pairs naturally with the same stub-call loop |
+| `inst-branch-indir` | experimental | retired indirect branches | `hot-instruction-loop` | `dense-integer-alu` | function-pointer call is the teaching case |
+| `l1i-tlb-fill` | experimental | instruction-side TLB fills | `random-instruction-pages` | `hot-instruction-loop` | code-page churn refill signal |
+| `l2-tlb-miss-instruction` | experimental | second-level instruction TLB misses | `random-instruction-pages` | `hot-instruction-loop` | instruction-side analogue of the data TLB story |
+| `mmu-table-walk-instruction` | experimental | instruction-side page walks | `random-instruction-pages` | `hot-instruction-loop` | frontend page-walk teaching counter |
 | `ldst-x64-uop` | experimental | 64-byte split load/store uops | `cross-x64-load` | `aligned-x64-load` | teaches 64B split accesses directly |
 | `ldst-xpg-uop` | experimental | cross-page load/store uops | `cross-page-load` | `aligned-page-load` | teaches page-spanning accesses directly |
 
