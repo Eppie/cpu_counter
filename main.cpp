@@ -69,6 +69,11 @@ struct DemoContrast {
   WorkloadRunSummary summary;
 };
 
+void ApplyMeasuredRunDefaults(CliOptions &options) {
+  options.run_options.require_active_pmu = true;
+  options.run_options.max_attempts = std::max<std::size_t>(options.run_options.max_attempts, 64);
+}
+
 std::string CounterLabel(PerfCounter counter) {
   for (const demo::CounterDefinition &definition : demo::Counters()) {
     if (definition.counter == counter) {
@@ -531,6 +536,52 @@ std::optional<double> MeanCpi(const WorkloadRunSummary &summary) {
   return *cycles / *instructions;
 }
 
+void PrintExpectationWarnings(const demo::WorkloadDefinition &workload,
+                              const WorkloadRunSummary &summary,
+                              const DemoContrast *contrast = nullptr) {
+  bool printed = false;
+  for (const auto &expectation : workload.expectations) {
+    const demo::CounterDefinition *definition = demo::FindCounter(expectation.counter_name);
+    if (definition == nullptr) {
+      continue;
+    }
+    const auto primary = MeanCounterValue(summary, definition->counter);
+    if (!primary.has_value()) {
+      continue;
+    }
+
+    bool warn = false;
+    std::string reason;
+    if (contrast == nullptr || contrast->workload == nullptr) {
+      if (expectation.level == "high" && *primary == 0.0) {
+        warn = true;
+        reason = "expected-high counter stayed at zero";
+      }
+    } else {
+      const auto other = MeanCounterValue(contrast->summary, definition->counter);
+      if (!other.has_value()) {
+        continue;
+      }
+      if (expectation.level == "high" && *primary <= *other) {
+        warn = true;
+        reason = "expected-high counter did not exceed the contrast workload";
+      } else if (expectation.level == "low" && *primary >= *other) {
+        warn = true;
+        reason = "expected-low counter did not stay below the contrast workload";
+      }
+    }
+
+    if (!warn) {
+      continue;
+    }
+    if (!printed) {
+      std::cout << "- warnings:\n";
+      printed = true;
+    }
+    std::cout << "  - " << expectation.counter_name << ": " << reason << ".\n";
+  }
+}
+
 std::string MismatchReason(const PerfMeasurement &measurement, const demo::RunOptions &options) {
   std::ostringstream oss;
   oss << "sample rejected";
@@ -983,8 +1034,7 @@ int RunDemoWorkload(const demo::WorkloadDefinition &workload, demo::DemoEnvironm
       std::cout << "\nRun failed: unknown contrast demo " << workload.contrast_demo_id << '\n';
       return 1;
     }
-    const PerfCounterSet contrast_set =
-        workload.measurement_counters | contrast.workload->measurement_counters;
+    const PerfCounterSet contrast_set = workload.measurement_counters;
     if (contrast_set.overflow) {
       std::cout << "\nRun failed: contrast measurement set exceeds PERF_MAX_SCOPE_EVENTS\n";
       return 1;
@@ -1030,14 +1080,25 @@ int RunDemoWorkload(const demo::WorkloadDefinition &workload, demo::DemoEnvironm
       }
     }
     if (ipc.has_value() && contrast_ipc.has_value()) {
-      std::cout << "- IPC moved from " << FormatDouble(*contrast_ipc, 3) << " in "
-                << contrast.workload->id << " to " << FormatDouble(*ipc, 3) << " in "
-                << workload.id
-                << ", which means the random chase spent far more of its time stalled on miss latency.\n";
+      if (*ipc < *contrast_ipc) {
+        std::cout << "- IPC moved from " << FormatDouble(*contrast_ipc, 3) << " in "
+                  << contrast.workload->id << " to " << FormatDouble(*ipc, 3) << " in "
+                  << workload.id
+                  << ", which means the primary workload retired less useful work per cycle.\n";
+      } else if (*ipc > *contrast_ipc) {
+        std::cout << "- IPC moved from " << FormatDouble(*contrast_ipc, 3) << " in "
+                  << contrast.workload->id << " to " << FormatDouble(*ipc, 3) << " in "
+                  << workload.id
+                  << ", which means the primary workload retired more useful work per cycle.\n";
+      } else {
+        std::cout << "- IPC stayed effectively flat between " << contrast.workload->id << " and "
+                  << workload.id << ".\n";
+      }
     }
     if (!workload.contrast_blurb.empty()) {
       std::cout << "- " << workload.contrast_blurb << '\n';
     }
+    PrintExpectationWarnings(workload, summary, &contrast);
   } else {
     if (ipc.has_value() && cpi.has_value()) {
       std::cout << "- IPC is " << FormatDouble(*ipc, 3) << " and CPI is "
@@ -1056,11 +1117,13 @@ int RunDemoWorkload(const demo::WorkloadDefinition &workload, demo::DemoEnvironm
                 << FormatDouble(*mean) << " and is expected to be " << expectation.level
                 << " here because " << expectation.note << '\n';
     }
+    PrintExpectationWarnings(workload, summary, nullptr);
   }
   return 0;
 }
 
 int RunCounter(CliOptions options) {
+  ApplyMeasuredRunDefaults(options);
   const demo::CounterDefinition *definition = demo::FindCounter(options.target);
   if (definition == nullptr) {
     std::cerr << "unknown counter: " << options.target << '\n';
@@ -1114,6 +1177,7 @@ int RunCounter(CliOptions options) {
 }
 
 int RunDemo(CliOptions options) {
+  ApplyMeasuredRunDefaults(options);
   const demo::WorkloadDefinition *workload = demo::FindWorkload(options.target);
   if (workload == nullptr) {
     std::cerr << "unknown demo: " << options.target << '\n';
@@ -1134,6 +1198,7 @@ int RunDemo(CliOptions options) {
 }
 
 int RunDemos(CliOptions options) {
+  ApplyMeasuredRunDefaults(options);
   std::vector<const demo::WorkloadDefinition *> demos = FilteredDemos(options);
   if (demos.empty()) {
     std::cerr << "no demos matched the requested filters\n";

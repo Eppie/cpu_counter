@@ -140,6 +140,14 @@ Supported flags:
 - `--require-stable-cpu`
 - `--require-active-pmu`
 
+Measured commands (`run counter`, `run demo`, and `run demos`) now default to:
+
+- best-effort P-core preference on this machine
+- retrying more aggressively before giving up on a sample
+- rejecting samples where the requested configurable PMCs stayed inactive
+
+You can still tighten runs further with `--require-stable-cpu`.
+
 ### Demo Structure
 
 The demo lab is registry-driven.

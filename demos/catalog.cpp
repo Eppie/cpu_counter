@@ -152,7 +152,6 @@ const WorkloadExpectation kCrossPageStoreExpectations[] = {
 
 const WorkloadExpectation kSimdAluExpectations[] = {
     {"inst-simd-alu", "high", "The loop body is explicit NEON arithmetic on vectors, so SIMD ALU retirement should be the headline counter."},
-    {"inst-int-alu", "low", "The math stays in vector lanes rather than scalar integer ALUs for most of the body."},
 };
 
 const WorkloadExpectation kDispatchIntExpectations[] = {
@@ -1084,8 +1083,7 @@ const WorkloadDefinition kWorkloads[] = {
         Tier::Experimental,
         3,
         1,
-        CYCLES | INSTRUCTIONS | PerfCounter::Named("INST_SIMD_ALU") |
-            PerfCounter::Named("INST_INT_ALU"),
+        CYCLES | INSTRUCTIONS | PerfCounter::Named("INST_SIMD_ALU"),
         std::span<const WorkloadExpectation>(kSimdAluExpectations),
         &workloads::SimdVectorAlu,
         "dense-integer-alu",
