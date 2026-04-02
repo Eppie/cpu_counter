@@ -562,6 +562,11 @@ void PrintExpectationWarnings(const demo::WorkloadDefinition &workload,
       if (!other.has_value()) {
         continue;
       }
+      const demo::WorkloadExpectation *contrast_expectation =
+          FindExpectation(*contrast->workload, definition->counter);
+      if (contrast_expectation == nullptr || contrast_expectation->level == expectation.level) {
+        continue;
+      }
       if (expectation.level == "high" && *primary <= *other) {
         warn = true;
         reason = "expected-high counter did not exceed the contrast workload";
@@ -583,26 +588,41 @@ void PrintExpectationWarnings(const demo::WorkloadDefinition &workload,
 }
 
 std::string MismatchReason(const PerfMeasurement &measurement, const demo::RunOptions &options) {
-  std::ostringstream oss;
-  oss << "sample rejected";
-  if (options.prefer_cpu.has_value()) {
-    oss << ": wanted cpu " << *options.prefer_cpu << ", saw " << measurement.cpu_before << " -> "
+  std::vector<std::string> reasons;
+  if (options.prefer_cpu.has_value() &&
+      (measurement.cpu_before != *options.prefer_cpu || measurement.cpu_after != *options.prefer_cpu)) {
+    std::ostringstream oss;
+    oss << "wanted cpu " << *options.prefer_cpu << ", saw " << measurement.cpu_before << " -> "
         << measurement.cpu_after;
-    return oss.str();
+    reasons.push_back(oss.str());
   }
-  if (options.prefer_cpu_range.has_value()) {
-    oss << ": wanted " << options.prefer_cpu_range->Description() << ", saw " << measurement.cpu_before
-        << " -> " << measurement.cpu_after;
-    return oss.str();
+  if (options.prefer_cpu_range.has_value() &&
+      (!options.prefer_cpu_range->Contains(measurement.cpu_before) ||
+       !options.prefer_cpu_range->Contains(measurement.cpu_after))) {
+    std::ostringstream oss;
+    oss << "wanted " << options.prefer_cpu_range->Description() << ", saw "
+        << measurement.cpu_before << " -> " << measurement.cpu_after;
+    reasons.push_back(oss.str());
   }
   if (options.require_stable_cpu && measurement.cpu_before != measurement.cpu_after) {
-    oss << ": cpu migrated " << measurement.cpu_before << " -> " << measurement.cpu_after;
-    return oss.str();
+    std::ostringstream oss;
+    oss << "cpu migrated " << measurement.cpu_before << " -> " << measurement.cpu_after;
+    reasons.push_back(oss.str());
   }
   if (options.require_active_pmu && !measurement.HasActiveConfigurableCounters()) {
-    oss << ": configurable counters stayed inactive";
-    return oss.str();
+    reasons.push_back("configurable counters stayed inactive");
+  }
+  if (reasons.empty()) {
+    return "sample rejected";
+  }
+  std::ostringstream oss;
+  oss << "sample rejected: ";
+  for (std::size_t i = 0; i < reasons.size(); ++i) {
+    if (i != 0) {
+      oss << "; ";
     }
+    oss << reasons[i];
+  }
   return oss.str();
 }
 
@@ -758,55 +778,59 @@ bool ExecuteWorkload(const demo::WorkloadDefinition &workload, PerfCounterSet me
 
   const std::size_t warmups = options.warmup_override.value_or(workload.default_warmups);
   const std::size_t repeats = options.repeat_override.value_or(workload.default_repeats);
-  std::thread worker([&] {
-    std::string worker_error;
-    if (!demo::ApplySchedulerPreference(options.run_options, worker_error)) {
-      summary.error = worker_error;
-      return;
-    }
-
-    for (std::size_t i = 0; i < warmups; ++i) {
-      summary.last_sink = workload.run(environment);
-    }
-
-    for (std::size_t repeat = 0; repeat < repeats; ++repeat) {
-      bool captured = false;
-      PerfMeasurement last_measurement;
-      for (std::size_t attempt = 0; attempt < options.run_options.max_attempts; ++attempt) {
-        ++summary.attempts_used;
-        std::uint64_t sink = 0;
-        PerfMeasurement measurement =
-            PerfMeasure(measured_counters, [&] { sink = workload.run(environment); });
-        summary.last_sink = sink;
-        last_measurement = measurement;
-
-        if (!measurement.valid) {
-          summary.error = measurement.error;
+  for (std::size_t repeat = 0; repeat < repeats; ++repeat) {
+    bool captured = false;
+    PerfMeasurement last_measurement;
+    std::string last_error;
+    for (std::size_t attempt = 0; attempt < options.run_options.max_attempts; ++attempt) {
+      ++summary.attempts_used;
+      PerfMeasurement measurement;
+      std::uint64_t sink = 0;
+      std::string worker_error;
+      std::thread worker([&] {
+        if (!demo::ApplySchedulerPreference(options.run_options, worker_error)) {
           return;
         }
-        if (!demo::SampleMatches(measurement, options.run_options)) {
-          summary.error = MismatchReason(measurement, options.run_options);
-          demo::ApplySchedulerPreference(options.run_options, worker_error);
-          std::this_thread::yield();
-          std::this_thread::sleep_for(std::chrono::milliseconds(1));
-          continue;
+        for (std::size_t i = 0; i < warmups; ++i) {
+          sink = workload.run(environment);
         }
+        measurement = PerfMeasure(measured_counters, [&] { sink = workload.run(environment); });
+      });
+      worker.join();
 
-        summary.samples.push_back(measurement);
-        captured = true;
-        break;
+      summary.last_sink = sink;
+      if (!worker_error.empty()) {
+        summary.error = worker_error;
+        return false;
       }
-      if (!captured) {
-        if (summary.error.empty()) {
-          summary.error = MismatchReason(last_measurement, options.run_options);
-        }
-        return;
+
+      last_measurement = measurement;
+      if (!measurement.valid) {
+        summary.error = measurement.error;
+        return false;
       }
+      if (!demo::SampleMatches(measurement, options.run_options)) {
+        last_error = MismatchReason(measurement, options.run_options);
+        std::this_thread::yield();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        continue;
+      }
+
+      summary.samples.push_back(measurement);
+      captured = true;
+      break;
     }
+    if (!captured) {
+      if (!last_error.empty()) {
+        summary.error = last_error;
+      } else if (summary.error.empty()) {
+        summary.error = MismatchReason(last_measurement, options.run_options);
+      }
+      return false;
+    }
+  }
 
-    summary.valid = true;
-  });
-  worker.join();
+  summary.valid = true;
   return summary.valid;
 }
 
