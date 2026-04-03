@@ -281,11 +281,13 @@ for (std::size_t i = 0; i < state.stream_read.size(); ++i) {
 )cpp";
 
 constexpr std::string_view kNtStreamReadConfig =
-    "8 passes over the same 64 MiB stream, but using explicit non-temporal scalar loads.";
+    "8 passes over the same 64 MiB stream, but using explicit non-temporal pair loads.";
 constexpr std::string_view kNtStreamReadCode = R"cpp(
 #pragma clang loop vectorize(disable)
-for (std::size_t i = 0; i < state.stream_read.size(); ++i) {
-  sum += __builtin_nontemporal_load(data + i);
+for (std::size_t i = 0; i + 1 < state.stream_read.size(); i += 2) {
+  asm volatile("ldnp %x0, %x1, [%2]" : "=&r"(a), "=&r"(b) : "r"(data + i) : "memory");
+  sum0 += a;
+  sum1 += b;
 }
 )cpp";
 
@@ -337,12 +339,13 @@ for (std::size_t i = 0; i < state.stream_store.size(); ++i) {
 )cpp";
 
 constexpr std::string_view kNtStreamWriteConfig =
-    "8 passes over the same 64 MiB stream, but using explicit non-temporal scalar stores.";
+    "8 passes over the same 64 MiB stream, but using explicit non-temporal pair stores.";
 constexpr std::string_view kNtStreamWriteCode = R"cpp(
 #pragma clang loop vectorize(disable)
-for (std::size_t i = 0; i < state.stream_store.size(); ++i) {
-  const std::uint64_t value = data[i] + static_cast<std::uint64_t>(i + pass + 1);
-  __builtin_nontemporal_store(value, data + i);
+for (std::size_t i = 0; i + 1 < state.stream_store.size(); i += 2) {
+  const std::uint64_t value0 = seed ^ (0x100000001b3ULL * (i + 1));
+  const std::uint64_t value1 = (seed + 0x9e3779b97f4a7c15ULL) ^ (0xc2b2ae3d27d4eb4fULL * (i + 3));
+  asm volatile("stnp %x0, %x1, [%2]" : : "r"(value0), "r"(value1), "r"(data + i) : "memory");
 }
 )cpp";
 
@@ -427,12 +430,16 @@ for (std::size_t pass = 0; pass < 256; ++pass) {
 )cpp";
 
 constexpr std::string_view kFirstTouchFaultConfig =
-    "Create a fresh 256 MiB anonymous mapping and write one byte per page exactly once.";
+    "Create a fresh 256 MiB PROT_NONE mapping, then fault each page in on first write.";
 constexpr std::string_view kFirstTouchFaultCode = R"cpp(
-void *mapping = mmap(nullptr, 256 * 1024 * 1024, PROT_READ | PROT_WRITE,
+void *mapping = mmap(nullptr, 256 * 1024 * 1024, PROT_NONE,
                      MAP_PRIVATE | MAP_ANON, -1, 0);
 for (std::size_t page = 0; page < pages; ++page) {
-  bytes[page * state.page_size] = static_cast<std::uint8_t>(page);
+  if (sigsetjmp(g_vm_fault_jump, 1) == 0) {
+    bytes[page * state.page_size] = static_cast<std::uint8_t>(page);
+  } else {
+    mprotect(page_ptr, state.page_size, PROT_READ | PROT_WRITE);
+  }
 }
 munmap(mapping, 256 * 1024 * 1024);
 )cpp";
@@ -567,20 +574,24 @@ if (bits & 1ULL) {
 )cpp";
 
 constexpr std::string_view kStoreOrderFriendlyConfig =
-    "8,000,000 store-then-load iterations where the load stream is shifted by 4,104 bytes and avoids 4 KiB aliasing.";
+    "8,000,000 store-heavy iterations where the load stream is shifted by 4,104 bytes and avoids 4 KiB aliasing.";
 constexpr std::string_view kStoreOrderFriendlyCode = R"cpp(
 volatile std::uint64_t *stores = storage.data();
 volatile const std::uint64_t *loads = storage.data() + 513;
 stores[index] = i + sum;
+stores[(index + 64) & mask] = sum ^ (i + 1);
+stores[(index + 128) & mask] = sum + i * 3 + 1;
 sum += loads[index];
 )cpp";
 
 constexpr std::string_view kStoreOrderAliasConfig =
-    "8,000,000 store-then-load iterations where the load stream is shifted by exactly 4,096 bytes and 4 KiB-aliases the store stream.";
+    "8,000,000 store-heavy iterations where the load stream is shifted by exactly 4,096 bytes and 4 KiB-aliases the store stream.";
 constexpr std::string_view kStoreOrderAliasCode = R"cpp(
 volatile std::uint64_t *stores = storage.data();
 volatile const std::uint64_t *loads = storage.data() + 512;
 stores[index] = i + sum;
+stores[(index + 64) & mask] = sum ^ (i + 1);
+stores[(index + 128) & mask] = sum + i * 3 + 1;
 sum += loads[index];
 )cpp";
 
@@ -847,7 +858,8 @@ const WorkloadDefinition kWorkloads[] = {
         Tier::Experimental,
         3,
         1,
-        CYCLES | INSTRUCTIONS | PerfCounter::Named("INST_BARRIER"),
+        CYCLES | INSTRUCTIONS | PerfCounter::Named("INST_BARRIER") |
+            PerfCounter::Named("INST_ALL"),
         std::span<const WorkloadExpectation>(kBarrierExpectations),
         &workloads::BarrierLoop,
         "dense-integer-alu",
@@ -864,7 +876,8 @@ const WorkloadDefinition kWorkloads[] = {
         Tier::Experimental,
         3,
         1,
-        CYCLES | INSTRUCTIONS | PerfCounter::Named("INTERRUPT_PENDING"),
+        CYCLES | INSTRUCTIONS | PerfCounter::Named("INTERRUPT_PENDING") |
+            PerfCounter::Named("INST_ALL"),
         std::span<const WorkloadExpectation>(kInterruptStormExpectations),
         &workloads::InterruptStorm,
         "dense-integer-alu",
@@ -881,7 +894,8 @@ const WorkloadDefinition kWorkloads[] = {
         Tier::Experimental,
         3,
         1,
-        CYCLES | INSTRUCTIONS | PerfCounter::Named("ST_MEMORY_ORDER_VIOLATION_NONSPEC"),
+        CYCLES | INSTRUCTIONS | PerfCounter::Named("ST_MEMORY_ORDER_VIOLATION_NONSPEC") |
+            PerfCounter::Named("INST_LDST"),
         std::span<const WorkloadExpectation>(kStoreOrderFriendlyExpectations),
         &workloads::StoreOrderFriendly,
     },
@@ -896,7 +910,8 @@ const WorkloadDefinition kWorkloads[] = {
         Tier::Experimental,
         3,
         1,
-        CYCLES | INSTRUCTIONS | PerfCounter::Named("ST_MEMORY_ORDER_VIOLATION_NONSPEC"),
+        CYCLES | INSTRUCTIONS | PerfCounter::Named("ST_MEMORY_ORDER_VIOLATION_NONSPEC") |
+            PerfCounter::Named("INST_LDST"),
         std::span<const WorkloadExpectation>(kStoreOrderAliasExpectations),
         &workloads::StoreOrderAlias,
         "store-order-friendly",

@@ -633,6 +633,30 @@ PerfCounterSet CounterMeasurementSet(const demo::CounterDefinition &definition) 
   if (definition.counter == BRANCHES) {
     return CYCLES | INSTRUCTIONS | BRANCHES;
   }
+  if (definition.counter == PerfCounter::Named("INST_BARRIER")) {
+    return CYCLES | INSTRUCTIONS | PerfCounter::Named("INST_BARRIER") |
+           PerfCounter::Named("INST_ALL");
+  }
+  if (definition.counter == PerfCounter::Named("INTERRUPT_PENDING")) {
+    return CYCLES | INSTRUCTIONS | PerfCounter::Named("INTERRUPT_PENDING") |
+           PerfCounter::Named("INST_ALL");
+  }
+  if (definition.counter == PerfCounter::Named("ST_MEMORY_ORDER_VIOLATION_NONSPEC")) {
+    return CYCLES | INSTRUCTIONS | PerfCounter::Named("ST_MEMORY_ORDER_VIOLATION_NONSPEC") |
+           PerfCounter::Named("INST_LDST");
+  }
+  if (definition.counter == PerfCounter::Named("MMU_VIRTUAL_MEMORY_FAULT_NONSPEC")) {
+    return CYCLES | INSTRUCTIONS | PerfCounter::Named("MMU_VIRTUAL_MEMORY_FAULT_NONSPEC") |
+           DTLB_MISS | PerfCounter::Named("MMU_TABLE_WALK_DATA");
+  }
+  if (definition.counter == PerfCounter::Named("LD_NT_UOP")) {
+    return CYCLES | INSTRUCTIONS | PerfCounter::Named("LD_NT_UOP") |
+           PerfCounter::Named("INST_INT_LD");
+  }
+  if (definition.counter == PerfCounter::Named("ST_NT_UOP")) {
+    return CYCLES | INSTRUCTIONS | PerfCounter::Named("ST_NT_UOP") |
+           PerfCounter::Named("INST_INT_ST");
+  }
   return CYCLES | INSTRUCTIONS | definition.counter;
 }
 
