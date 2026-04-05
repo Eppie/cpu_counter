@@ -20,7 +20,6 @@ const WorkloadExpectation kHotReadExpectations[] = {
     {"dtlb-miss", "low", "The address footprint is tiny, so DTLB pressure stays near zero."},
     {"l2-tlb-miss", "low", "A tiny hot footprint should not walk into second-level data TLB misses."},
     {"dtlb-miss-nonspec", "low", "The same hot footprint also keeps the non-speculative DTLB miss counter near zero."},
-    {"mmu-virtual-memory-fault", "low", "This loop keeps touching already-hot pages, so it should not trigger fresh virtual-memory faults."},
 };
 
 const WorkloadExpectation kScalarStreamReadExpectations[] = {
@@ -105,7 +104,6 @@ const WorkloadExpectation kPageStrideExpectations[] = {
 };
 
 const WorkloadExpectation kFirstTouchFaultExpectations[] = {
-    {"mmu-virtual-memory-fault", "high", "This workload creates a fresh sparse file mapping and writes one byte per page, so the first touch has to instantiate each page."},
     {"dtlb-miss", "high", "Those cold first touches also churn translation state because every page is newly visited."},
     {"mmu-table-walk-data", "high", "The first-touch walk forces real data-side translation work while the mapping is populated."},
 };
@@ -240,13 +238,9 @@ const WorkloadExpectation kRandomInstructionExpectations[] = {
     {"map-dispatch-bubble-itlb", "high", "The same code-page churn also keeps the instruction-side translation path busy, making ITLB-related dispatch bubbles the intended high case."},
 };
 
-const WorkloadExpectation kStoreOrderFriendlyExpectations[] = {
-    {"st-memory-order-violation", "low", "The load stream is shifted so it no longer 4K-aliases the preceding store stream, which is the low-conflict baseline."},
-};
+const std::span<const WorkloadExpectation> kStoreOrderFriendlyExpectations{};
 
-const WorkloadExpectation kStoreOrderAliasExpectations[] = {
-    {"st-memory-order-violation", "high", "The load stream is forced to 4K-alias the preceding store stream, which is the most plausible store-order-conflict trigger in the current lab."},
-};
+const std::span<const WorkloadExpectation> kStoreOrderAliasExpectations{};
 
 constexpr std::string_view kDenseAluConfig =
     "20,000,000 iterations over four 64-bit registers. No deliberate data working set.";
@@ -886,7 +880,7 @@ const WorkloadDefinition kWorkloads[] = {
         "store-order-friendly",
         "Store Order Friendly",
         "A store-then-load loop that avoids 4 KiB aliasing between the two streams.",
-        "This is the low-conflict baseline for the store-order-violation counter: the load stream stays offset just enough to avoid the classic 4 KiB alias pattern.",
+        "This is the low-conflict baseline for the store-order experiments: the load stream stays offset just enough to avoid the classic 4 KiB alias pattern.",
         kStoreOrderFriendlyConfig,
         kStoreOrderFriendlyCode,
         Group::StoreOrdering,
@@ -895,14 +889,14 @@ const WorkloadDefinition kWorkloads[] = {
         1,
         CYCLES | INSTRUCTIONS | PerfCounter::Named("ST_MEMORY_ORDER_VIOLATION_NONSPEC") |
             PerfCounter::Named("INST_LDST"),
-        std::span<const WorkloadExpectation>(kStoreOrderFriendlyExpectations),
+        kStoreOrderFriendlyExpectations,
         &workloads::StoreOrderFriendly,
     },
     {
         "store-order-alias",
         "Store Order Alias",
         "A store-then-load loop that forces 4 KiB aliasing between the two streams.",
-        "This is the high-conflict counterpart to the friendly case: the load stream is shifted by exactly 4 KiB so the low address bits match the earlier store stream.",
+        "This is the high-conflict counterpart to the friendly case: the load stream is shifted by exactly 4 KiB so the low address bits match the earlier store stream, even though the dedicated violation event remains weak on this machine.",
         kStoreOrderAliasConfig,
         kStoreOrderAliasCode,
         Group::StoreOrdering,
@@ -911,7 +905,7 @@ const WorkloadDefinition kWorkloads[] = {
         1,
         CYCLES | INSTRUCTIONS | PerfCounter::Named("ST_MEMORY_ORDER_VIOLATION_NONSPEC") |
             PerfCounter::Named("INST_LDST"),
-        std::span<const WorkloadExpectation>(kStoreOrderAliasExpectations),
+        kStoreOrderAliasExpectations,
         &workloads::StoreOrderAlias,
         "store-order-friendly",
         "Both demos issue the same store-then-load pattern. The main difference is whether the load stream is offset by 4,104 bytes and avoids 4 KiB aliasing, or offset by exactly 4,096 bytes and collides in the low address bits.",
@@ -1599,7 +1593,7 @@ const CounterDefinition kCounters[] = {
         "st-memory-order-violation",
         "Store Memory Order Violation",
         "Non-speculative store/load ordering violations.",
-        "This remains experimental because the exact trigger is subtle, but the 4 KiB alias pair gives it a deliberate high/low contrast instead of relying on incidental conflicts.",
+        "This remains experimental because the exact trigger is subtle and the dedicated event has stayed at zero on current M4 Max P-core runs, even with an explicit 4 KiB alias stress pair.",
         Group::StoreOrdering,
         Tier::Experimental,
         PerfCounter::Named("ST_MEMORY_ORDER_VIOLATION_NONSPEC"),
@@ -1707,7 +1701,7 @@ const CounterDefinition kCounters[] = {
         "mmu-virtual-memory-fault",
         "Virtual Memory Fault",
         "Non-speculative virtual-memory fault events on the data side.",
-        "This is the one counter in the lab that deliberately wants a truly absent page, so the first-touch-fault workload creates a brand-new mapping for every measurement run.",
+        "This remains experimental because the dedicated fault event has stayed at zero on current M4 Max P-core runs even when the workload clearly triggers translation churn and backing-page instantiation.",
         Group::TlbPageWalk,
         Tier::Experimental,
         PerfCounter::Named("MMU_VIRTUAL_MEMORY_FAULT_NONSPEC"),
