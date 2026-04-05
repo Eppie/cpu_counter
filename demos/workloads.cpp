@@ -4,6 +4,7 @@
 #include <arm_neon.h>
 #endif
 
+#include <fcntl.h>
 #include <libkern/OSCacheControl.h>
 #include <pthread/qos.h>
 #include <sys/mman.h>
@@ -14,7 +15,6 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
-#include <csetjmp>
 #include <csignal>
 #include <cstdint>
 #include <cstring>
@@ -28,12 +28,6 @@ namespace {
 
 volatile std::uint64_t g_sink = 0;
 volatile std::sig_atomic_t g_interrupt_signal_count = 0;
-thread_local volatile std::sig_atomic_t g_vm_fault_page_index = -1;
-thread_local volatile std::sig_atomic_t g_vm_fault_active = 0;
-thread_local const std::uint8_t *g_vm_fault_base = nullptr;
-thread_local std::size_t g_vm_fault_page_size = 0;
-thread_local std::size_t g_vm_fault_page_count = 0;
-thread_local sigjmp_buf g_vm_fault_jump;
 
 template <typename T>
 std::optional<T> ReadSysctlIntegral(const char *name) {
@@ -115,29 +109,6 @@ void WriteUnaligned64(std::uint8_t *ptr, std::uint64_t value) {
 void InterruptSignalHandler(int) {
   g_interrupt_signal_count =
       static_cast<std::sig_atomic_t>(g_interrupt_signal_count + static_cast<std::sig_atomic_t>(1));
-}
-
-void VmFaultSignalHandler(int, siginfo_t *info, void *) {
-  if (info == nullptr || info->si_addr == nullptr || !g_vm_fault_active || g_vm_fault_base == nullptr ||
-      g_vm_fault_page_size == 0 || g_vm_fault_page_count == 0) {
-    return;
-  }
-
-  const auto fault_addr = reinterpret_cast<std::uintptr_t>(info->si_addr);
-  const auto base_addr = reinterpret_cast<std::uintptr_t>(g_vm_fault_base);
-  if (fault_addr < base_addr) {
-    g_vm_fault_page_index = -1;
-    siglongjmp(g_vm_fault_jump, 1);
-  }
-
-  const std::size_t page = (fault_addr - base_addr) / g_vm_fault_page_size;
-  if (page >= g_vm_fault_page_count) {
-    g_vm_fault_page_index = -1;
-    siglongjmp(g_vm_fault_jump, 1);
-  }
-
-  g_vm_fault_page_index = static_cast<std::sig_atomic_t>(page);
-  siglongjmp(g_vm_fault_jump, 1);
 }
 
 #if defined(__aarch64__)
@@ -782,62 +753,33 @@ namespace workloads {
 
 [[gnu::noinline]] std::uint64_t FirstTouchFault(DemoEnvironment &state) {
   constexpr std::size_t kFaultBytes = 256 * 1024 * 1024;
-  void *mapping = ::mmap(nullptr, kFaultBytes, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+  char path[] = "/tmp/cpu_counter_fault.XXXXXX";
+  const int fd = ::mkstemp(path);
+  if (fd < 0) {
+    return 0;
+  }
+  ::unlink(path);
+  if (::ftruncate(fd, static_cast<off_t>(kFaultBytes)) != 0) {
+    ::close(fd);
+    return 0;
+  }
+  void *mapping =
+      ::mmap(nullptr, kFaultBytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  ::close(fd);
   if (mapping == MAP_FAILED) {
     return 0;
   }
 
-  struct sigaction action {};
-  struct sigaction old_segv {};
-  struct sigaction old_bus {};
-  action.sa_sigaction = &VmFaultSignalHandler;
-  action.sa_flags = SA_SIGINFO | SA_NODEFER;
-  sigemptyset(&action.sa_mask);
-  sigaction(SIGSEGV, &action, &old_segv);
-  sigaction(SIGBUS, &action, &old_bus);
-
   auto *bytes = static_cast<volatile std::uint8_t *>(mapping);
   std::uint64_t sum = 0;
   const std::size_t pages = kFaultBytes / state.page_size;
-  g_vm_fault_base = static_cast<const std::uint8_t *>(mapping);
-  g_vm_fault_page_size = state.page_size;
-  g_vm_fault_page_count = pages;
-  g_vm_fault_active = 1;
-
   for (std::size_t page = 0; page < pages; ++page) {
     const std::size_t offset = page * state.page_size;
-    while (true) {
-      g_vm_fault_page_index = -1;
-      if (sigsetjmp(g_vm_fault_jump, 1) == 0) {
-        bytes[offset] = static_cast<std::uint8_t>(page);
-        sum += bytes[offset];
-        break;
-      }
-
-      const auto fault_page = static_cast<int>(g_vm_fault_page_index);
-      if (fault_page < 0 || static_cast<std::size_t>(fault_page) >= pages) {
-        sum = 0;
-        page = pages;
-        break;
-      }
-
-      void *fault_ptr =
-          const_cast<std::uint8_t *>(static_cast<const std::uint8_t *>(mapping) +
-                                     static_cast<std::size_t>(fault_page) * state.page_size);
-      if (::mprotect(fault_ptr, state.page_size, PROT_READ | PROT_WRITE) != 0) {
-        sum = 0;
-        page = pages;
-        break;
-      }
-    }
+    bytes[offset] = static_cast<std::uint8_t>(page);
+    sum += bytes[offset];
   }
 
-  g_vm_fault_active = 0;
-  g_vm_fault_base = nullptr;
-  g_vm_fault_page_size = 0;
-  g_vm_fault_page_count = 0;
-  sigaction(SIGSEGV, &old_segv, nullptr);
-  sigaction(SIGBUS, &old_bus, nullptr);
+  ::msync(mapping, kFaultBytes, MS_SYNC);
   ::munmap(mapping, kFaultBytes);
   g_sink ^= sum;
   return sum;
@@ -1044,21 +986,22 @@ namespace workloads {
 
 [[gnu::noinline]] std::uint64_t StoreOrderFriendly(DemoEnvironment &) {
   constexpr std::size_t kBaseWords = 1u << 15;
-  constexpr std::size_t kOffsetWords = 513;
+  constexpr std::size_t kOffsetBytes = 4104;
   constexpr std::size_t kMask = kBaseWords - 1;
   constexpr std::size_t kIters = 8'000'000;
-  std::vector<std::uint64_t> storage(kBaseWords + kOffsetWords + 1, 0);
-  volatile std::uint64_t *stores = storage.data();
-  volatile const std::uint64_t *loads = storage.data() + kOffsetWords;
+  std::vector<std::uint8_t> storage(kBaseWords * sizeof(std::uint32_t) + kOffsetBytes + 16, 0);
+  volatile std::uint32_t *stores = reinterpret_cast<volatile std::uint32_t *>(storage.data());
+  auto *base = storage.data();
   std::size_t index = 0;
   std::uint64_t sum = 0;
   for (std::size_t i = 0; i < kIters; ++i) {
-    index = ((sum >> 7) + index * 1315423911ULL + 17ULL) & kMask;
-    stores[index] = static_cast<std::uint64_t>(i + sum);
-    stores[(index + 64) & kMask] = static_cast<std::uint64_t>(sum ^ (i + 1));
-    stores[(index + 128) & kMask] = static_cast<std::uint64_t>(sum + i * 3 + 1);
+    index = (((sum >> 7) + index * 1315423911ULL + 17ULL) & kMask) & ~std::size_t{1};
+    stores[index] = static_cast<std::uint32_t>(i + sum);
+    stores[(index + 1) & kMask] = static_cast<std::uint32_t>(sum ^ (i + 1));
+    stores[(index + 2) & kMask] = static_cast<std::uint32_t>(sum + i * 3 + 1);
+    stores[(index + 3) & kMask] = static_cast<std::uint32_t>(sum ^ (i * 7 + 3));
     std::atomic_signal_fence(std::memory_order_seq_cst);
-    sum += loads[index];
+    sum += ReadUnaligned64(base + kOffsetBytes + index * sizeof(std::uint32_t));
   }
   g_sink ^= sum;
   return sum;
@@ -1066,21 +1009,22 @@ namespace workloads {
 
 [[gnu::noinline]] std::uint64_t StoreOrderAlias(DemoEnvironment &) {
   constexpr std::size_t kBaseWords = 1u << 15;
-  constexpr std::size_t kOffsetWords = 512;
+  constexpr std::size_t kOffsetBytes = 4096;
   constexpr std::size_t kMask = kBaseWords - 1;
   constexpr std::size_t kIters = 8'000'000;
-  std::vector<std::uint64_t> storage(kBaseWords + kOffsetWords + 1, 0);
-  volatile std::uint64_t *stores = storage.data();
-  volatile const std::uint64_t *loads = storage.data() + kOffsetWords;
+  std::vector<std::uint8_t> storage(kBaseWords * sizeof(std::uint32_t) + kOffsetBytes + 16, 0);
+  volatile std::uint32_t *stores = reinterpret_cast<volatile std::uint32_t *>(storage.data());
+  auto *base = storage.data();
   std::size_t index = 0;
   std::uint64_t sum = 0;
   for (std::size_t i = 0; i < kIters; ++i) {
-    index = ((sum >> 7) + index * 1315423911ULL + 17ULL) & kMask;
-    stores[index] = static_cast<std::uint64_t>(i + sum);
-    stores[(index + 64) & kMask] = static_cast<std::uint64_t>(sum ^ (i + 1));
-    stores[(index + 128) & kMask] = static_cast<std::uint64_t>(sum + i * 3 + 1);
+    index = (((sum >> 7) + index * 1315423911ULL + 17ULL) & kMask) & ~std::size_t{1};
+    stores[index] = static_cast<std::uint32_t>(i + sum);
+    stores[(index + 1) & kMask] = static_cast<std::uint32_t>(sum ^ (i + 1));
+    stores[(index + 2) & kMask] = static_cast<std::uint32_t>(sum + i * 3 + 1);
+    stores[(index + 3) & kMask] = static_cast<std::uint32_t>(sum ^ (i * 7 + 3));
     std::atomic_signal_fence(std::memory_order_seq_cst);
-    sum += loads[index];
+    sum += ReadUnaligned64(base + kOffsetBytes + index * sizeof(std::uint32_t));
   }
   g_sink ^= sum;
   return sum;

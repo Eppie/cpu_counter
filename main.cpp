@@ -71,7 +71,7 @@ struct DemoContrast {
 
 void ApplyMeasuredRunDefaults(CliOptions &options) {
   options.run_options.require_active_pmu = true;
-  options.run_options.max_attempts = std::max<std::size_t>(options.run_options.max_attempts, 64);
+  options.run_options.max_attempts = std::max<std::size_t>(options.run_options.max_attempts, 128);
 }
 
 std::string CounterLabel(PerfCounter counter) {

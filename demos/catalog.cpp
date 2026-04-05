@@ -105,7 +105,7 @@ const WorkloadExpectation kPageStrideExpectations[] = {
 };
 
 const WorkloadExpectation kFirstTouchFaultExpectations[] = {
-    {"mmu-virtual-memory-fault", "high", "This workload creates a fresh anonymous mapping and writes one byte per page, so the first touch has to instantiate each page."},
+    {"mmu-virtual-memory-fault", "high", "This workload creates a fresh sparse file mapping and writes one byte per page, so the first touch has to instantiate each page."},
     {"dtlb-miss", "high", "Those cold first touches also churn translation state because every page is newly visited."},
     {"mmu-table-walk-data", "high", "The first-touch walk forces real data-side translation work while the mapping is populated."},
 };
@@ -430,17 +430,16 @@ for (std::size_t pass = 0; pass < 256; ++pass) {
 )cpp";
 
 constexpr std::string_view kFirstTouchFaultConfig =
-    "Create a fresh 256 MiB PROT_NONE mapping, then fault each page in on first write.";
+    "Create a fresh 256 MiB sparse file mapping and write one byte per page exactly once.";
 constexpr std::string_view kFirstTouchFaultCode = R"cpp(
-void *mapping = mmap(nullptr, 256 * 1024 * 1024, PROT_NONE,
-                     MAP_PRIVATE | MAP_ANON, -1, 0);
+int fd = mkstemp(path);
+ftruncate(fd, 256 * 1024 * 1024);
+void *mapping = mmap(nullptr, 256 * 1024 * 1024, PROT_READ | PROT_WRITE,
+                     MAP_SHARED, fd, 0);
 for (std::size_t page = 0; page < pages; ++page) {
-  if (sigsetjmp(g_vm_fault_jump, 1) == 0) {
-    bytes[page * state.page_size] = static_cast<std::uint8_t>(page);
-  } else {
-    mprotect(page_ptr, state.page_size, PROT_READ | PROT_WRITE);
-  }
+  bytes[page * state.page_size] = static_cast<std::uint8_t>(page);
 }
+msync(mapping, 256 * 1024 * 1024, MS_SYNC);
 munmap(mapping, 256 * 1024 * 1024);
 )cpp";
 
@@ -574,25 +573,25 @@ if (bits & 1ULL) {
 )cpp";
 
 constexpr std::string_view kStoreOrderFriendlyConfig =
-    "8,000,000 store-heavy iterations where the load stream is shifted by 4,104 bytes and avoids 4 KiB aliasing.";
+    "8,000,000 store-heavy iterations using 32-bit stores and a non-aliasing 64-bit load stream shifted by 4,104 bytes.";
 constexpr std::string_view kStoreOrderFriendlyCode = R"cpp(
-volatile std::uint64_t *stores = storage.data();
-volatile const std::uint64_t *loads = storage.data() + 513;
+volatile std::uint32_t *stores = reinterpret_cast<volatile std::uint32_t *>(storage.data());
 stores[index] = i + sum;
-stores[(index + 64) & mask] = sum ^ (i + 1);
-stores[(index + 128) & mask] = sum + i * 3 + 1;
-sum += loads[index];
+stores[(index + 1) & mask] = sum ^ (i + 1);
+stores[(index + 2) & mask] = sum + i * 3 + 1;
+stores[(index + 3) & mask] = sum ^ (i * 7 + 3);
+sum += ReadUnaligned64(base + 4104 + index * sizeof(std::uint32_t));
 )cpp";
 
 constexpr std::string_view kStoreOrderAliasConfig =
-    "8,000,000 store-heavy iterations where the load stream is shifted by exactly 4,096 bytes and 4 KiB-aliases the store stream.";
+    "8,000,000 store-heavy iterations using 32-bit stores and a 64-bit load stream shifted by exactly 4,096 bytes to preserve 4 KiB aliasing.";
 constexpr std::string_view kStoreOrderAliasCode = R"cpp(
-volatile std::uint64_t *stores = storage.data();
-volatile const std::uint64_t *loads = storage.data() + 512;
+volatile std::uint32_t *stores = reinterpret_cast<volatile std::uint32_t *>(storage.data());
 stores[index] = i + sum;
-stores[(index + 64) & mask] = sum ^ (i + 1);
-stores[(index + 128) & mask] = sum + i * 3 + 1;
-sum += loads[index];
+stores[(index + 1) & mask] = sum ^ (i + 1);
+stores[(index + 2) & mask] = sum + i * 3 + 1;
+stores[(index + 3) & mask] = sum ^ (i * 7 + 3);
+sum += ReadUnaligned64(base + 4096 + index * sizeof(std::uint32_t));
 )cpp";
 
 constexpr std::string_view kHotInstructionConfig =
@@ -777,8 +776,8 @@ const WorkloadDefinition kWorkloads[] = {
             PerfCounter::Named("INST_INT_ST"),
         std::span<const WorkloadExpectation>(kNtStreamWriteExpectations),
         &workloads::NtStreamWrite,
-        "scalar-stream-write",
-        "Both demos sweep the same 64 MiB array with scalar code. The main difference is whether each store uses the ordinary temporal path or explicitly requests non-temporal behavior.",
+        "hot-seq-write",
+        "Compare this against the tiny hot-write baseline. The main difference is whether stores keep revisiting the same resident lines, or sweep a large footprint through the explicit non-temporal store path.",
     },
     {
         "simd-stream-write",
@@ -936,8 +935,8 @@ const WorkloadDefinition kWorkloads[] = {
     {
         "first-touch-fault",
         "First-Touch Fault",
-        "Create a fresh anonymous mapping and touch each page exactly once.",
-        "This is the dedicated virtual-memory-fault showcase: the data is not just translation-hostile, it is genuinely absent until the first write instantiates each page.",
+        "Create a fresh sparse file mapping and touch each page exactly once.",
+        "This is the dedicated virtual-memory-fault showcase: the data is not just translation-hostile, it is file-backed and absent until the first write instantiates each page.",
         kFirstTouchFaultConfig,
         kFirstTouchFaultCode,
         Group::TlbPageWalk,
@@ -949,7 +948,7 @@ const WorkloadDefinition kWorkloads[] = {
         std::span<const WorkloadExpectation>(kFirstTouchFaultExpectations),
         &workloads::FirstTouchFault,
         "hot-seq-read",
-        "Both demos ultimately touch memory, but this one creates a brand-new mapping and faults every page in on first write while the hot read baseline stays on already-resident data.",
+        "Both demos ultimately touch memory, but this one creates a brand-new sparse file mapping and faults every page in on first write while the hot read baseline stays on already-resident data.",
     },
     {
         "aligned-x64-load",
@@ -1593,7 +1592,7 @@ const CounterDefinition kCounters[] = {
         Tier::Experimental,
         PerfCounter::Named("ST_NT_UOP"),
         "nt-stream-write",
-        "scalar-stream-write",
+        "hot-seq-write",
         {2.0, 100},
     },
     {
