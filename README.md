@@ -7,6 +7,11 @@ This project now has two jobs:
 
 The library stays as one shipped header. The demo lab is built from the `demos/` subtree and uses the public library API only.
 
+If you want a focused reading path or a current issue snapshot, start with:
+
+- `docs/OFFLINE_GUIDE.md`
+- `docs/CURRENT_STATUS.md`
+
 ## Caveat First
 
 - This project uses private Apple `kperf` / `kperfdata` APIs.
