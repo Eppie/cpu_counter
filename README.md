@@ -153,6 +153,12 @@ Measured commands (`run counter`, `run demo`, and `run demos`) now default to:
 
 You can still tighten runs further with `--require-stable-cpu`.
 
+Measured demo output now includes:
+
+- raw counter means
+- normalized derived metrics such as IPC/CPI, branch miss per kbranch, miss per kinst, uops per instruction, and percentage shares when the required counters are present
+- side-by-side compare tables for demos that have an explicit contrast workload
+
 ### Demo Structure
 
 The demo lab is registry-driven.
@@ -168,6 +174,7 @@ Each workload has:
 - default repeats / warmups
 - curated measurement set
 - expected high/low counter behaviors
+- normalized derived metrics printed opportunistically from the measured counter set
 
 Each counter has:
 

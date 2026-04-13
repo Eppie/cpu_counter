@@ -69,6 +69,12 @@ struct DemoContrast {
   WorkloadRunSummary summary;
 };
 
+struct DerivedMetricRow {
+  std::string label;
+  std::string value;
+  std::string basis;
+};
+
 void ApplyMeasuredRunDefaults(CliOptions &options) {
   options.run_options.require_active_pmu = true;
   options.run_options.max_attempts = std::max<std::size_t>(options.run_options.max_attempts, 128);
@@ -408,6 +414,40 @@ std::optional<double> MeanCounterValue(const WorkloadRunSummary &summary, PerfCo
   return total / static_cast<double>(count);
 }
 
+std::optional<PerfCounter> LookupCounter(std::string_view cli_name) {
+  if (const demo::CounterDefinition *definition = demo::FindCounter(cli_name)) {
+    return definition->counter;
+  }
+  return std::nullopt;
+}
+
+std::optional<double> MeanCatalogCounterValue(const WorkloadRunSummary &summary,
+                                              std::string_view cli_name) {
+  const auto counter = LookupCounter(cli_name);
+  if (!counter.has_value()) {
+    return std::nullopt;
+  }
+  return MeanCounterValue(summary, *counter);
+}
+
+std::optional<double> SumCatalogCounterValues(const WorkloadRunSummary &summary,
+                                              std::initializer_list<std::string_view> cli_names) {
+  double total = 0.0;
+  bool any = false;
+  for (const std::string_view cli_name : cli_names) {
+    const auto value = MeanCatalogCounterValue(summary, cli_name);
+    if (!value.has_value()) {
+      continue;
+    }
+    total += *value;
+    any = true;
+  }
+  if (!any) {
+    return std::nullopt;
+  }
+  return total;
+}
+
 double MeanWallNs(const WorkloadRunSummary &summary) {
   if (summary.samples.empty()) {
     return 0.0;
@@ -534,6 +574,219 @@ std::optional<double> MeanCpi(const WorkloadRunSummary &summary) {
     return std::nullopt;
   }
   return *cycles / *instructions;
+}
+
+std::vector<DerivedMetricRow> ComputeDerivedMetrics(const WorkloadRunSummary &summary) {
+  std::vector<DerivedMetricRow> metrics;
+
+  const auto cycles = MeanCounterValue(summary, CYCLES);
+  const auto instructions = MeanCounterValue(summary, INSTRUCTIONS);
+  const auto branches = MeanCounterValue(summary, BRANCHES);
+  const auto branch_miss = MeanCounterValue(summary, BRANCH_MISS);
+  const auto cond_branches = MeanCatalogCounterValue(summary, "inst-branch-cond");
+  const auto cond_branch_miss = MeanCatalogCounterValue(summary, "branch-cond-miss");
+  const auto taken_branches = MeanCatalogCounterValue(summary, "inst-branch-taken");
+
+  const auto l1_load_miss = MeanCounterValue(summary, L1_LOAD_MISS);
+  const auto l1_store_miss = MeanCounterValue(summary, L1_STORE_MISS);
+  const auto dtlb_miss = MeanCounterValue(summary, DTLB_MISS);
+  const auto dtlb_miss_nonspec = MeanCatalogCounterValue(summary, "dtlb-miss-nonspec");
+  const auto dtlb_access = MeanCatalogCounterValue(summary, "dtlb-access");
+  const auto dtlb_fill = MeanCatalogCounterValue(summary, "dtlb-fill");
+  const auto l2_dtlb_miss = MeanCounterValue(summary, L2_TLB_MISS);
+  const auto data_page_walk = MeanCatalogCounterValue(summary, "mmu-table-walk-data");
+
+  const auto itlb_miss = MeanCounterValue(summary, ITLB_MISS);
+  const auto l1i_cache_miss = MeanCatalogCounterValue(summary, "l1i-cache-miss");
+  const auto l1i_tlb_fill = MeanCatalogCounterValue(summary, "l1i-tlb-fill");
+  const auto l2_itlb_miss = MeanCatalogCounterValue(summary, "l2-tlb-miss-instruction");
+  const auto instruction_page_walk = MeanCatalogCounterValue(summary, "mmu-table-walk-instruction");
+
+  const auto inst_int_ld = MeanCatalogCounterValue(summary, "inst-int-ld");
+  const auto inst_simd_ld = MeanCatalogCounterValue(summary, "inst-simd-ld");
+  const auto inst_int_st = MeanCatalogCounterValue(summary, "inst-int-st");
+  const auto inst_simd_st = MeanCatalogCounterValue(summary, "inst-simd-st");
+  const auto inst_ldst = MeanCatalogCounterValue(summary, "inst-ldst");
+  const auto load_ops = SumCatalogCounterValues(summary, {"inst-int-ld", "inst-simd-ld"});
+  const auto store_ops = SumCatalogCounterValues(summary, {"inst-int-st", "inst-simd-st"});
+
+  const auto ldst_x64 = MeanCatalogCounterValue(summary, "ldst-x64-uop");
+  const auto ldst_xpg = MeanCatalogCounterValue(summary, "ldst-xpg-uop");
+  const auto ld_nt_uop = MeanCatalogCounterValue(summary, "ld-nt-uop");
+  const auto st_nt_uop = MeanCatalogCounterValue(summary, "st-nt-uop");
+
+  const auto atomic_succ = MeanCatalogCounterValue(summary, "atomic-succ");
+  const auto atomic_fail = MeanCatalogCounterValue(summary, "atomic-fail");
+  const auto inst_barrier = MeanCatalogCounterValue(summary, "inst-barrier");
+  const auto interrupt_pending = MeanCatalogCounterValue(summary, "interrupt-pending");
+
+  const auto core_active = MeanCatalogCounterValue(summary, "core-active-cycle");
+  const auto retire_uop = MeanCatalogCounterValue(summary, "retire-uop");
+  const auto map_uop = MeanCatalogCounterValue(summary, "map-uop");
+  const auto map_int_uop = MeanCatalogCounterValue(summary, "map-int-uop");
+  const auto map_ldst_uop = MeanCatalogCounterValue(summary, "map-ldst-uop");
+  const auto map_simd_uop = MeanCatalogCounterValue(summary, "map-simd-uop");
+
+  const auto fetch_restart = MeanCatalogCounterValue(summary, "fetch-restart");
+  const auto flush_restart_other = MeanCatalogCounterValue(summary, "flush-restart-other");
+
+  const auto add_value = [&](std::string_view label, double value, int precision,
+                             std::string_view basis) {
+    metrics.push_back({std::string(label), FormatDouble(value, precision), std::string(basis)});
+  };
+  const auto add_ratio = [&](std::string_view label, const std::optional<double> &numerator,
+                             const std::optional<double> &denominator, int precision,
+                             std::string_view basis) {
+    if (!numerator.has_value() || !denominator.has_value() || *denominator <= 0.0) {
+      return;
+    }
+    add_value(label, *numerator / *denominator, precision, basis);
+  };
+  const auto add_per_k = [&](std::string_view label, const std::optional<double> &numerator,
+                             const std::optional<double> &denominator, int precision,
+                             std::string_view basis) {
+    if (!numerator.has_value() || !denominator.has_value() || *denominator <= 0.0) {
+      return;
+    }
+    add_value(label, (*numerator * 1000.0) / *denominator, precision, basis);
+  };
+  const auto add_per_m = [&](std::string_view label, const std::optional<double> &numerator,
+                             const std::optional<double> &denominator, int precision,
+                             std::string_view basis) {
+    if (!numerator.has_value() || !denominator.has_value() || *denominator <= 0.0) {
+      return;
+    }
+    add_value(label, (*numerator * 1'000'000.0) / *denominator, precision, basis);
+  };
+  const auto add_percent = [&](std::string_view label, const std::optional<double> &numerator,
+                               const std::optional<double> &denominator, int precision,
+                               std::string_view basis) {
+    if (!numerator.has_value() || !denominator.has_value() || *denominator <= 0.0) {
+      return;
+    }
+    metrics.push_back(
+        {std::string(label), FormatDouble((*numerator * 100.0) / *denominator, precision) + "%",
+         std::string(basis)});
+  };
+
+  add_ratio("IPC", instructions, cycles, 3, "instructions / cycle");
+  add_ratio("CPI", cycles, instructions, 3, "cycles / instruction");
+  add_per_k("branches / kinst", branches, instructions, 3, "per 1k instructions");
+  add_per_k("branch miss / kbranch", branch_miss, branches, 3, "per 1k retired branches");
+  add_per_k("cond branch miss / kcond", cond_branch_miss, cond_branches, 3,
+            "per 1k conditional branches");
+  add_per_k("taken branch / kbranch", taken_branches, branches, 3, "per 1k retired branches");
+
+  if (load_ops.has_value()) {
+    add_per_k("L1 load miss / kload", l1_load_miss, load_ops, 3, "per 1k load instructions");
+  } else {
+    add_per_k("L1 load miss / kinst", l1_load_miss, instructions, 3, "per 1k instructions");
+  }
+  if (store_ops.has_value()) {
+    add_per_k("L1 store miss / kstore", l1_store_miss, store_ops, 3, "per 1k store instructions");
+  } else {
+    add_per_k("L1 store miss / kinst", l1_store_miss, instructions, 3, "per 1k instructions");
+  }
+
+  add_per_k("int load / kinst", inst_int_ld, instructions, 3, "per 1k instructions");
+  add_per_k("SIMD load / kinst", inst_simd_ld, instructions, 3, "per 1k instructions");
+  add_per_k("int store / kinst", inst_int_st, instructions, 3, "per 1k instructions");
+  add_per_k("SIMD store / kinst", inst_simd_st, instructions, 3, "per 1k instructions");
+  add_per_k("LD/ST inst / kinst", inst_ldst, instructions, 3, "per 1k instructions");
+
+  if (inst_int_ld.has_value()) {
+    add_per_k("NT load uop / kscalar-load", ld_nt_uop, inst_int_ld, 3,
+              "per 1k scalar load instructions");
+  } else {
+    add_per_k("NT load uop / kinst", ld_nt_uop, instructions, 3, "per 1k instructions");
+  }
+  if (inst_int_st.has_value()) {
+    add_per_k("NT store uop / kscalar-store", st_nt_uop, inst_int_st, 3,
+              "per 1k scalar store instructions");
+  } else {
+    add_per_k("NT store uop / kinst", st_nt_uop, instructions, 3, "per 1k instructions");
+  }
+
+  if (dtlb_access.has_value()) {
+    add_per_k("DTLB miss / kaccess", dtlb_miss, dtlb_access, 3, "per 1k DTLB accesses");
+    add_per_k("DTLB miss nonspec / kaccess", dtlb_miss_nonspec, dtlb_access, 3,
+              "per 1k DTLB accesses");
+    add_per_k("DTLB fill / kaccess", dtlb_fill, dtlb_access, 3, "per 1k DTLB accesses");
+  } else {
+    add_per_k("DTLB miss / kinst", dtlb_miss, instructions, 3, "per 1k instructions");
+    add_per_k("DTLB miss nonspec / kinst", dtlb_miss_nonspec, instructions, 3,
+              "per 1k instructions");
+    add_per_k("DTLB fill / kinst", dtlb_fill, instructions, 3, "per 1k instructions");
+  }
+  add_per_k("L2 DTLB miss / kDTLB-miss", l2_dtlb_miss, dtlb_miss, 3,
+            "per 1k first-level DTLB misses");
+  add_per_k("data walk / kDTLB-miss", data_page_walk, dtlb_miss, 3,
+            "per 1k first-level DTLB misses");
+
+  add_per_k("ITLB miss / kinst", itlb_miss, instructions, 3, "per 1k instructions");
+  add_per_k("L1I miss / kinst", l1i_cache_miss, instructions, 3, "per 1k instructions");
+  add_per_k("L1I fill / kinst", l1i_tlb_fill, instructions, 3, "per 1k instructions");
+  add_per_k("L2 ITLB miss / kITLB-miss", l2_itlb_miss, itlb_miss, 3,
+            "per 1k first-level ITLB misses");
+  add_per_k("instruction walk / kITLB-miss", instruction_page_walk, itlb_miss, 3,
+            "per 1k first-level ITLB misses");
+
+  if (inst_ldst.has_value()) {
+    add_per_k("x64 split / kldst", ldst_x64, inst_ldst, 3, "per 1k load/store instructions");
+    add_per_k("xpage split / kldst", ldst_xpg, inst_ldst, 3, "per 1k load/store instructions");
+  } else {
+    add_per_k("x64 split / kinst", ldst_x64, instructions, 3, "per 1k instructions");
+    add_per_k("xpage split / kinst", ldst_xpg, instructions, 3, "per 1k instructions");
+  }
+
+  add_ratio("atomic fail / success", atomic_fail, atomic_succ, 3, "failed atomics / successful atomics");
+  if (atomic_fail.has_value() && atomic_succ.has_value() &&
+      (*atomic_fail + *atomic_succ) > 0.0) {
+    metrics.push_back({"atomic fail rate",
+                       FormatDouble((*atomic_fail * 100.0) / (*atomic_fail + *atomic_succ), 2) + "%",
+                       "failed atomics / total atomics"});
+  }
+
+  add_per_k("barrier / kinst", inst_barrier, instructions, 3, "per 1k instructions");
+  add_per_m("interrupt pending / Minst", interrupt_pending, instructions, 3,
+            "per 1M instructions");
+
+  add_percent("core active / cycle", core_active, cycles, 2, "active cycles as a share of total cycles");
+  add_ratio("retire uop / inst", retire_uop, instructions, 3, "retired uops / instructions");
+  add_ratio("map uop / inst", map_uop, instructions, 3, "mapped uops / instructions");
+  add_percent("map int share", map_int_uop, map_uop, 2, "integer-class uops as a share of mapped uops");
+  add_percent("map ldst share", map_ldst_uop, map_uop, 2, "load/store uops as a share of mapped uops");
+  add_percent("map SIMD share", map_simd_uop, map_uop, 2, "SIMD uops as a share of mapped uops");
+
+  add_per_k("fetch restart / kinst", fetch_restart, instructions, 3, "per 1k instructions");
+  add_per_k("flush restart / kinst", flush_restart_other, instructions, 3,
+            "per 1k instructions");
+
+  return metrics;
+}
+
+void PrintDerivedMetrics(const std::vector<DerivedMetricRow> &metrics, std::string_view indent) {
+  if (metrics.empty()) {
+    return;
+  }
+  std::size_t label_width = std::string("metric").size();
+  std::size_t value_width = std::string("value").size();
+  std::size_t basis_width = std::string("basis").size();
+  for (const DerivedMetricRow &metric : metrics) {
+    label_width = std::max(label_width, metric.label.size());
+    value_width = std::max(value_width, metric.value.size());
+    basis_width = std::max(basis_width, metric.basis.size());
+  }
+
+  std::cout << indent << "derived metrics:\n";
+  std::cout << indent << "  " << std::left << std::setw(static_cast<int>(label_width)) << "metric"
+            << "  " << std::right << std::setw(static_cast<int>(value_width)) << "value"
+            << "  " << std::left << std::setw(static_cast<int>(basis_width)) << "basis" << '\n';
+  for (const DerivedMetricRow &metric : metrics) {
+    std::cout << indent << "  " << std::left << std::setw(static_cast<int>(label_width))
+              << metric.label << "  " << std::right << std::setw(static_cast<int>(value_width))
+              << metric.value << "  " << std::left << metric.basis << '\n';
+  }
 }
 
 void PrintExpectationWarnings(const demo::WorkloadDefinition &workload,
@@ -713,13 +966,7 @@ void PrintWorkloadRunSummary(const WorkloadRunSummary &summary) {
     }
   }
 
-  const auto cycles = MeanCounterValue(summary, CYCLES);
-  const auto instructions = MeanCounterValue(summary, INSTRUCTIONS);
-  if (cycles.has_value() && instructions.has_value() && *cycles > 0.0 && *instructions > 0.0) {
-    std::cout << "  derived:\n";
-    std::cout << "    IPC  " << FormatDouble(*instructions / *cycles, 3) << '\n';
-    std::cout << "    CPI  " << FormatDouble(*cycles / *instructions, 3) << '\n';
-  }
+  PrintDerivedMetrics(ComputeDerivedMetrics(summary), "  ");
 }
 
 void PrintDemoContrastSummary(const demo::WorkloadDefinition &primary,
