@@ -193,6 +193,9 @@ std::uint64_t StoreOrderFriendly(DemoEnvironment &state);
 std::uint64_t StoreOrderAlias(DemoEnvironment &state);
 std::uint64_t HotInstructionLoop(DemoEnvironment &state);
 std::uint64_t RandomInstructionPages(DemoEnvironment &state);
+std::uint64_t FrontendHotRestart(DemoEnvironment &state);
+std::uint64_t FrontendRandomRestart(DemoEnvironment &state);
+std::uint64_t FrontendSelfModifyingRestart(DemoEnvironment &state);
 
 }  // namespace workloads
 

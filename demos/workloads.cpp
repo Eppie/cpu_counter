@@ -173,6 +173,14 @@ std::uint64_t ReduceU64x2(uint64x2_t value) {
 #endif
 }
 
+constexpr std::size_t kFrontendRestartCalls = 1'048'576;
+
+void PatchExecStub(std::uint8_t *stub_bytes, std::uint16_t imm16) {
+  auto *stub = reinterpret_cast<std::uint32_t *>(stub_bytes);
+  stub[0] = EncodeMovzX0(imm16);
+  stub[1] = 0xD65F03C0u;
+}
+
 }  // namespace
 
 bool LogicalCpuRange::Contains(int cpu) const {
@@ -1050,6 +1058,75 @@ namespace workloads {
     }
   }
   g_sink += sum;
+  return sum;
+}
+
+[[gnu::noinline]] std::uint64_t FrontendHotRestart(DemoEnvironment &state) {
+  const auto fn = state.ExecStubAt(0);
+  std::uint64_t sum = 0;
+  for (std::size_t i = 0; i < kFrontendRestartCalls; ++i) {
+    sum += fn();
+  }
+  g_sink ^= sum;
+  return sum;
+}
+
+[[gnu::noinline]] std::uint64_t FrontendRandomRestart(DemoEnvironment &state) {
+  std::uint64_t sum = 0;
+  const std::size_t page_count = state.exec_page_order.size();
+  if (page_count == 0) {
+    return 0;
+  }
+  for (std::size_t i = 0; i < kFrontendRestartCalls; ++i) {
+    const std::size_t page = state.exec_page_order[i % page_count];
+    sum += state.ExecStubAt(page)();
+  }
+  g_sink ^= sum;
+  return sum;
+}
+
+[[gnu::noinline]] std::uint64_t FrontendSelfModifyingRestart(DemoEnvironment &state) {
+  const std::size_t bytes = state.page_size * 2;
+  void *mapping =
+      ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+  if (mapping == MAP_FAILED) {
+    return 0;
+  }
+
+  auto *code = static_cast<std::uint8_t *>(mapping);
+  PatchExecStub(code + 0 * state.page_size, 1);
+  PatchExecStub(code + 1 * state.page_size, 2);
+  sys_icache_invalidate(code, bytes);
+  if (::mprotect(code, bytes, PROT_READ | PROT_EXEC) != 0) {
+    ::munmap(code, bytes);
+    return 0;
+  }
+
+  std::uint64_t sum = 0;
+  constexpr std::size_t kCallsPerBlock = 32;
+  constexpr std::size_t kBlocks = kFrontendRestartCalls / kCallsPerBlock;
+  for (std::size_t block = 0; block < kBlocks; ++block) {
+    const std::size_t target_page = block & 1u;
+    auto *target = code + target_page * state.page_size;
+    if (::mprotect(code, bytes, PROT_READ | PROT_WRITE) != 0) {
+      ::munmap(code, bytes);
+      return sum;
+    }
+    PatchExecStub(target, static_cast<std::uint16_t>((block + 1) & 0xffffu));
+    sys_icache_invalidate(target, 2 * sizeof(std::uint32_t));
+    if (::mprotect(code, bytes, PROT_READ | PROT_EXEC) != 0) {
+      ::munmap(code, bytes);
+      return sum;
+    }
+
+    const auto fn = reinterpret_cast<DemoEnvironment::ExecStub>(target);
+    for (std::size_t i = 0; i < kCallsPerBlock; ++i) {
+      sum += fn();
+    }
+  }
+
+  ::munmap(code, bytes);
+  g_sink ^= sum;
   return sum;
 }
 

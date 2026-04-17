@@ -232,6 +232,7 @@ Experimental showcase workloads currently include:
 - `dispatch-simd-alu`
 - `frontend-hot-restart`
 - `frontend-random-restart`
+- `frontend-self-modifying-restart`
 
 ### Counter Support Table
 
@@ -291,7 +292,7 @@ The registry now covers the full 63-counter target list from the original resear
 | `branch-indir-miss` | experimental | indirect-branch mispredicts | `random-instruction-pages` | `hot-instruction-loop` | general indirect-target churn showcase |
 | `branch-ret-indir-miss` | experimental | return-side indirect-branch mispredicts | `random-instruction-pages` | `hot-instruction-loop` | best available return-target stress case in the lab |
 | `fetch-restart` | experimental | frontend fetch restart events | `frontend-random-restart` | `frontend-hot-restart` | code-page churn versus one hot stub |
-| `flush-restart-other` | experimental | non-branch frontend flush/restart events | `frontend-random-restart` | `frontend-hot-restart` | more opaque than the stable frontend miss counters |
+| `flush-restart-other` | experimental | non-branch frontend flush/restart events | `frontend-self-modifying-restart` | `frontend-hot-restart` | explicit code rewriting plus I-cache invalidation is a better probe than plain code-page churn |
 | `map-dispatch-bubble` | experimental | mapper/dispatch bubbles | `frontend-random-restart` | `frontend-hot-restart` | hot versus randomized code-page locality |
 | `map-dispatch-bubble-ic` | experimental | instruction-cache-driven dispatch bubbles | `random-instruction-pages` | `hot-instruction-loop` | explicit code-cache churn teaching case |
 | `map-dispatch-bubble-itlb` | experimental | instruction-TLB-driven dispatch bubbles | `random-instruction-pages` | `hot-instruction-loop` | explicit ITLB-churn teaching case |

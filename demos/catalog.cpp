@@ -182,10 +182,14 @@ const WorkloadExpectation kFrontendHotRestartExpectations[] = {
 
 const WorkloadExpectation kFrontendRandomRestartExpectations[] = {
     {"fetch-restart", "high", "Jumping across many executable pages makes the frontend repeatedly rediscover and restart fetch from new locations."},
-    {"flush-restart-other", "high", "The same code-page churn should amplify non-branch frontend flush/restart activity if this event is meaningful on the current core."},
     {"map-dispatch-bubble", "high", "The frontend keeps tripping over new code pages, so dispatch bubbles are the intended high-level consequence."},
     {"map-stall", "high", "The mapper should spend more time starved or stalled when fetch keeps restarting across many code pages."},
     {"map-stall-dispatch", "high", "This workload is the intended high case for dispatch-facing mapper stalls because frontend locality is intentionally destroyed."},
+};
+
+const WorkloadExpectation kFrontendSelfModifyingExpectations[] = {
+    {"flush-restart-other", "high", "The workload rewrites executable code, invalidates the I-cache, and re-enters execution repeatedly, so non-branch frontend flush/restart activity is the headline signal."},
+    {"fetch-restart", "high", "Patching and re-entering alternating stubs also forces the frontend to rediscover code streams repeatedly, so fetch restart is a supporting signal."},
 };
 
 const WorkloadExpectation kPredictableBranchExpectations[] = {
@@ -525,20 +529,34 @@ constexpr std::string_view kDispatchSimdConfig =
 constexpr std::string_view kDispatchSimdCode = kSimdAluCode;
 
 constexpr std::string_view kFrontendHotRestartConfig =
-    "Same tiny hot executable stub loop, but measured with frontend restart counters.";
+    "1,048,576 indirect calls to the same tiny executable stub.";
 constexpr std::string_view kFrontendHotRestartCode = R"cpp(
 const auto fn = state.ExecStubAt(0);
-for (std::size_t i = 0; i < 32'000'000; ++i) {
+for (std::size_t i = 0; i < 1'048'576; ++i) {
   sum += fn();
 }
 )cpp";
 
 constexpr std::string_view kFrontendRandomRestartConfig =
-    "Same randomized executable-page walk, but measured with frontend restart counters.";
+    "1,048,576 indirect calls across the shuffled executable-page set, with the same total call count as the hot baseline.";
 constexpr std::string_view kFrontendRandomRestartCode = R"cpp(
-for (std::size_t pass = 0; pass < 128; ++pass) {
-  for (std::size_t page : state.exec_page_order) {
-    sum += state.ExecStubAt(page)();
+for (std::size_t i = 0; i < 1'048'576; ++i) {
+  const std::size_t page = state.exec_page_order[i % state.exec_page_order.size()];
+  sum += state.ExecStubAt(page)();
+}
+)cpp";
+
+constexpr std::string_view kFrontendSelfModifyingConfig =
+    "32,768 patch blocks. Each block rewrites one of two executable stubs, invalidates its I-cache lines, then executes that stub 32 times.";
+constexpr std::string_view kFrontendSelfModifyingCode = R"cpp(
+for (std::size_t block = 0; block < 32'768; ++block) {
+  const std::size_t target_page = block & 1u;
+  mprotect(code, bytes, PROT_READ | PROT_WRITE);
+  PatchExecStub(code + target_page * page_size, block + 1);
+  sys_icache_invalidate(code + target_page * page_size, 8);
+  mprotect(code, bytes, PROT_READ | PROT_EXEC);
+  for (std::size_t i = 0; i < 32; ++i) {
+    sum += reinterpret_cast<ExecStub>(code + target_page * page_size)();
   }
 }
 )cpp";
@@ -1241,7 +1259,7 @@ const WorkloadDefinition kWorkloads[] = {
             PerfCounter::Named("FLUSH_RESTART_OTHER_NONSPEC") |
             PerfCounter::Named("CORE_ACTIVE_CYCLE"),
         std::span<const WorkloadExpectation>(kFrontendHotRestartExpectations),
-        &workloads::HotInstructionLoop,
+        &workloads::FrontendHotRestart,
     },
     {
         "frontend-random-restart",
@@ -1258,9 +1276,28 @@ const WorkloadDefinition kWorkloads[] = {
             PerfCounter::Named("FLUSH_RESTART_OTHER_NONSPEC") |
             PerfCounter::Named("CORE_ACTIVE_CYCLE"),
         std::span<const WorkloadExpectation>(kFrontendRandomRestartExpectations),
-        &workloads::RandomInstructionPages,
+        &workloads::FrontendRandomRestart,
         "frontend-hot-restart",
-        "Both demos repeatedly call generated executable stubs. The difference is whether execution stays on one hot code page or jumps across many pages in randomized order.",
+        "Both demos perform the same total number of indirect calls into generated executable stubs. The difference is whether every call targets one hot stub or the call stream walks a wide shuffled code-page set.",
+    },
+    {
+        "frontend-self-modifying-restart",
+        "Frontend Self-Modifying Restart",
+        "Alternating executable stubs are rewritten and re-entered repeatedly.",
+        "This is the dedicated non-branch frontend flush showcase: the code stream itself changes under execution, so the frontend has to absorb repeated invalidation and restart pressure rather than just code-page churn.",
+        kFrontendSelfModifyingConfig,
+        kFrontendSelfModifyingCode,
+        Group::InstructionSide,
+        Tier::Experimental,
+        3,
+        1,
+        CYCLES | INSTRUCTIONS | PerfCounter::Named("FETCH_RESTART") |
+            PerfCounter::Named("FLUSH_RESTART_OTHER_NONSPEC") |
+            PerfCounter::Named("CORE_ACTIVE_CYCLE"),
+        std::span<const WorkloadExpectation>(kFrontendSelfModifyingExpectations),
+        &workloads::FrontendSelfModifyingRestart,
+        "frontend-hot-restart",
+        "Both demos execute tiny generated stubs. The difference is that this version rewrites the active code, invalidates the instruction cache, and re-enters execution repeatedly while the hot baseline keeps the code stream fixed.",
     },
 };
 
@@ -1929,11 +1966,11 @@ const CounterDefinition kCounters[] = {
         "flush-restart-other",
         "Flush Restart Other",
         "Non-branch frontend flush/restart events.",
-        "Experimental because the exact microarchitectural meaning is more opaque than the stable miss counters, but code-page churn is the intended high case.",
+        "Experimental because the exact microarchitectural meaning is opaque. On this machine, explicit code rewriting plus I-cache invalidation is a better probe than plain code-page churn.",
         Group::InstructionSide,
         Tier::Experimental,
         PerfCounter::Named("FLUSH_RESTART_OTHER_NONSPEC"),
-        "frontend-random-restart",
+        "frontend-self-modifying-restart",
         "frontend-hot-restart",
         {2.0, 100},
     },
