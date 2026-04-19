@@ -7,10 +7,10 @@ namespace {
 
 const WorkloadExpectation kDenseAluExpectations[] = {
     {"cycles", "low", "The loop stays in registers and avoids long-latency miss penalties, so total cycle count stays comparatively low."},
-    {"instructions", "high", "A tight integer ALU loop retires many instructions with almost no memory stalls."},
-    {"inst-all", "high", "This is a dense compute loop, so the all-instruction counter should rise along with fixed instructions."},
-    {"inst-int-alu", "high", "Most of the work is integer arithmetic on registers, which is exactly what this counter is meant to reflect."},
-    {"branches", "low", "The loop body is mostly straight-line arithmetic, so branch density stays low."},
+    {"instructions", "approx", "The current clang build emits about 14 loop-body instructions per iteration, so 20,000,000 iterations predict about 280,000,000 retired instructions.", ExpectationKind::ApproximateValue, 280'000'000.0, 0.01},
+    {"inst-all", "approx", "The PMU all-instruction view should track the same current codegen estimate: about 14 loop-body instructions per iteration across 20,000,000 iterations.", ExpectationKind::ApproximateValue, 280'000'000.0, 0.01},
+    {"inst-int-alu", "approx", "On the current build, about 13 of the 14 loop-body instructions are integer ALU-class instructions, so this counter should land near 260,000,000.", ExpectationKind::ApproximateValue, 260'000'000.0, 0.01},
+    {"branches", "approx", "There is one loop-closing branch per iteration, so 20,000,000 iterations predict about 20,000,000 retired branches.", ExpectationKind::ApproximateValue, 20'000'000.0, 0.01},
     {"interrupt-pending", "low", "There are no deliberately injected asynchronous events here, so pending-interrupt pressure should stay near baseline."},
 };
 
@@ -76,17 +76,17 @@ const WorkloadExpectation kRandomWriteExpectations[] = {
 };
 
 const WorkloadExpectation kUncontendedAtomicExpectations[] = {
-    {"atomic-succ", "high", "Every compare-exchange should usually succeed on the first try when no other thread is touching the same word."},
-    {"atomic-fail", "low", "With no competing writers, the retry path should stay close to zero."},
+    {"atomic-succ", "approx", "The loop performs 4,000,000 compare-exchange updates, and without contention nearly every one should retire as a successful atomic operation.", ExpectationKind::ApproximateValue, 4'000'000.0, 0.01},
+    {"atomic-fail", "near-zero", "With no competing writers, the retry path should stay at or extremely close to zero.", ExpectationKind::NearZero, 1'000.0, 0.0},
 };
 
 const WorkloadExpectation kContendedAtomicExpectations[] = {
-    {"atomic-succ", "high", "The measured thread still eventually commits successful atomic updates."},
+    {"atomic-succ", "approx", "The measured thread still executes 2,000,000 compare-exchange updates, so successful atomics should stay close to that exact loop trip count even under contention.", ExpectationKind::ApproximateValue, 2'000'000.0, 0.01},
     {"atomic-fail", "high", "Competing helper threads keep invalidating the expected value, so failed atomic attempts rise sharply."},
 };
 
 const WorkloadExpectation kBarrierExpectations[] = {
-    {"inst-barrier", "high", "The loop emits a real memory barrier every iteration, so barrier-instruction retirement should be the headline signal."},
+    {"inst-barrier", "approx", "The loop executes one real memory barrier per iteration, so 20,000,000 iterations predict about 20,000,000 retired barrier instructions.", ExpectationKind::ApproximateValue, 20'000'000.0, 0.01},
 };
 
 const WorkloadExpectation kInterruptStormExpectations[] = {

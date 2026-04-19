@@ -558,6 +558,102 @@ const demo::WorkloadExpectation *FindExpectation(const demo::WorkloadDefinition 
   return nullptr;
 }
 
+std::string ExpectationDisplay(const demo::WorkloadExpectation &expectation) {
+  switch (expectation.kind) {
+    case demo::ExpectationKind::ApproximateValue: {
+      std::string label = "≈" + FormatDouble(expectation.expected_value, 0);
+      if (expectation.tolerance_fraction > 0.0) {
+        label += " ±" + FormatDouble(expectation.tolerance_fraction * 100.0, 1) + "%";
+      }
+      return label;
+    }
+    case demo::ExpectationKind::NearZero:
+      return "<= " + FormatDouble(expectation.expected_value, 0);
+    case demo::ExpectationKind::Relative:
+    default:
+      return std::string(expectation.level);
+  }
+}
+
+std::optional<std::string> ExpectationObservedSummary(const demo::WorkloadExpectation &expectation,
+                                                      double measured) {
+  switch (expectation.kind) {
+    case demo::ExpectationKind::ApproximateValue: {
+      if (expectation.expected_value <= 0.0) {
+        return std::nullopt;
+      }
+      const double delta = measured - expectation.expected_value;
+      const double error_pct = (delta * 100.0) / expectation.expected_value;
+      std::ostringstream oss;
+      oss << "measured " << FormatDouble(measured) << "; expected "
+          << ExpectationDisplay(expectation) << "; error="
+          << (error_pct >= 0.0 ? "+" : "") << FormatDouble(error_pct, 3) << '%';
+      return oss.str();
+    }
+    case demo::ExpectationKind::NearZero: {
+      std::ostringstream oss;
+      oss << "measured " << FormatDouble(measured) << "; expected "
+          << ExpectationDisplay(expectation);
+      return oss.str();
+    }
+    case demo::ExpectationKind::Relative:
+    default:
+      return std::nullopt;
+  }
+}
+
+std::optional<std::string> ExpectationWarningReason(const demo::WorkloadExpectation &expectation,
+                                                    PerfCounter counter, double measured,
+                                                    const DemoContrast *contrast,
+                                                    std::optional<double> contrast_value) {
+  switch (expectation.kind) {
+    case demo::ExpectationKind::ApproximateValue: {
+      if (expectation.expected_value <= 0.0) {
+        return std::nullopt;
+      }
+      const double tolerance = std::abs(expectation.expected_value) * expectation.tolerance_fraction;
+      if (std::abs(measured - expectation.expected_value) <= tolerance) {
+        return std::nullopt;
+      }
+      std::ostringstream oss;
+      oss << "measured " << FormatDouble(measured) << " outside expected band "
+          << ExpectationDisplay(expectation);
+      return oss.str();
+    }
+    case demo::ExpectationKind::NearZero:
+      if (measured <= expectation.expected_value) {
+        return std::nullopt;
+      }
+      return "measured " + FormatDouble(measured) + " above expected near-zero bound " +
+             ExpectationDisplay(expectation);
+    case demo::ExpectationKind::Relative:
+    default:
+      break;
+  }
+
+  if (contrast == nullptr || contrast->workload == nullptr) {
+    if (expectation.level == "high" && measured == 0.0) {
+      return std::string("expected-high counter stayed at zero");
+    }
+    return std::nullopt;
+  }
+  if (!contrast_value.has_value()) {
+    return std::nullopt;
+  }
+  const demo::WorkloadExpectation *contrast_expectation =
+      FindExpectation(*contrast->workload, counter);
+  if (contrast_expectation == nullptr || contrast_expectation->level == expectation.level) {
+    return std::nullopt;
+  }
+  if (expectation.level == "high" && measured <= *contrast_value) {
+    return std::string("expected-high counter did not exceed the contrast workload");
+  }
+  if (expectation.level == "low" && measured >= *contrast_value) {
+    return std::string("expected-low counter did not stay below the contrast workload");
+  }
+  return std::nullopt;
+}
+
 std::optional<double> MeanIpc(const WorkloadRunSummary &summary) {
   const auto cycles = MeanCounterValue(summary, CYCLES);
   const auto instructions = MeanCounterValue(summary, INSTRUCTIONS);
@@ -803,40 +899,19 @@ void PrintExpectationWarnings(const demo::WorkloadDefinition &workload,
       continue;
     }
 
-    bool warn = false;
-    std::string reason;
-    if (contrast == nullptr || contrast->workload == nullptr) {
-      if (expectation.level == "high" && *primary == 0.0) {
-        warn = true;
-        reason = "expected-high counter stayed at zero";
-      }
-    } else {
-      const auto other = MeanCounterValue(contrast->summary, definition->counter);
-      if (!other.has_value()) {
-        continue;
-      }
-      const demo::WorkloadExpectation *contrast_expectation =
-          FindExpectation(*contrast->workload, definition->counter);
-      if (contrast_expectation == nullptr || contrast_expectation->level == expectation.level) {
-        continue;
-      }
-      if (expectation.level == "high" && *primary <= *other) {
-        warn = true;
-        reason = "expected-high counter did not exceed the contrast workload";
-      } else if (expectation.level == "low" && *primary >= *other) {
-        warn = true;
-        reason = "expected-low counter did not stay below the contrast workload";
-      }
-    }
-
-    if (!warn) {
+    const auto other = contrast != nullptr && contrast->workload != nullptr
+                           ? MeanCounterValue(contrast->summary, definition->counter)
+                           : std::nullopt;
+    const auto reason =
+        ExpectationWarningReason(expectation, definition->counter, *primary, contrast, other);
+    if (!reason.has_value()) {
       continue;
     }
     if (!printed) {
       std::cout << "- warnings:\n";
       printed = true;
     }
-    std::cout << "  - " << expectation.counter_name << ": " << reason << ".\n";
+    std::cout << "  - " << expectation.counter_name << ": " << *reason << ".\n";
   }
 }
 
@@ -922,10 +997,12 @@ void PrintWorkloadRunSummary(const WorkloadRunSummary &summary) {
 
   std::size_t label_width = std::string("counter").size();
   std::size_t value_width = std::string("mean").size();
+  std::size_t expected_width = std::string("expected").size();
   struct MeasuredRow {
     PerfCounter counter;
     double mean = 0.0;
     const demo::WorkloadExpectation *expectation = nullptr;
+    std::string expectation_display;
   };
   std::vector<MeasuredRow> measured;
   for (std::uint8_t i = 0; i < summary.measured_counters.count; ++i) {
@@ -934,22 +1011,27 @@ void PrintWorkloadRunSummary(const WorkloadRunSummary &summary) {
     if (!mean.has_value()) {
       continue;
     }
-    measured.push_back({counter, *mean, FindExpectation(*summary.workload, counter)});
+    const demo::WorkloadExpectation *expectation = FindExpectation(*summary.workload, counter);
+    const std::string expectation_display =
+        expectation != nullptr ? ExpectationDisplay(*expectation) : std::string("-");
+    measured.push_back({counter, *mean, expectation, expectation_display});
     label_width = std::max(label_width, CounterLabel(counter).size());
     value_width = std::max(value_width, FormatDouble(*mean).size());
+    expected_width = std::max(expected_width, expectation_display.size());
   }
 
   if (!measured.empty()) {
     std::cout << "  measured counters:\n";
     std::cout << "    " << std::left << std::setw(static_cast<int>(label_width)) << "counter"
               << "  " << std::right << std::setw(static_cast<int>(value_width)) << "mean"
-              << "  expected\n";
+              << "  " << std::left << std::setw(static_cast<int>(expected_width)) << "expected"
+              << '\n';
     for (const MeasuredRow &row : measured) {
       const std::string label = CounterLabel(row.counter);
       std::cout << "    " << std::left << std::setw(static_cast<int>(label_width)) << label << "  "
                 << std::right << std::setw(static_cast<int>(value_width))
-                << FormatDouble(row.mean) << "  "
-                << (row.expectation != nullptr ? row.expectation->level : "-") << '\n';
+                << FormatDouble(row.mean) << "  " << std::left
+                << std::setw(static_cast<int>(expected_width)) << row.expectation_display << '\n';
     }
 
     bool printed_notes = false;
@@ -961,7 +1043,7 @@ void PrintWorkloadRunSummary(const WorkloadRunSummary &summary) {
         std::cout << "  expectation notes:\n";
         printed_notes = true;
       }
-      std::cout << "    - " << CounterLabel(row.counter) << " (" << row.expectation->level
+      std::cout << "    - " << CounterLabel(row.counter) << " (" << row.expectation_display
                 << "): " << row.expectation->note << '\n';
     }
   }
@@ -1258,7 +1340,7 @@ int ExplainDemo(const CliOptions &options) {
   std::cout << "- default repeats: " << workload->default_repeats << '\n';
   std::cout << "- expected counters:\n";
   for (const auto &expectation : workload->expectations) {
-    std::cout << "  - " << expectation.counter_name << " -> " << expectation.level << ": "
+    std::cout << "  - " << expectation.counter_name << " -> " << ExpectationDisplay(expectation) << ": "
               << expectation.note << '\n';
   }
   if (!workload->code_snippet.empty()) {
@@ -1311,7 +1393,8 @@ int RunDemoWorkload(const demo::WorkloadDefinition &workload, demo::DemoEnvironm
   }
   std::cout << "\nExpected counter behavior:\n";
   for (const auto &expectation : workload.expectations) {
-    std::cout << "- " << expectation.counter_name << " -> " << expectation.level << ": "
+    std::cout << "- " << expectation.counter_name << " -> " << ExpectationDisplay(expectation)
+              << ": "
               << expectation.note << '\n';
   }
   std::cout << std::flush;
@@ -1408,9 +1491,16 @@ int RunDemoWorkload(const demo::WorkloadDefinition &workload, demo::DemoEnvironm
       if (!mean.has_value()) {
         continue;
       }
-      std::cout << "- " << expectation.counter_name << " measured "
-                << FormatDouble(*mean) << " and is expected to be " << expectation.level
-                << " here because " << expectation.note << '\n';
+      if (const auto observed = ExpectationObservedSummary(expectation, *mean);
+          observed.has_value()) {
+        std::cout << "- " << expectation.counter_name << ": " << *observed << ". "
+                  << expectation.note << '\n';
+      } else {
+        std::cout << "- " << expectation.counter_name << " measured "
+                  << FormatDouble(*mean) << " and is expected to be "
+                  << ExpectationDisplay(expectation) << " here because " << expectation.note
+                  << '\n';
+      }
     }
     PrintExpectationWarnings(workload, summary, nullptr);
   }

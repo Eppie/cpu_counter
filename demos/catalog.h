@@ -34,10 +34,19 @@ enum class CorePreference {
   Efficiency,
 };
 
+enum class ExpectationKind {
+  Relative,
+  ApproximateValue,
+  NearZero,
+};
+
 struct WorkloadExpectation {
   std::string_view counter_name;
   std::string_view level;
   std::string_view note;
+  ExpectationKind kind = ExpectationKind::Relative;
+  double expected_value = 0.0;
+  double tolerance_fraction = 0.0;
 };
 
 struct ValidationRule {

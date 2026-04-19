@@ -173,7 +173,7 @@ Each workload has:
 - tier
 - default repeats / warmups
 - curated measurement set
-- expected high/low counter behaviors
+- expected counter behaviors, which can be relative (`high` / `low`) or approximate count targets for the demos with stable loop-level expectations
 - normalized derived metrics printed opportunistically from the measured counter set
 
 Each counter has:
