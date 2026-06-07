@@ -78,11 +78,8 @@ struct Counter {
 };
 
 constexpr bool CStringEqual(const char *lhs, const char *rhs) {
-  if (lhs == rhs) {
-    return true;
-  }
   if (lhs == nullptr || rhs == nullptr) {
-    return false;
+    return lhs == rhs;
   }
   while (*lhs != '\0' && *rhs != '\0') {
     if (*lhs != *rhs) {
