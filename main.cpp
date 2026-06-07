@@ -1033,12 +1033,24 @@ struct AnalysisRow {
   double ipc = 0.0;
   double l1_miss_per_kinst = 0.0;
   double tlb_per_kinst = 0.0;
+  double branch_miss_per_kbranch = 0.0;
+  double l1i_miss_per_kinst = 0.0;
+  double fetch_restart_per_kinst = 0.0;
+  double uops_per_inst = 0.0;
+  double active_cycle_ratio = 0.0;
   std::optional<double> cycle_p50;
   std::optional<double> cycle_p95;
   bool has_cycles = false;
   bool has_instructions = false;
   bool has_ipc = false;
   bool has_instruction_metrics = false;
+  bool has_l1_metrics = false;
+  bool has_tlb_metrics = false;
+  bool has_branch_metrics = false;
+  bool has_l1i_metrics = false;
+  bool has_fetch_metrics = false;
+  bool has_uop_metrics = false;
+  bool has_active_cycle_metrics = false;
 };
 
 std::string ScopeAggregateKey(const JsonScopeAggregate &record) {
@@ -1083,6 +1095,14 @@ AnalysisRow BuildAnalysisRow(const JsonScopeAggregate &record) {
     row.has_ipc = true;
   }
   if (instructions != nullptr && instructions->mean > 0.0) {
+    const bool has_l1_counters =
+        FindCounterAggregate(record, {"L1D_CACHE_MISS_LD", "L1D_CACHE_MISS_ST",
+                                      "L1D_CACHE_MISS_LD_NONSPEC",
+                                      "L1D_CACHE_MISS_ST_NONSPEC"}) != nullptr;
+    const bool has_tlb_counters =
+        FindCounterAggregate(record, {"MMU_TABLE_WALK_DATA", "MMU_TABLE_WALK_INSTRUCTION",
+                                      "L2_TLB_MISS_DATA", "L2_TLB_MISS_INSTRUCTION",
+                                      "L1D_TLB_MISS", "L1I_TLB_MISS_DEMAND"}) != nullptr;
     const double l1_misses = SumCounterMeans(
         record, {"L1D_CACHE_MISS_LD", "L1D_CACHE_MISS_ST", "L1D_CACHE_MISS_LD_NONSPEC",
                  "L1D_CACHE_MISS_ST_NONSPEC"});
@@ -1091,7 +1111,40 @@ AnalysisRow BuildAnalysisRow(const JsonScopeAggregate &record) {
                  "L2_TLB_MISS_INSTRUCTION", "L1D_TLB_MISS", "L1I_TLB_MISS_DEMAND"});
     row.l1_miss_per_kinst = (l1_misses * 1000.0) / instructions->mean;
     row.tlb_per_kinst = (tlb_pressure * 1000.0) / instructions->mean;
-    row.has_instruction_metrics = true;
+    row.has_l1_metrics = has_l1_counters;
+    row.has_tlb_metrics = has_tlb_counters;
+    row.has_instruction_metrics = has_l1_counters || has_tlb_counters;
+
+    if (const JsonCounterAggregate *l1i =
+            FindCounterAggregate(record, {"L1I_CACHE_MISS_DEMAND", "L1I_CACHE_MISS"})) {
+      row.l1i_miss_per_kinst = (l1i->mean * 1000.0) / instructions->mean;
+      row.has_l1i_metrics = true;
+    }
+    if (const JsonCounterAggregate *fetch_restart =
+            FindCounterAggregate(record, {"FETCH_RESTART"})) {
+      row.fetch_restart_per_kinst = (fetch_restart->mean * 1000.0) / instructions->mean;
+      row.has_fetch_metrics = true;
+    }
+    if (const JsonCounterAggregate *retire_uop = FindCounterAggregate(record, {"RETIRE_UOP"})) {
+      row.uops_per_inst = retire_uop->mean / instructions->mean;
+      row.has_uop_metrics = true;
+    }
+  }
+
+  if (const JsonCounterAggregate *branches = FindCounterAggregate(record, {"INST_BRANCH"});
+      branches != nullptr && branches->mean > 0.0) {
+    if (const JsonCounterAggregate *branch_miss =
+            FindCounterAggregate(record, {"BRANCH_MISPRED_NONSPEC"})) {
+      row.branch_miss_per_kbranch = (branch_miss->mean * 1000.0) / branches->mean;
+      row.has_branch_metrics = true;
+    }
+  }
+  if (cycles != nullptr && cycles->mean > 0.0) {
+    if (const JsonCounterAggregate *active_cycles =
+            FindCounterAggregate(record, {"CORE_ACTIVE_CYCLE"})) {
+      row.active_cycle_ratio = active_cycles->mean / cycles->mean;
+      row.has_active_cycle_metrics = true;
+    }
   }
   return row;
 }
@@ -2144,8 +2197,25 @@ int Summary(const CliOptions &options) {
   std::size_t ipc_width = std::string("IPC").size();
   std::size_t l1_width = std::string("L1miss/Kins").size();
   std::size_t tlb_width = std::string("TLB/Kins").size();
+  std::size_t branch_width = std::string("BrMiss/KBr").size();
+  std::size_t l1i_width = std::string("L1I/Kins").size();
+  std::size_t fetch_width = std::string("FetchR/Kins").size();
+  std::size_t uop_width = std::string("uOP/inst").size();
+  std::size_t active_width = std::string("active/cyc").size();
   std::size_t p95_width = std::string("p95cyc").size();
   std::size_t dropped_width = std::string("dropped").size();
+  bool show_branch = false;
+  bool show_l1i = false;
+  bool show_fetch = false;
+  bool show_uop = false;
+  bool show_active = false;
+  for (const AnalysisRow &row : rows) {
+    show_branch = show_branch || row.has_branch_metrics;
+    show_l1i = show_l1i || row.has_l1i_metrics;
+    show_fetch = show_fetch || row.has_fetch_metrics;
+    show_uop = show_uop || row.has_uop_metrics;
+    show_active = show_active || row.has_active_cycle_metrics;
+  }
 
   struct PrintableRow {
     std::string scope;
@@ -2154,6 +2224,11 @@ int Summary(const CliOptions &options) {
     std::string ipc;
     std::string l1;
     std::string tlb;
+    std::string branch;
+    std::string l1i;
+    std::string fetch;
+    std::string uop;
+    std::string active;
     std::string p95;
     std::string dropped;
   };
@@ -2165,8 +2240,13 @@ int Summary(const CliOptions &options) {
         FormatInteger(row.calls),
         FormatMaybeDouble(row.cycles_per_call, row.has_cycles, 0),
         FormatMaybeDouble(row.ipc, row.has_ipc, 3),
-        FormatMaybeDouble(row.l1_miss_per_kinst, row.has_instruction_metrics, 3),
-        FormatMaybeDouble(row.tlb_per_kinst, row.has_instruction_metrics, 3),
+        FormatMaybeDouble(row.l1_miss_per_kinst, row.has_l1_metrics, 3),
+        FormatMaybeDouble(row.tlb_per_kinst, row.has_tlb_metrics, 3),
+        FormatMaybeDouble(row.branch_miss_per_kbranch, row.has_branch_metrics, 3),
+        FormatMaybeDouble(row.l1i_miss_per_kinst, row.has_l1i_metrics, 3),
+        FormatMaybeDouble(row.fetch_restart_per_kinst, row.has_fetch_metrics, 3),
+        FormatMaybeDouble(row.uops_per_inst, row.has_uop_metrics, 3),
+        FormatMaybeDouble(row.active_cycle_ratio, row.has_active_cycle_metrics, 3),
         FormatOptionalDouble(row.cycle_p95, 0),
         FormatInteger(row.dropped),
     };
@@ -2176,10 +2256,21 @@ int Summary(const CliOptions &options) {
     ipc_width = std::max(ipc_width, out.ipc.size());
     l1_width = std::max(l1_width, out.l1.size());
     tlb_width = std::max(tlb_width, out.tlb.size());
+    branch_width = std::max(branch_width, out.branch.size());
+    l1i_width = std::max(l1i_width, out.l1i.size());
+    fetch_width = std::max(fetch_width, out.fetch.size());
+    uop_width = std::max(uop_width, out.uop.size());
+    active_width = std::max(active_width, out.active.size());
     p95_width = std::max(p95_width, out.p95.size());
     dropped_width = std::max(dropped_width, out.dropped.size());
     printable.push_back(std::move(out));
   }
+
+  const auto right_cell = [](const std::string &value, std::size_t width) {
+    std::ostringstream oss;
+    oss << std::right << std::setw(static_cast<int>(width)) << value << "  ";
+    return oss.str();
+  };
 
   std::cout << "Summary: " << options.target << '\n';
   std::cout << std::left << std::setw(static_cast<int>(scope_width)) << "scope" << "  "
@@ -2188,6 +2279,11 @@ int Summary(const CliOptions &options) {
             << std::right << std::setw(static_cast<int>(ipc_width)) << "IPC" << "  "
             << std::right << std::setw(static_cast<int>(l1_width)) << "L1miss/Kins" << "  "
             << std::right << std::setw(static_cast<int>(tlb_width)) << "TLB/Kins" << "  "
+            << (show_branch ? right_cell("BrMiss/KBr", branch_width) : "")
+            << (show_l1i ? right_cell("L1I/Kins", l1i_width) : "")
+            << (show_fetch ? right_cell("FetchR/Kins", fetch_width) : "")
+            << (show_uop ? right_cell("uOP/inst", uop_width) : "")
+            << (show_active ? right_cell("active/cyc", active_width) : "")
             << std::right << std::setw(static_cast<int>(p95_width)) << "p95cyc" << "  "
             << std::right << std::setw(static_cast<int>(dropped_width)) << "dropped" << '\n';
   for (const PrintableRow &row : printable) {
@@ -2197,6 +2293,11 @@ int Summary(const CliOptions &options) {
               << std::right << std::setw(static_cast<int>(ipc_width)) << row.ipc << "  "
               << std::right << std::setw(static_cast<int>(l1_width)) << row.l1 << "  "
               << std::right << std::setw(static_cast<int>(tlb_width)) << row.tlb << "  "
+              << (show_branch ? right_cell(row.branch, branch_width) : "")
+              << (show_l1i ? right_cell(row.l1i, l1i_width) : "")
+              << (show_fetch ? right_cell(row.fetch, fetch_width) : "")
+              << (show_uop ? right_cell(row.uop, uop_width) : "")
+              << (show_active ? right_cell(row.active, active_width) : "")
               << std::right << std::setw(static_cast<int>(p95_width)) << row.p95 << "  "
               << std::right << std::setw(static_cast<int>(dropped_width)) << row.dropped << '\n';
   }
@@ -2316,7 +2417,7 @@ int Diff(const CliOptions &options) {
         row.baseline.has_ipc && row.candidate.has_ipc
             ? FormatSignedPercent(row.candidate.ipc, row.baseline.ipc)
             : std::string("-"),
-        row.baseline.has_instruction_metrics && row.candidate.has_instruction_metrics &&
+        row.baseline.has_l1_metrics && row.candidate.has_l1_metrics &&
                 row.baseline.l1_miss_per_kinst > 0.0
             ? FormatSignedPercent(row.candidate.l1_miss_per_kinst, row.baseline.l1_miss_per_kinst)
             : std::string("-"),
