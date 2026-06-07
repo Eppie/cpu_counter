@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -13,6 +14,8 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -26,6 +29,8 @@ enum class CommandKind {
   RunCounter,
   RunDemo,
   RunDemos,
+  Summary,
+  Diff,
   Validate,
 };
 
@@ -38,6 +43,7 @@ enum class TierFilter {
 struct CliOptions {
   CommandKind command = CommandKind::Help;
   std::string target;
+  std::string secondary_target;
   TierFilter tier_filter = TierFilter::All;
   std::optional<demo::Group> group_filter;
   std::optional<std::size_t> repeat_override;
@@ -153,6 +159,8 @@ void PrintUsage() {
   std::cout << "  cpu_counter run counter <name> [--repeat N] [--warmup N] [--prefer-pcore|--prefer-ecore|--prefer-cpu N] [--require-stable-cpu] [--require-active-pmu]\n";
   std::cout << "  cpu_counter run demo <id> [--repeat N] [--warmup N] [--prefer-pcore|--prefer-ecore|--prefer-cpu N] [--require-stable-cpu] [--require-active-pmu]\n";
   std::cout << "  cpu_counter run demos [--tier stable|experimental|all] [--group <group>] [--repeat N] [--warmup N] [--prefer-pcore|--prefer-ecore|--prefer-cpu N] [--require-stable-cpu] [--require-active-pmu]\n";
+  std::cout << "  cpu_counter summary <perf.jsonl>\n";
+  std::cout << "  cpu_counter diff <baseline.jsonl> <candidate.jsonl>\n";
   std::cout << "  cpu_counter validate [--group <group>] [--prefer-pcore|--prefer-ecore|--prefer-cpu N] [--require-stable-cpu] [--require-active-pmu]\n\n";
   std::cout << "Groups:\n";
   for (demo::Group group : {
@@ -388,6 +396,27 @@ bool ParseArgs(int argc, char **argv, CliOptions &options, std::string &error) {
     return ParseFlags(argc, argv, 2, options, error);
   }
 
+  if (arg1 == "summary") {
+    if (argc < 3) {
+      error = "summary requires a JSONL path";
+      return false;
+    }
+    options.command = CommandKind::Summary;
+    options.target = argv[2];
+    return ParseFlags(argc, argv, 3, options, error);
+  }
+
+  if (arg1 == "diff") {
+    if (argc < 4) {
+      error = "diff requires baseline and candidate JSONL paths";
+      return false;
+    }
+    options.command = CommandKind::Diff;
+    options.target = argv[2];
+    options.secondary_target = argv[3];
+    return ParseFlags(argc, argv, 4, options, error);
+  }
+
   if (arg1 == "help" || arg1 == "--help" || arg1 == "-h") {
     options.command = CommandKind::Help;
     return true;
@@ -509,6 +538,595 @@ std::string FormatWallNs(double ns) {
     oss << " (" << FormatDouble(ns / 1'000.0, 3) << " us)";
   }
   return oss.str();
+}
+
+struct JsonValue {
+  enum class Type {
+    Null,
+    Bool,
+    Number,
+    String,
+    Object,
+    Array,
+  };
+
+  Type type = Type::Null;
+  bool bool_value = false;
+  std::string number_text;
+  std::string string_value;
+  std::vector<std::pair<std::string, JsonValue>> object_value;
+  std::vector<JsonValue> array_value;
+};
+
+class JsonParser {
+ public:
+  explicit JsonParser(std::string_view text) : text_(text) {}
+
+  std::optional<JsonValue> Parse(std::string &error) {
+    SkipWhitespace();
+    auto value = ParseValue(error);
+    if (!value.has_value()) {
+      return std::nullopt;
+    }
+    SkipWhitespace();
+    if (pos_ != text_.size()) {
+      error = "trailing characters after JSON value";
+      return std::nullopt;
+    }
+    return value;
+  }
+
+ private:
+  std::string_view text_;
+  std::size_t pos_ = 0;
+
+  void SkipWhitespace() {
+    while (pos_ < text_.size()) {
+      const char c = text_[pos_];
+      if (c != ' ' && c != '\t' && c != '\r' && c != '\n') {
+        break;
+      }
+      ++pos_;
+    }
+  }
+
+  bool Consume(char expected) {
+    SkipWhitespace();
+    if (pos_ >= text_.size() || text_[pos_] != expected) {
+      return false;
+    }
+    ++pos_;
+    return true;
+  }
+
+  bool ConsumeLiteral(std::string_view literal) {
+    SkipWhitespace();
+    if (text_.substr(pos_, literal.size()) != literal) {
+      return false;
+    }
+    pos_ += literal.size();
+    return true;
+  }
+
+  std::optional<JsonValue> ParseValue(std::string &error) {
+    SkipWhitespace();
+    if (pos_ >= text_.size()) {
+      error = "unexpected end of JSON";
+      return std::nullopt;
+    }
+
+    const char c = text_[pos_];
+    if (c == '"') {
+      JsonValue value;
+      value.type = JsonValue::Type::String;
+      auto parsed = ParseString(error);
+      if (!parsed.has_value()) {
+        return std::nullopt;
+      }
+      value.string_value = std::move(*parsed);
+      return value;
+    }
+    if (c == '{') {
+      return ParseObject(error);
+    }
+    if (c == '[') {
+      return ParseArray(error);
+    }
+    if (c == '-' || (c >= '0' && c <= '9')) {
+      return ParseNumber(error);
+    }
+    if (ConsumeLiteral("true")) {
+      JsonValue value;
+      value.type = JsonValue::Type::Bool;
+      value.bool_value = true;
+      return value;
+    }
+    if (ConsumeLiteral("false")) {
+      JsonValue value;
+      value.type = JsonValue::Type::Bool;
+      value.bool_value = false;
+      return value;
+    }
+    if (ConsumeLiteral("null")) {
+      return JsonValue{};
+    }
+
+    error = "unexpected JSON token";
+    return std::nullopt;
+  }
+
+  std::optional<std::string> ParseString(std::string &error) {
+    if (!Consume('"')) {
+      error = "expected JSON string";
+      return std::nullopt;
+    }
+    std::string out;
+    while (pos_ < text_.size()) {
+      const char c = text_[pos_++];
+      if (c == '"') {
+        return out;
+      }
+      if (c != '\\') {
+        out.push_back(c);
+        continue;
+      }
+      if (pos_ >= text_.size()) {
+        error = "unterminated JSON escape";
+        return std::nullopt;
+      }
+      const char escaped = text_[pos_++];
+      switch (escaped) {
+        case '"':
+        case '\\':
+        case '/':
+          out.push_back(escaped);
+          break;
+        case 'b':
+          out.push_back('\b');
+          break;
+        case 'f':
+          out.push_back('\f');
+          break;
+        case 'n':
+          out.push_back('\n');
+          break;
+        case 'r':
+          out.push_back('\r');
+          break;
+        case 't':
+          out.push_back('\t');
+          break;
+        case 'u':
+          if (pos_ + 4 > text_.size()) {
+            error = "truncated JSON unicode escape";
+            return std::nullopt;
+          }
+          out.push_back('?');
+          pos_ += 4;
+          break;
+        default:
+          error = "unknown JSON escape";
+          return std::nullopt;
+      }
+    }
+    error = "unterminated JSON string";
+    return std::nullopt;
+  }
+
+  std::optional<JsonValue> ParseNumber(std::string &error) {
+    const std::size_t start = pos_;
+    if (text_[pos_] == '-') {
+      ++pos_;
+    }
+    if (pos_ >= text_.size()) {
+      error = "invalid JSON number";
+      return std::nullopt;
+    }
+    if (text_[pos_] == '0') {
+      ++pos_;
+    } else if (text_[pos_] >= '1' && text_[pos_] <= '9') {
+      while (pos_ < text_.size() && text_[pos_] >= '0' && text_[pos_] <= '9') {
+        ++pos_;
+      }
+    } else {
+      error = "invalid JSON number";
+      return std::nullopt;
+    }
+    if (pos_ < text_.size() && text_[pos_] == '.') {
+      ++pos_;
+      if (pos_ >= text_.size() || text_[pos_] < '0' || text_[pos_] > '9') {
+        error = "invalid JSON number fraction";
+        return std::nullopt;
+      }
+      while (pos_ < text_.size() && text_[pos_] >= '0' && text_[pos_] <= '9') {
+        ++pos_;
+      }
+    }
+    if (pos_ < text_.size() && (text_[pos_] == 'e' || text_[pos_] == 'E')) {
+      ++pos_;
+      if (pos_ < text_.size() && (text_[pos_] == '+' || text_[pos_] == '-')) {
+        ++pos_;
+      }
+      if (pos_ >= text_.size() || text_[pos_] < '0' || text_[pos_] > '9') {
+        error = "invalid JSON number exponent";
+        return std::nullopt;
+      }
+      while (pos_ < text_.size() && text_[pos_] >= '0' && text_[pos_] <= '9') {
+        ++pos_;
+      }
+    }
+
+    JsonValue value;
+    value.type = JsonValue::Type::Number;
+    value.number_text = std::string(text_.substr(start, pos_ - start));
+    return value;
+  }
+
+  std::optional<JsonValue> ParseObject(std::string &error) {
+    if (!Consume('{')) {
+      error = "expected JSON object";
+      return std::nullopt;
+    }
+    JsonValue value;
+    value.type = JsonValue::Type::Object;
+    SkipWhitespace();
+    if (Consume('}')) {
+      return value;
+    }
+    while (true) {
+      auto key = ParseString(error);
+      if (!key.has_value()) {
+        return std::nullopt;
+      }
+      if (!Consume(':')) {
+        error = "expected ':' after JSON object key";
+        return std::nullopt;
+      }
+      auto child = ParseValue(error);
+      if (!child.has_value()) {
+        return std::nullopt;
+      }
+      value.object_value.push_back({std::move(*key), std::move(*child)});
+      if (Consume('}')) {
+        return value;
+      }
+      if (!Consume(',')) {
+        error = "expected ',' in JSON object";
+        return std::nullopt;
+      }
+    }
+  }
+
+  std::optional<JsonValue> ParseArray(std::string &error) {
+    if (!Consume('[')) {
+      error = "expected JSON array";
+      return std::nullopt;
+    }
+    JsonValue value;
+    value.type = JsonValue::Type::Array;
+    SkipWhitespace();
+    if (Consume(']')) {
+      return value;
+    }
+    while (true) {
+      auto child = ParseValue(error);
+      if (!child.has_value()) {
+        return std::nullopt;
+      }
+      value.array_value.push_back(std::move(*child));
+      if (Consume(']')) {
+        return value;
+      }
+      if (!Consume(',')) {
+        error = "expected ',' in JSON array";
+        return std::nullopt;
+      }
+    }
+  }
+};
+
+const JsonValue *JsonFind(const JsonValue &object, std::string_view key) {
+  if (object.type != JsonValue::Type::Object) {
+    return nullptr;
+  }
+  for (const auto &entry : object.object_value) {
+    if (entry.first == key) {
+      return &entry.second;
+    }
+  }
+  return nullptr;
+}
+
+std::optional<std::string> JsonString(const JsonValue &object, std::string_view key) {
+  const JsonValue *value = JsonFind(object, key);
+  if (value == nullptr || value->type != JsonValue::Type::String) {
+    return std::nullopt;
+  }
+  return value->string_value;
+}
+
+std::optional<double> JsonDouble(const JsonValue &object, std::string_view key) {
+  const JsonValue *value = JsonFind(object, key);
+  if (value == nullptr || value->type != JsonValue::Type::Number) {
+    return std::nullopt;
+  }
+  try {
+    return std::stod(value->number_text);
+  } catch (...) {
+    return std::nullopt;
+  }
+}
+
+std::optional<std::uint64_t> JsonUInt(const JsonValue &object, std::string_view key) {
+  const JsonValue *value = JsonFind(object, key);
+  if (value == nullptr || value->type != JsonValue::Type::Number) {
+    return std::nullopt;
+  }
+  try {
+    return static_cast<std::uint64_t>(std::stoull(value->number_text));
+  } catch (...) {
+    return std::nullopt;
+  }
+}
+
+struct JsonCounterAggregate {
+  std::string name;
+  std::string id;
+  double total = 0.0;
+  double min = 0.0;
+  double max = 0.0;
+  double mean = 0.0;
+  std::optional<double> p50;
+  std::optional<double> p95;
+  std::optional<double> p99;
+};
+
+struct JsonScopeAggregate {
+  std::string label;
+  std::uint64_t sample_every = 1;
+  std::uint64_t sampled_count = 0;
+  std::uint64_t estimated_count = 0;
+  std::uint64_t dropped_count = 0;
+  double wall_total_ns = 0.0;
+  double wall_mean_ns = 0.0;
+  std::optional<double> wall_p50_ns;
+  std::optional<double> wall_p95_ns;
+  std::optional<double> wall_p99_ns;
+  std::vector<JsonCounterAggregate> counters;
+};
+
+bool ParseScopeAggregateLine(std::string_view line, std::size_t line_number,
+                             JsonScopeAggregate &record, std::string &error) {
+  JsonParser parser(line);
+  auto parsed = parser.Parse(error);
+  if (!parsed.has_value()) {
+    error = "line " + std::to_string(line_number) + ": " + error;
+    return false;
+  }
+  if (parsed->type != JsonValue::Type::Object) {
+    error = "line " + std::to_string(line_number) + ": expected JSON object";
+    return false;
+  }
+  if (const auto type = JsonString(*parsed, "type");
+      type.has_value() && *type != "scope_aggregate") {
+    return true;
+  }
+
+  const auto label = JsonString(*parsed, "label");
+  if (!label.has_value()) {
+    error = "line " + std::to_string(line_number) + ": missing label";
+    return false;
+  }
+  record = {};
+  record.label = *label;
+  record.sample_every = JsonUInt(*parsed, "sample_every").value_or(1);
+  record.sampled_count = JsonUInt(*parsed, "sampled_count").value_or(0);
+  record.estimated_count = JsonUInt(*parsed, "estimated_count")
+                                .value_or(record.sampled_count * record.sample_every);
+  record.dropped_count = JsonUInt(*parsed, "dropped_count").value_or(0);
+
+  if (const JsonValue *wall = JsonFind(*parsed, "wall_ns")) {
+    record.wall_total_ns = JsonDouble(*wall, "total").value_or(0.0);
+    record.wall_mean_ns = JsonDouble(*wall, "mean").value_or(0.0);
+    record.wall_p50_ns = JsonDouble(*wall, "p50");
+    record.wall_p95_ns = JsonDouble(*wall, "p95");
+    record.wall_p99_ns = JsonDouble(*wall, "p99");
+  }
+
+  const JsonValue *counters = JsonFind(*parsed, "counters");
+  if (counters == nullptr || counters->type != JsonValue::Type::Array) {
+    return true;
+  }
+  for (const JsonValue &counter_value : counters->array_value) {
+    if (counter_value.type != JsonValue::Type::Object) {
+      continue;
+    }
+    JsonCounterAggregate counter;
+    counter.name = JsonString(counter_value, "name").value_or("");
+    counter.id = JsonString(counter_value, "id").value_or(counter.name);
+    counter.total = JsonDouble(counter_value, "total").value_or(0.0);
+    counter.min = JsonDouble(counter_value, "min").value_or(0.0);
+    counter.max = JsonDouble(counter_value, "max").value_or(0.0);
+    counter.mean = JsonDouble(counter_value, "mean").value_or(
+        record.sampled_count != 0 ? counter.total / static_cast<double>(record.sampled_count)
+                                  : 0.0);
+    counter.p50 = JsonDouble(counter_value, "p50");
+    counter.p95 = JsonDouble(counter_value, "p95");
+    counter.p99 = JsonDouble(counter_value, "p99");
+    record.counters.push_back(std::move(counter));
+  }
+  return true;
+}
+
+bool LoadScopeAggregates(const std::string &path, std::vector<JsonScopeAggregate> &records,
+                         std::string &error) {
+  std::ifstream file(path);
+  if (!file) {
+    error = "failed to open " + path;
+    return false;
+  }
+
+  records.clear();
+  std::string line;
+  std::size_t line_number = 0;
+  while (std::getline(file, line)) {
+    ++line_number;
+    if (line.find_first_not_of(" \t\r\n") == std::string::npos) {
+      continue;
+    }
+    JsonScopeAggregate record;
+    if (!ParseScopeAggregateLine(line, line_number, record, error)) {
+      return false;
+    }
+    if (!record.label.empty()) {
+      records.push_back(std::move(record));
+    }
+  }
+  return true;
+}
+
+bool EndsWith(std::string_view text, std::string_view suffix) {
+  return text.size() >= suffix.size() &&
+         text.substr(text.size() - suffix.size(), suffix.size()) == suffix;
+}
+
+bool CounterMatches(const JsonCounterAggregate &counter, std::string_view key) {
+  if (counter.name == key || counter.id == key) {
+    return true;
+  }
+  const std::string suffix = ":" + std::string(key);
+  return EndsWith(counter.id, suffix);
+}
+
+const JsonCounterAggregate *FindCounterAggregate(
+    const JsonScopeAggregate &record, std::initializer_list<std::string_view> keys) {
+  for (const std::string_view key : keys) {
+    for (const JsonCounterAggregate &counter : record.counters) {
+      if (CounterMatches(counter, key)) {
+        return &counter;
+      }
+    }
+  }
+  return nullptr;
+}
+
+double SumCounterMeans(const JsonScopeAggregate &record,
+                       std::initializer_list<std::string_view> keys) {
+  double total = 0.0;
+  for (const std::string_view key : keys) {
+    if (const JsonCounterAggregate *counter = FindCounterAggregate(record, {key})) {
+      total += counter->mean;
+    }
+  }
+  return total;
+}
+
+struct AnalysisRow {
+  std::string key;
+  std::string label;
+  std::uint64_t calls = 0;
+  std::uint64_t samples = 0;
+  std::uint64_t dropped = 0;
+  double wall_ns_per_call = 0.0;
+  double cycles_per_call = 0.0;
+  double estimated_cycles = 0.0;
+  double ipc = 0.0;
+  double l1_miss_per_kinst = 0.0;
+  double tlb_per_kinst = 0.0;
+  std::optional<double> cycle_p50;
+  std::optional<double> cycle_p95;
+  bool has_cycles = false;
+  bool has_instructions = false;
+  bool has_ipc = false;
+  bool has_instruction_metrics = false;
+};
+
+std::string ScopeAggregateKey(const JsonScopeAggregate &record) {
+  std::vector<std::string> counter_ids;
+  counter_ids.reserve(record.counters.size());
+  for (const JsonCounterAggregate &counter : record.counters) {
+    counter_ids.push_back(counter.id.empty() ? counter.name : counter.id);
+  }
+  std::sort(counter_ids.begin(), counter_ids.end());
+  std::ostringstream oss;
+  oss << record.label << "::sample_every=" << record.sample_every << "::";
+  for (std::size_t i = 0; i < counter_ids.size(); ++i) {
+    if (i != 0) {
+      oss << '|';
+    }
+    oss << counter_ids[i];
+  }
+  return oss.str();
+}
+
+AnalysisRow BuildAnalysisRow(const JsonScopeAggregate &record) {
+  AnalysisRow row;
+  row.key = ScopeAggregateKey(record);
+  row.label = record.label;
+  row.calls = record.estimated_count != 0 ? record.estimated_count : record.sampled_count;
+  row.samples = record.sampled_count;
+  row.dropped = record.dropped_count;
+  row.wall_ns_per_call = record.wall_mean_ns;
+
+  const JsonCounterAggregate *cycles = FindCounterAggregate(record, {"FIXED_CYCLES"});
+  const JsonCounterAggregate *instructions = FindCounterAggregate(record, {"FIXED_INSTRUCTIONS"});
+  row.has_cycles = cycles != nullptr;
+  row.has_instructions = instructions != nullptr;
+  if (cycles != nullptr) {
+    row.cycles_per_call = cycles->mean;
+    row.estimated_cycles = cycles->mean * static_cast<double>(std::max<std::uint64_t>(1, row.calls));
+    row.cycle_p50 = cycles->p50;
+    row.cycle_p95 = cycles->p95;
+  }
+  if (cycles != nullptr && instructions != nullptr && cycles->mean > 0.0) {
+    row.ipc = instructions->mean / cycles->mean;
+    row.has_ipc = true;
+  }
+  if (instructions != nullptr && instructions->mean > 0.0) {
+    const double l1_misses = SumCounterMeans(
+        record, {"L1D_CACHE_MISS_LD", "L1D_CACHE_MISS_ST", "L1D_CACHE_MISS_LD_NONSPEC",
+                 "L1D_CACHE_MISS_ST_NONSPEC"});
+    const double tlb_pressure = SumCounterMeans(
+        record, {"MMU_TABLE_WALK_DATA", "MMU_TABLE_WALK_INSTRUCTION", "L2_TLB_MISS_DATA",
+                 "L2_TLB_MISS_INSTRUCTION", "L1D_TLB_MISS", "L1I_TLB_MISS_DEMAND"});
+    row.l1_miss_per_kinst = (l1_misses * 1000.0) / instructions->mean;
+    row.tlb_per_kinst = (tlb_pressure * 1000.0) / instructions->mean;
+    row.has_instruction_metrics = true;
+  }
+  return row;
+}
+
+std::vector<AnalysisRow> BuildAnalysisRows(const std::vector<JsonScopeAggregate> &records) {
+  std::vector<AnalysisRow> rows;
+  rows.reserve(records.size());
+  for (const JsonScopeAggregate &record : records) {
+    rows.push_back(BuildAnalysisRow(record));
+  }
+  std::sort(rows.begin(), rows.end(), [](const AnalysisRow &lhs, const AnalysisRow &rhs) {
+    const double lhs_hotness = lhs.has_cycles ? lhs.estimated_cycles : lhs.wall_ns_per_call * lhs.calls;
+    const double rhs_hotness = rhs.has_cycles ? rhs.estimated_cycles : rhs.wall_ns_per_call * rhs.calls;
+    return lhs_hotness > rhs_hotness;
+  });
+  return rows;
+}
+
+std::string FormatOptionalDouble(std::optional<double> value, int precision = 2) {
+  if (!value.has_value()) {
+    return "-";
+  }
+  return FormatDouble(*value, precision);
+}
+
+std::string FormatMaybeDouble(double value, bool present, int precision = 2) {
+  return present ? FormatDouble(value, precision) : std::string("-");
+}
+
+std::string FormatSignedPercent(double candidate, double baseline) {
+  if (baseline == 0.0) {
+    return candidate == 0.0 ? std::string("+0.00%") : std::string("inf");
+  }
+  const double pct = ((candidate - baseline) * 100.0) / baseline;
+  return std::string(pct >= 0.0 ? "+" : "") + FormatDouble(pct, 2) + "%";
 }
 
 double Ratio(double numerator, double denominator) {
@@ -1507,6 +2125,234 @@ int RunDemoWorkload(const demo::WorkloadDefinition &workload, demo::DemoEnvironm
   return 0;
 }
 
+int Summary(const CliOptions &options) {
+  std::vector<JsonScopeAggregate> records;
+  std::string error;
+  if (!LoadScopeAggregates(options.target, records, error)) {
+    std::cerr << error << '\n';
+    return 1;
+  }
+  if (records.empty()) {
+    std::cerr << "no scope aggregate records found in " << options.target << '\n';
+    return 1;
+  }
+
+  const std::vector<AnalysisRow> rows = BuildAnalysisRows(records);
+  std::size_t scope_width = std::string("scope").size();
+  std::size_t calls_width = std::string("calls").size();
+  std::size_t cycles_width = std::string("cyc/call").size();
+  std::size_t ipc_width = std::string("IPC").size();
+  std::size_t l1_width = std::string("L1miss/Kins").size();
+  std::size_t tlb_width = std::string("TLB/Kins").size();
+  std::size_t p95_width = std::string("p95cyc").size();
+  std::size_t dropped_width = std::string("dropped").size();
+
+  struct PrintableRow {
+    std::string scope;
+    std::string calls;
+    std::string cycles;
+    std::string ipc;
+    std::string l1;
+    std::string tlb;
+    std::string p95;
+    std::string dropped;
+  };
+  std::vector<PrintableRow> printable;
+  printable.reserve(rows.size());
+  for (const AnalysisRow &row : rows) {
+    PrintableRow out{
+        row.label,
+        FormatInteger(row.calls),
+        FormatMaybeDouble(row.cycles_per_call, row.has_cycles, 0),
+        FormatMaybeDouble(row.ipc, row.has_ipc, 3),
+        FormatMaybeDouble(row.l1_miss_per_kinst, row.has_instruction_metrics, 3),
+        FormatMaybeDouble(row.tlb_per_kinst, row.has_instruction_metrics, 3),
+        FormatOptionalDouble(row.cycle_p95, 0),
+        FormatInteger(row.dropped),
+    };
+    scope_width = std::max(scope_width, out.scope.size());
+    calls_width = std::max(calls_width, out.calls.size());
+    cycles_width = std::max(cycles_width, out.cycles.size());
+    ipc_width = std::max(ipc_width, out.ipc.size());
+    l1_width = std::max(l1_width, out.l1.size());
+    tlb_width = std::max(tlb_width, out.tlb.size());
+    p95_width = std::max(p95_width, out.p95.size());
+    dropped_width = std::max(dropped_width, out.dropped.size());
+    printable.push_back(std::move(out));
+  }
+
+  std::cout << "Summary: " << options.target << '\n';
+  std::cout << std::left << std::setw(static_cast<int>(scope_width)) << "scope" << "  "
+            << std::right << std::setw(static_cast<int>(calls_width)) << "calls" << "  "
+            << std::right << std::setw(static_cast<int>(cycles_width)) << "cyc/call" << "  "
+            << std::right << std::setw(static_cast<int>(ipc_width)) << "IPC" << "  "
+            << std::right << std::setw(static_cast<int>(l1_width)) << "L1miss/Kins" << "  "
+            << std::right << std::setw(static_cast<int>(tlb_width)) << "TLB/Kins" << "  "
+            << std::right << std::setw(static_cast<int>(p95_width)) << "p95cyc" << "  "
+            << std::right << std::setw(static_cast<int>(dropped_width)) << "dropped" << '\n';
+  for (const PrintableRow &row : printable) {
+    std::cout << std::left << std::setw(static_cast<int>(scope_width)) << row.scope << "  "
+              << std::right << std::setw(static_cast<int>(calls_width)) << row.calls << "  "
+              << std::right << std::setw(static_cast<int>(cycles_width)) << row.cycles << "  "
+              << std::right << std::setw(static_cast<int>(ipc_width)) << row.ipc << "  "
+              << std::right << std::setw(static_cast<int>(l1_width)) << row.l1 << "  "
+              << std::right << std::setw(static_cast<int>(tlb_width)) << row.tlb << "  "
+              << std::right << std::setw(static_cast<int>(p95_width)) << row.p95 << "  "
+              << std::right << std::setw(static_cast<int>(dropped_width)) << row.dropped << '\n';
+  }
+  return 0;
+}
+
+std::string DiffVerdict(const AnalysisRow &baseline, const AnalysisRow &candidate) {
+  if (!baseline.has_cycles || !candidate.has_cycles || baseline.cycles_per_call <= 0.0) {
+    return "no-cycle-data";
+  }
+  const double pct =
+      ((candidate.cycles_per_call - baseline.cycles_per_call) * 100.0) / baseline.cycles_per_call;
+  if (std::abs(pct) < 2.0) {
+    return "no-change";
+  }
+  const bool aggregate_improved = pct < 0.0;
+  if (baseline.cycle_p50.has_value() && candidate.cycle_p50.has_value() &&
+      baseline.cycle_p95.has_value() && candidate.cycle_p95.has_value()) {
+    const bool median_same_direction =
+        aggregate_improved ? *candidate.cycle_p50 < *baseline.cycle_p50
+                           : *candidate.cycle_p50 > *baseline.cycle_p50;
+    const bool tail_same_direction =
+        aggregate_improved ? *candidate.cycle_p95 < *baseline.cycle_p95
+                           : *candidate.cycle_p95 > *baseline.cycle_p95;
+    if (median_same_direction && tail_same_direction) {
+      return aggregate_improved ? "improved-dist" : "regressed-dist";
+    }
+  }
+  return aggregate_improved ? "improved-agg" : "regressed-agg";
+}
+
+int Diff(const CliOptions &options) {
+  std::vector<JsonScopeAggregate> baseline_records;
+  std::vector<JsonScopeAggregate> candidate_records;
+  std::string error;
+  if (!LoadScopeAggregates(options.target, baseline_records, error)) {
+    std::cerr << error << '\n';
+    return 1;
+  }
+  if (!LoadScopeAggregates(options.secondary_target, candidate_records, error)) {
+    std::cerr << error << '\n';
+    return 1;
+  }
+
+  const std::vector<AnalysisRow> baseline_rows = BuildAnalysisRows(baseline_records);
+  const std::vector<AnalysisRow> candidate_rows = BuildAnalysisRows(candidate_records);
+  std::unordered_map<std::string, AnalysisRow> baseline_by_key;
+  std::unordered_map<std::string, AnalysisRow> candidate_by_key;
+  for (const AnalysisRow &row : baseline_rows) {
+    baseline_by_key.emplace(row.key, row);
+  }
+  for (const AnalysisRow &row : candidate_rows) {
+    candidate_by_key.emplace(row.key, row);
+  }
+
+  struct DiffRow {
+    std::string scope;
+    AnalysisRow baseline;
+    AnalysisRow candidate;
+    std::string verdict;
+  };
+  std::vector<DiffRow> rows;
+  for (const auto &entry : baseline_by_key) {
+    const auto candidate_it = candidate_by_key.find(entry.first);
+    if (candidate_it == candidate_by_key.end()) {
+      continue;
+    }
+    rows.push_back({entry.second.label, entry.second, candidate_it->second,
+                    DiffVerdict(entry.second, candidate_it->second)});
+  }
+  std::sort(rows.begin(), rows.end(), [](const DiffRow &lhs, const DiffRow &rhs) {
+    const double lhs_delta =
+        lhs.baseline.cycles_per_call > 0.0
+            ? std::abs(lhs.candidate.cycles_per_call - lhs.baseline.cycles_per_call) /
+                  lhs.baseline.cycles_per_call
+            : 0.0;
+    const double rhs_delta =
+        rhs.baseline.cycles_per_call > 0.0
+            ? std::abs(rhs.candidate.cycles_per_call - rhs.baseline.cycles_per_call) /
+                  rhs.baseline.cycles_per_call
+            : 0.0;
+    return lhs_delta > rhs_delta;
+  });
+
+  if (rows.empty()) {
+    std::cerr << "no matching scope aggregates found between inputs\n";
+    return 1;
+  }
+
+  std::size_t scope_width = std::string("scope").size();
+  std::size_t base_width = std::string("base cyc").size();
+  std::size_t cand_width = std::string("cand cyc").size();
+  std::size_t delta_width = std::string("cyc delta").size();
+  std::size_t ipc_width = std::string("IPC delta").size();
+  std::size_t l1_width = std::string("L1/Ki delta").size();
+  std::size_t verdict_width = std::string("verdict").size();
+
+  struct PrintableDiffRow {
+    std::string scope;
+    std::string base_cycles;
+    std::string candidate_cycles;
+    std::string cycle_delta;
+    std::string ipc_delta;
+    std::string l1_delta;
+    std::string verdict;
+  };
+  std::vector<PrintableDiffRow> printable;
+  printable.reserve(rows.size());
+  for (const DiffRow &row : rows) {
+    PrintableDiffRow out{
+        row.scope,
+        FormatMaybeDouble(row.baseline.cycles_per_call, row.baseline.has_cycles, 0),
+        FormatMaybeDouble(row.candidate.cycles_per_call, row.candidate.has_cycles, 0),
+        row.baseline.has_cycles && row.candidate.has_cycles && row.baseline.cycles_per_call > 0.0
+            ? FormatSignedPercent(row.candidate.cycles_per_call, row.baseline.cycles_per_call)
+            : std::string("-"),
+        row.baseline.has_ipc && row.candidate.has_ipc
+            ? FormatSignedPercent(row.candidate.ipc, row.baseline.ipc)
+            : std::string("-"),
+        row.baseline.has_instruction_metrics && row.candidate.has_instruction_metrics &&
+                row.baseline.l1_miss_per_kinst > 0.0
+            ? FormatSignedPercent(row.candidate.l1_miss_per_kinst, row.baseline.l1_miss_per_kinst)
+            : std::string("-"),
+        row.verdict,
+    };
+    scope_width = std::max(scope_width, out.scope.size());
+    base_width = std::max(base_width, out.base_cycles.size());
+    cand_width = std::max(cand_width, out.candidate_cycles.size());
+    delta_width = std::max(delta_width, out.cycle_delta.size());
+    ipc_width = std::max(ipc_width, out.ipc_delta.size());
+    l1_width = std::max(l1_width, out.l1_delta.size());
+    verdict_width = std::max(verdict_width, out.verdict.size());
+    printable.push_back(std::move(out));
+  }
+
+  std::cout << "Diff: " << options.target << " -> " << options.secondary_target << '\n';
+  std::cout << "Note: verdicts use aggregate means and available p50/p95 direction; formal statistical tests need repeated run-level samples.\n";
+  std::cout << std::left << std::setw(static_cast<int>(scope_width)) << "scope" << "  "
+            << std::right << std::setw(static_cast<int>(base_width)) << "base cyc" << "  "
+            << std::right << std::setw(static_cast<int>(cand_width)) << "cand cyc" << "  "
+            << std::right << std::setw(static_cast<int>(delta_width)) << "cyc delta" << "  "
+            << std::right << std::setw(static_cast<int>(ipc_width)) << "IPC delta" << "  "
+            << std::right << std::setw(static_cast<int>(l1_width)) << "L1/Ki delta" << "  "
+            << std::left << std::setw(static_cast<int>(verdict_width)) << "verdict" << '\n';
+  for (const PrintableDiffRow &row : printable) {
+    std::cout << std::left << std::setw(static_cast<int>(scope_width)) << row.scope << "  "
+              << std::right << std::setw(static_cast<int>(base_width)) << row.base_cycles << "  "
+              << std::right << std::setw(static_cast<int>(cand_width)) << row.candidate_cycles
+              << "  " << std::right << std::setw(static_cast<int>(delta_width))
+              << row.cycle_delta << "  " << std::right << std::setw(static_cast<int>(ipc_width))
+              << row.ipc_delta << "  " << std::right << std::setw(static_cast<int>(l1_width))
+              << row.l1_delta << "  " << std::left << row.verdict << '\n';
+  }
+  return 0;
+}
+
 int RunCounter(CliOptions options) {
   ApplyMeasuredRunDefaults(options);
   const demo::CounterDefinition *definition = demo::FindCounter(options.target);
@@ -1719,6 +2565,10 @@ int main(int argc, char **argv) {
       return RunDemo(options);
     case CommandKind::RunDemos:
       return RunDemos(options);
+    case CommandKind::Summary:
+      return Summary(options);
+    case CommandKind::Diff:
+      return Diff(options);
     case CommandKind::Validate:
       return Validate(options);
   }

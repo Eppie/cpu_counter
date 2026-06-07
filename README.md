@@ -58,6 +58,7 @@ void HotLoop() {
 - `PerfPrimeThread(...)`
 - `PerfPoint`
 - `PerfMeasure(...)`
+- curated counter bundles: `CACHE_PROFILE`, `BRANCH_PROFILE`, `FRONTEND_PROFILE`, `EXECUTION_PROFILE`
 
 ### Explicit Measurement API
 
@@ -110,7 +111,24 @@ PERF_OUTPUT=/tmp/profile.jsonl ./your_binary
 PERF_OUTPUT=- ./your_binary
 ```
 
+Each scope aggregate record is schema-marked JSONL. Existing total/min/max/mean fields remain, and schema v2 adds:
+
+- `schema: 2` and `type: "scope_aggregate"`
+- stable counter `id` values alongside display names
+- `estimated_count` for sampled scopes
+- approximate `p50`, `p95`, and `p99` for wall time and counters
+- `distribution: "log2_upper_bound"` to describe the quantile approximation
+
 The demo binary does not rely on that aggregated output. It measures workloads explicitly with `PerfMeasure(...)` and prints human-facing explanations.
+
+The `cpu_counter` binary can also inspect production JSONL output:
+
+```sh
+./cpu_counter summary /tmp/profile.jsonl
+./cpu_counter diff baseline.jsonl candidate.jsonl
+```
+
+`summary` sorts scopes by estimated cycle hotness and prints derived metrics such as IPC, L1 misses per kilo-instruction, and TLB pressure per kilo-instruction. `diff` matches scope aggregates by label, sample rate, and counter set, then reports cycle-per-call, IPC, and L1-miss deltas. Its verdicts use aggregate means plus p50/p95 direction when present; formal statistical tests still require repeated run-level samples, not just one aggregate JSONL file.
 
 ## 2. Running the Demo Lab
 
@@ -130,6 +148,8 @@ sudo ./cpu_counter help
 sudo ./cpu_counter run counter l1-load-miss
 sudo ./cpu_counter run demo page-stride-read
 sudo ./cpu_counter run demos --tier stable
+./cpu_counter summary /tmp/profile.jsonl
+./cpu_counter diff baseline.jsonl candidate.jsonl
 sudo ./cpu_counter validate
 ```
 

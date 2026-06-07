@@ -1,1 +1,6 @@
 cpu_counter
+test_api_compile
+test_registry_check
+perf.jsonl
+all.log
+logs/

@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <cstdint>
 #include <cstdlib>
@@ -44,6 +45,7 @@ constexpr u32 KPC_CLASS_CONFIGURABLE_MASK = 1u << KPC_CLASS_CONFIGURABLE;
 constexpr usize KPC_MAX_COUNTERS = 32;
 constexpr usize PERF_MAX_SCOPE_EVENTS = 10;
 constexpr usize PERF_MAX_THRESHOLDS = 8;
+constexpr usize PERF_HISTOGRAM_BINS = 64;
 
 constexpr int KPEP_CONFIG_ERROR_CONFLICTING_EVENTS = 12;
 
@@ -75,8 +77,25 @@ struct Counter {
   }
 };
 
+constexpr bool CStringEqual(const char *lhs, const char *rhs) {
+  if (lhs == rhs) {
+    return true;
+  }
+  if (lhs == nullptr || rhs == nullptr) {
+    return false;
+  }
+  while (*lhs != '\0' && *rhs != '\0') {
+    if (*lhs != *rhs) {
+      return false;
+    }
+    ++lhs;
+    ++rhs;
+  }
+  return *lhs == *rhs;
+}
+
 constexpr bool operator==(const Counter &lhs, const Counter &rhs) {
-  return lhs.kind == rhs.kind && lhs.name == rhs.name && lhs.raw_config == rhs.raw_config &&
+  return lhs.kind == rhs.kind && CStringEqual(lhs.name, rhs.name) && lhs.raw_config == rhs.raw_config &&
          lhs.fixed == rhs.fixed;
 }
 
@@ -158,6 +177,23 @@ inline constexpr Counter ITLB_MISS = Counter::Named("L1I_TLB_MISS_DEMAND");
 inline constexpr Counter TLB_MISS = DTLB_MISS;
 inline constexpr Counter L2_TLB_MISS = Counter::Named("L2_TLB_MISS_DATA");
 inline constexpr Counter L2_MISS = L2_TLB_MISS;
+inline constexpr Counter L1I_CACHE_MISS = Counter::Named("L1I_CACHE_MISS_DEMAND");
+inline constexpr Counter BRANCH_COND_MISS = Counter::Named("BRANCH_COND_MISPRED_NONSPEC");
+inline constexpr Counter BRANCH_INDIR_MISS = Counter::Named("BRANCH_INDIR_MISPRED_NONSPEC");
+inline constexpr Counter FETCH_RESTART = Counter::Named("FETCH_RESTART");
+inline constexpr Counter MAP_DISPATCH_BUBBLE = Counter::Named("MAP_DISPATCH_BUBBLE");
+inline constexpr Counter CORE_ACTIVE_CYCLE = Counter::Named("CORE_ACTIVE_CYCLE");
+inline constexpr Counter RETIRE_UOP = Counter::Named("RETIRE_UOP");
+inline constexpr Counter MAP_UOP = Counter::Named("MAP_UOP");
+
+inline constexpr CounterSet CACHE_PROFILE =
+    CYCLES | INSTRUCTIONS | L1_LOAD_MISS | DTLB_MISS | L2_TLB_MISS;
+inline constexpr CounterSet BRANCH_PROFILE =
+    CYCLES | INSTRUCTIONS | BRANCHES | BRANCH_MISS | BRANCH_COND_MISS | BRANCH_INDIR_MISS;
+inline constexpr CounterSet FRONTEND_PROFILE =
+    CYCLES | INSTRUCTIONS | ITLB_MISS | L1I_CACHE_MISS | FETCH_RESTART | MAP_DISPATCH_BUBBLE;
+inline constexpr CounterSet EXECUTION_PROFILE =
+    CYCLES | INSTRUCTIONS | CORE_ACTIVE_CYCLE | RETIRE_UOP | MAP_UOP;
 
 constexpr Counter RawEvent(u64 raw_config, const char *label = nullptr) {
   return Counter::Raw(raw_config, label);
@@ -378,10 +414,77 @@ struct Program {
   Program() { counter_slot_for_requested.fill(-1); }
 };
 
+struct Histogram {
+  std::array<u64, PERF_HISTOGRAM_BINS> bins{};
+  u64 count = 0;
+
+  static constexpr u8 BinFor(u64 value) {
+    if (value == 0) {
+      return 0;
+    }
+    u8 bin = 1;
+    while (value > 1 && bin + 1 < PERF_HISTOGRAM_BINS) {
+      value >>= 1;
+      ++bin;
+    }
+    return bin;
+  }
+
+  static constexpr u64 BinUpperBound(u8 bin) {
+    if (bin == 0) {
+      return 0;
+    }
+    if (bin >= 63) {
+      return std::numeric_limits<u64>::max();
+    }
+    return (u64{1} << bin) - 1;
+  }
+
+  void Add(u64 value) {
+    ++count;
+    ++bins[BinFor(value)];
+  }
+
+  void Merge(const Histogram &other) {
+    count += other.count;
+    for (usize i = 0; i < bins.size(); ++i) {
+      bins[i] += other.bins[i];
+    }
+  }
+
+  [[nodiscard]] u64 Quantile(double q) const {
+    if (count == 0) {
+      return 0;
+    }
+    if (q <= 0.0) {
+      for (usize i = 0; i < bins.size(); ++i) {
+        if (bins[i] != 0) {
+          return BinUpperBound(static_cast<u8>(i));
+        }
+      }
+      return 0;
+    }
+    if (q > 1.0) {
+      q = 1.0;
+    }
+    const u64 target =
+        std::max<u64>(1, static_cast<u64>(std::ceil(q * static_cast<double>(count))));
+    u64 cumulative = 0;
+    for (usize i = 0; i < bins.size(); ++i) {
+      cumulative += bins[i];
+      if (cumulative >= target) {
+        return BinUpperBound(static_cast<u8>(i));
+      }
+    }
+    return BinUpperBound(static_cast<u8>(bins.size() - 1));
+  }
+};
+
 struct Aggregate {
   std::string label;
   CounterSet set;
   std::vector<std::string> counter_names;
+  std::vector<std::string> counter_ids;
   std::vector<Threshold> thresholds;
   u32 sample_every = 1;
   u64 sampled_count = 0;
@@ -389,9 +492,11 @@ struct Aggregate {
   u64 total_wall_ticks = 0;
   u64 min_wall_ticks = std::numeric_limits<u64>::max();
   u64 max_wall_ticks = 0;
+  Histogram wall_histogram;
   std::array<u64, PERF_MAX_SCOPE_EVENTS> total_counters{};
   std::array<u64, PERF_MAX_SCOPE_EVENTS> min_counters{};
   std::array<u64, PERF_MAX_SCOPE_EVENTS> max_counters{};
+  std::array<Histogram, PERF_MAX_SCOPE_EVENTS> counter_histograms{};
   u64 threshold_violations = 0;
   std::string last_error;
 
@@ -1002,6 +1107,7 @@ class Backend {
       aggregate.thresholds = thresholds;
       for (u8 i = 0; i < set.count; ++i) {
         aggregate.counter_names.push_back(CounterName(set.items[i]));
+        aggregate.counter_ids.push_back(CounterId(set.items[i]));
       }
     }
     return aggregate;
@@ -1018,12 +1124,14 @@ class Backend {
     aggregate.total_wall_ticks += wall_ticks;
     aggregate.min_wall_ticks = std::min(aggregate.min_wall_ticks, wall_ticks);
     aggregate.max_wall_ticks = std::max(aggregate.max_wall_ticks, wall_ticks);
+    aggregate.wall_histogram.Add(wall_ticks);
 
     for (u8 i = 0; i < frame.requested.count; ++i) {
       const u64 value = deltas[i];
       aggregate.total_counters[i] += value;
       aggregate.min_counters[i] = std::min(aggregate.min_counters[i], value);
       aggregate.max_counters[i] = std::max(aggregate.max_counters[i], value);
+      aggregate.counter_histograms[i].Add(value);
     }
 
     for (const Threshold &threshold : frame.thresholds) {
@@ -1047,12 +1155,14 @@ class Backend {
       dst.min_wall_ticks = std::min(dst.min_wall_ticks, src.min_wall_ticks);
       dst.max_wall_ticks = std::max(dst.max_wall_ticks, src.max_wall_ticks);
     }
+    dst.wall_histogram.Merge(src.wall_histogram);
     for (u8 i = 0; i < dst.set.count; ++i) {
       dst.total_counters[i] += src.total_counters[i];
       if (src.sampled_count != 0) {
         dst.min_counters[i] = std::min(dst.min_counters[i], src.min_counters[i]);
         dst.max_counters[i] = std::max(dst.max_counters[i], src.max_counters[i]);
       }
+      dst.counter_histograms[i].Merge(src.counter_histograms[i]);
     }
     dst.threshold_violations += src.threshold_violations;
     if (!src.last_error.empty()) {
@@ -1101,17 +1211,25 @@ class Backend {
     for (const std::string &key : keys) {
       const Aggregate &aggregate = snapshot.at(key);
       (*out) << '{';
-      (*out) << "\"label\":\"" << JsonEscape(aggregate.label) << "\"";
+      (*out) << "\"schema\":2";
+      (*out) << ",\"type\":\"scope_aggregate\"";
+      (*out) << ",\"label\":\"" << JsonEscape(aggregate.label) << "\"";
       (*out) << ",\"sample_every\":" << aggregate.sample_every;
       (*out) << ",\"sampled_count\":" << aggregate.sampled_count;
+      (*out) << ",\"estimated_count\":"
+             << (aggregate.sampled_count * static_cast<u64>(aggregate.sample_every));
       (*out) << ",\"dropped_count\":" << aggregate.dropped_count;
       if (aggregate.sampled_count != 0) {
         const u64 total_ns = detail::TicksToNs(aggregate.total_wall_ticks);
         const u64 min_ns = detail::TicksToNs(aggregate.min_wall_ticks);
         const u64 max_ns = detail::TicksToNs(aggregate.max_wall_ticks);
+        const u64 p50_ns = detail::TicksToNs(aggregate.wall_histogram.Quantile(0.50));
+        const u64 p95_ns = detail::TicksToNs(aggregate.wall_histogram.Quantile(0.95));
+        const u64 p99_ns = detail::TicksToNs(aggregate.wall_histogram.Quantile(0.99));
         (*out) << ",\"wall_ns\":{\"total\":" << total_ns << ",\"min\":" << min_ns
                << ",\"max\":" << max_ns << ",\"mean\":"
                << static_cast<double>(total_ns) / static_cast<double>(aggregate.sampled_count)
+               << ",\"p50\":" << p50_ns << ",\"p95\":" << p95_ns << ",\"p99\":" << p99_ns
                << '}';
       }
 
@@ -1123,6 +1241,9 @@ class Backend {
         const u64 min_value = aggregate.sampled_count != 0 ? aggregate.min_counters[i] : 0;
         (*out) << '{';
         (*out) << "\"name\":\"" << JsonEscape(aggregate.counter_names[i]) << "\"";
+        if (i < aggregate.counter_ids.size()) {
+          (*out) << ",\"id\":\"" << JsonEscape(aggregate.counter_ids[i]) << "\"";
+        }
         (*out) << ",\"total\":" << aggregate.total_counters[i];
         (*out) << ",\"min\":" << min_value;
         (*out) << ",\"max\":" << aggregate.max_counters[i];
@@ -1131,9 +1252,13 @@ class Backend {
                        ? static_cast<double>(aggregate.total_counters[i]) /
                              static_cast<double>(aggregate.sampled_count)
                        : 0.0);
+        (*out) << ",\"p50\":" << aggregate.counter_histograms[i].Quantile(0.50);
+        (*out) << ",\"p95\":" << aggregate.counter_histograms[i].Quantile(0.95);
+        (*out) << ",\"p99\":" << aggregate.counter_histograms[i].Quantile(0.99);
         (*out) << '}';
       }
       (*out) << ']';
+      (*out) << ",\"distribution\":\"log2_upper_bound\"";
       (*out) << ",\"threshold_violations\":" << aggregate.threshold_violations;
       if (!aggregate.last_error.empty()) {
         (*out) << ",\"last_error\":\"" << JsonEscape(aggregate.last_error) << '"';
@@ -1408,6 +1533,18 @@ inline constexpr auto ITLB_MISS = perf::ITLB_MISS;
 inline constexpr auto TLB_MISS = perf::TLB_MISS;
 inline constexpr auto L2_TLB_MISS = perf::L2_TLB_MISS;
 inline constexpr auto L2_MISS = perf::L2_MISS;
+inline constexpr auto L1I_CACHE_MISS = perf::L1I_CACHE_MISS;
+inline constexpr auto BRANCH_COND_MISS = perf::BRANCH_COND_MISS;
+inline constexpr auto BRANCH_INDIR_MISS = perf::BRANCH_INDIR_MISS;
+inline constexpr auto FETCH_RESTART = perf::FETCH_RESTART;
+inline constexpr auto MAP_DISPATCH_BUBBLE = perf::MAP_DISPATCH_BUBBLE;
+inline constexpr auto CORE_ACTIVE_CYCLE = perf::CORE_ACTIVE_CYCLE;
+inline constexpr auto RETIRE_UOP = perf::RETIRE_UOP;
+inline constexpr auto MAP_UOP = perf::MAP_UOP;
+inline constexpr auto CACHE_PROFILE = perf::CACHE_PROFILE;
+inline constexpr auto BRANCH_PROFILE = perf::BRANCH_PROFILE;
+inline constexpr auto FRONTEND_PROFILE = perf::FRONTEND_PROFILE;
+inline constexpr auto EXECUTION_PROFILE = perf::EXECUTION_PROFILE;
 inline constexpr auto RawEvent = perf::RawEvent;
 inline constexpr auto MaxThreshold = perf::MaxThreshold;
 using perf::PerfMeasure;
@@ -1460,6 +1597,19 @@ inline constexpr Counter ITLB_MISS{};
 inline constexpr Counter TLB_MISS{};
 inline constexpr Counter L2_TLB_MISS{};
 inline constexpr Counter L2_MISS{};
+inline constexpr Counter L1I_CACHE_MISS{};
+inline constexpr Counter BRANCH_COND_MISS{};
+inline constexpr Counter BRANCH_INDIR_MISS{};
+inline constexpr Counter FETCH_RESTART{};
+inline constexpr Counter MAP_DISPATCH_BUBBLE{};
+inline constexpr Counter CORE_ACTIVE_CYCLE{};
+inline constexpr Counter RETIRE_UOP{};
+inline constexpr Counter MAP_UOP{};
+
+inline constexpr CounterSet CACHE_PROFILE{};
+inline constexpr CounterSet BRANCH_PROFILE{};
+inline constexpr CounterSet FRONTEND_PROFILE{};
+inline constexpr CounterSet EXECUTION_PROFILE{};
 
 constexpr Counter RawEvent(std::uint64_t, const char * = nullptr) { return Counter{}; }
 constexpr Threshold MaxThreshold(Counter counter, std::uint64_t max_value) {
@@ -1539,6 +1689,18 @@ inline constexpr auto ITLB_MISS = perf::ITLB_MISS;
 inline constexpr auto TLB_MISS = perf::TLB_MISS;
 inline constexpr auto L2_TLB_MISS = perf::L2_TLB_MISS;
 inline constexpr auto L2_MISS = perf::L2_MISS;
+inline constexpr auto L1I_CACHE_MISS = perf::L1I_CACHE_MISS;
+inline constexpr auto BRANCH_COND_MISS = perf::BRANCH_COND_MISS;
+inline constexpr auto BRANCH_INDIR_MISS = perf::BRANCH_INDIR_MISS;
+inline constexpr auto FETCH_RESTART = perf::FETCH_RESTART;
+inline constexpr auto MAP_DISPATCH_BUBBLE = perf::MAP_DISPATCH_BUBBLE;
+inline constexpr auto CORE_ACTIVE_CYCLE = perf::CORE_ACTIVE_CYCLE;
+inline constexpr auto RETIRE_UOP = perf::RETIRE_UOP;
+inline constexpr auto MAP_UOP = perf::MAP_UOP;
+inline constexpr auto CACHE_PROFILE = perf::CACHE_PROFILE;
+inline constexpr auto BRANCH_PROFILE = perf::BRANCH_PROFILE;
+inline constexpr auto FRONTEND_PROFILE = perf::FRONTEND_PROFILE;
+inline constexpr auto EXECUTION_PROFILE = perf::EXECUTION_PROFILE;
 inline constexpr auto RawEvent = perf::RawEvent;
 inline constexpr auto MaxThreshold = perf::MaxThreshold;
 using perf::PerfMeasure;

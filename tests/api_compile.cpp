@@ -15,11 +15,18 @@ void SampledScopeSmoke() {
   }
 }
 
+void BundleSmoke() {
+  PERF_SCOPE("cache-profile-smoke", CACHE_PROFILE);
+  PERF_SCOPE("branch-profile-smoke", BRANCH_PROFILE);
+  PERF_SCOPE("frontend-profile-smoke", FRONTEND_PROFILE);
+}
+
 }  // namespace
 
 int main() {
   ScopeSmoke();
   SampledScopeSmoke();
+  BundleSmoke();
 
   std::string error;
   if (!PerfPrimeThread(PerfCounterSet{}, &error)) {
