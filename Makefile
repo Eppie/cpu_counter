@@ -1,4 +1,7 @@
-CXX := /opt/homebrew/opt/llvm/bin/clang++
+# Defaults to the clang++ on your PATH (Apple Clang from the Xcode command line
+# tools works). Override for a specific toolchain, e.g.:
+#   make CXX=/opt/homebrew/opt/llvm/bin/clang++
+CXX ?= clang++
 CXXFLAGS := -std=c++20 -O2 -Wall -Wextra -pedantic -I.
 TARGET := cpu_counter
 SOURCES := main.cpp $(wildcard demos/*.cpp)

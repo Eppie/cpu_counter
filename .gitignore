@@ -1,6 +1,8 @@
 cpu_counter
 test_api_compile
 test_registry_check
+pmu_probe
+tools/
 perf.jsonl
 all.log
 logs/
