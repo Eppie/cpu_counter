@@ -8,8 +8,9 @@ SOURCES := main.cpp $(wildcard demos/*.cpp)
 HEADERS := perf.h $(wildcard demos/*.h)
 TEST_API := test_api_compile
 TEST_REGISTRY := test_registry_check
+EXAMPLE := perf_quickstart
 
-.PHONY: all clean run test test-disable live-smoke
+.PHONY: all clean run test test-disable live-smoke example
 
 all: $(TARGET)
 
@@ -36,5 +37,10 @@ test-disable:
 live-smoke: $(TARGET)
 	sudo ./$(TARGET) validate --prefer-pcore --require-stable-cpu --require-active-pmu
 
+$(EXAMPLE): examples/quickstart.cpp $(HEADERS)
+	$(CXX) $(CXXFLAGS) examples/quickstart.cpp -o $(EXAMPLE)
+
+example: $(EXAMPLE)
+
 clean:
-	rm -f $(TARGET) $(TEST_API) $(TEST_REGISTRY)
+	rm -f $(TARGET) $(TEST_API) $(TEST_REGISTRY) $(EXAMPLE)

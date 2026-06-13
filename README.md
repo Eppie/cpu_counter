@@ -29,6 +29,55 @@ The library auto-selects the PMU event database for whatever Apple Silicon chip 
 - Some machines also reject `kpc_force_all_ctrs_set(1)` even under `sudo`; the library treats that as best-effort and reports the later programming failure directly if configurable PMCs still cannot be installed.
 - Without privilege, the binary still runs, but measured commands fail with a clear error instead of crashing.
 
+## Integration
+
+`perf.h` is a single header with no build step of its own. Pick whichever path fits your project; the CMake paths give you a `perf::perf` target that carries the include path and the C++20 requirement.
+
+### Vendor the header
+
+Copy `perf.h` into your tree and include it (C++20 required):
+
+```cpp
+#include "perf.h"
+```
+
+### CMake — FetchContent
+
+```cmake
+include(FetchContent)
+FetchContent_Declare(perf
+  GIT_REPOSITORY https://github.com/Eppie/cpu_counter.git
+  GIT_TAG main)
+FetchContent_MakeAvailable(perf)
+target_link_libraries(your_target PRIVATE perf::perf)
+```
+
+### CMake — add_subdirectory
+
+```cmake
+add_subdirectory(third_party/cpu_counter)
+target_link_libraries(your_target PRIVATE perf::perf)
+```
+
+(Consuming via `add_subdirectory`/FetchContent builds only the library; the demo, tests, and examples are skipped.)
+
+### CMake — installed package
+
+```sh
+cmake -B build && cmake --build build && cmake --install build --prefix /your/prefix
+```
+
+```cmake
+find_package(perf CONFIG REQUIRED)
+target_link_libraries(your_target PRIVATE perf::perf)
+```
+
+Notes:
+
+- Define `PERF_DISABLE` to compile all instrumentation out to no-ops (the public API still exists, so instrumented code builds anywhere — handy for non-Apple targets).
+- `PERF_VERSION` (plus `PERF_VERSION_MAJOR` / `_MINOR` / `_PATCH`) exposes the header version.
+- A minimal usage example lives in [`examples/quickstart.cpp`](examples/quickstart.cpp).
+
 ## Build
 
 ```sh
@@ -114,11 +163,11 @@ if (!PerfPrimeThread(CYCLES | INSTRUCTIONS | L1_MISS | DTLB_MISS, &error)) {
 
 ### Output
 
-Production-style `PerfScope` aggregation still writes JSONL on shutdown:
+Production-style `PerfScope` aggregation writes JSONL on shutdown, but only when you point it somewhere with `PERF_OUTPUT` — it never drops a file into your working directory on its own. If scopes were recorded and `PERF_OUTPUT` is unset, it prints a one-line hint to stderr instead.
 
 ```sh
-PERF_OUTPUT=/tmp/profile.jsonl ./your_binary
-PERF_OUTPUT=- ./your_binary
+PERF_OUTPUT=/tmp/profile.jsonl ./your_binary   # write to a file
+PERF_OUTPUT=- ./your_binary                    # write to stdout
 ```
 
 Each scope aggregate record is schema-marked JSONL. Existing total/min/max/mean fields remain, and schema v2 adds:
