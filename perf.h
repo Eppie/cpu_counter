@@ -1,11 +1,6 @@
 #ifndef PERF_H_
 #define PERF_H_
 
-#include <dlfcn.h>
-#include <mach/mach_time.h>
-#include <sys/sysctl.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -29,6 +24,18 @@
 
 #ifndef PERF_DISABLE
 
+// The active implementation is built on Apple's private kperf/kperfdata
+// frameworks and Arm64 PMU events. Define PERF_DISABLE to compile the entire
+// public API out as no-ops, which lets instrumented code build on any platform.
+#if !defined(__APPLE__) || !defined(__aarch64__)
+#error "perf.h requires macOS on Apple Silicon (arm64); define PERF_DISABLE to compile it out as a no-op."
+#endif
+
+#include <dlfcn.h>
+#include <mach/mach_time.h>
+#include <sys/sysctl.h>
+#include <unistd.h>
+
 namespace perf {
 
 using u8 = std::uint8_t;
@@ -51,7 +58,28 @@ constexpr int KPEP_CONFIG_ERROR_CONFLICTING_EVENTS = 12;
 
 struct kpep_db;
 struct kpep_config;
-struct kpep_event;
+
+// kpep event record (Apple's reverse-engineered kperfdata layout, arm64). We read
+// only `mask` — the bitmask of physical counter slots the event may occupy — to
+// order events most-constrained-first when programming, so a satisfiable set
+// programs regardless of the order the caller listed counters. The mask only
+// influences ordering (the slot assignment still comes from kpep), so a future
+// layout change degrades to "ordering stops helping", never wrong counts. The
+// size assert is a tripwire in case Apple changes the record.
+struct kpep_event {
+  const char *name;
+  const char *description;
+  const char *errata;
+  const char *alias;
+  const char *fallback;
+  u32 mask;
+  u8 number;
+  u8 umask;
+  u8 reserved;
+  u8 is_fixed;
+};
+static_assert(sizeof(kpep_event) == 48,
+              "kpep_event layout changed; revisit perf.h event-ordering (uses .mask)");
 
 enum class CounterKind : u8 {
   Named,
@@ -162,6 +190,11 @@ struct SampleSite {
   SampleSite() { counter_slots.fill(-1); }
 };
 
+// Public counter constants. MAINTENANCE: every name added here must be mirrored
+// in three other places further down — the global-namespace re-export block at
+// the end of this active section, plus the no-op stub block and its re-export
+// block under `#else` (PERF_DISABLE). `make test-disable` fails to compile if a
+// name is missing from the disabled path.
 inline constexpr Counter CYCLES = Counter::Named("FIXED_CYCLES", true);
 inline constexpr Counter INSTRUCTIONS = Counter::Named("FIXED_INSTRUCTIONS", true);
 inline constexpr Counter BRANCHES = Counter::Named("INST_BRANCH");
@@ -173,7 +206,6 @@ inline constexpr Counter DTLB_MISS = Counter::Named("L1D_TLB_MISS");
 inline constexpr Counter ITLB_MISS = Counter::Named("L1I_TLB_MISS_DEMAND");
 inline constexpr Counter TLB_MISS = DTLB_MISS;
 inline constexpr Counter L2_TLB_MISS = Counter::Named("L2_TLB_MISS_DATA");
-inline constexpr Counter L2_MISS = L2_TLB_MISS;
 inline constexpr Counter L1I_CACHE_MISS = Counter::Named("L1I_CACHE_MISS_DEMAND");
 inline constexpr Counter BRANCH_COND_MISS = Counter::Named("BRANCH_COND_MISPRED_NONSPEC");
 inline constexpr Counter BRANCH_INDIR_MISS = Counter::Named("BRANCH_INDIR_MISPRED_NONSPEC");
@@ -566,7 +598,9 @@ class Backend {
 
   bool PrimeThread(CounterSet requested, std::string &error) {
     if (requested.overflow) {
-      error = "requested counter set exceeds PERF_MAX_SCOPE_EVENTS";
+      error = "counter set too large: a measurement may include at most " +
+              std::to_string(PERF_MAX_SCOPE_EVENTS) +
+              " counters; reduce the set or split it across separate measurements";
       return false;
     }
     if (requested.count == 0) {
@@ -588,7 +622,10 @@ class Backend {
       }
       requested = state.installed_set | requested;
       if (requested.overflow) {
-        error = "too many simultaneous configurable counters in installed thread set";
+        error = "priming this counter set together with the thread's already-installed "
+                "counters would exceed the maximum of " +
+                std::to_string(PERF_MAX_SCOPE_EVENTS) +
+                " counters per thread; prime fewer counters";
         return false;
       }
     }
@@ -601,7 +638,9 @@ class Backend {
     frame.aggregate = ResolveAggregate(state, frame);
 
     if (frame.requested.overflow) {
-      frame.error = "requested counter set exceeds PERF_MAX_SCOPE_EVENTS";
+      frame.error = "counter set too large: a measurement may include at most " +
+                    std::to_string(PERF_MAX_SCOPE_EVENTS) +
+                    " counters; reduce the set or split it across separate scopes";
       frame.dropped = true;
       return;
     }
@@ -690,7 +729,9 @@ class Backend {
     snapshot.set = requested;
     snapshot.count = requested.count;
     if (requested.overflow) {
-      snapshot.error = "requested counter set exceeds PERF_MAX_SCOPE_EVENTS";
+      snapshot.error = "counter set too large: a measurement may include at most " +
+                       std::to_string(PERF_MAX_SCOPE_EVENTS) +
+                       " counters; reduce the set or split it across separate measurements";
       return snapshot;
     }
     if (requested.count == 0) {
@@ -847,16 +888,47 @@ class Backend {
     used_slots.fill(false);
     program.regs.fill(0);
 
-    std::vector<Counter> named_events;
-    std::vector<u8> named_indices;
+    // kpep numbers configurable counter slots relative to the counter *classes*
+    // present in the config it is given. If the caller's set has configurable
+    // events but no fixed counter, kpep reports CONFIGURABLE-only classes and
+    // returns configurable-relative slot indices (0-based), while our read path
+    // always uses the FIXED|CONFIG layout (fixed counters at slots 0..n-1). Every
+    // configurable counter would then be read from the wrong slot. Fixed counters
+    // occupy dedicated slots and never cost a configurable slot, so we
+    // transparently present them to kpep to force absolute FIXED|CONFIG numbering.
+    // The injected counters are programmed but never reported to the caller.
+    constexpr u8 kInjectedIndex = 0xFF;
+    bool has_named_fixed = false;
+    bool has_named_configurable = false;
     for (u8 i = 0; i < set.count; ++i) {
-      if (set.items[i].kind == CounterKind::Named) {
-        named_events.push_back(set.items[i]);
-        named_indices.push_back(i);
+      if (set.items[i].kind != CounterKind::Named) {
+        continue;
+      }
+      if (set.items[i].fixed) {
+        has_named_fixed = true;
+      } else {
+        has_named_configurable = true;
       }
     }
 
-    if (!named_events.empty()) {
+    struct NamedEntry {
+      Counter counter;
+      u8 set_index;       // index in the caller's set, or kInjectedIndex
+      kpep_event *event;  // resolved database event
+      int slot_count;     // popcount of the slot mask; fewer = more constrained
+    };
+    std::vector<NamedEntry> named;
+    if (has_named_configurable && !has_named_fixed) {
+      named.push_back({CYCLES, kInjectedIndex, nullptr, 0});
+      named.push_back({INSTRUCTIONS, kInjectedIndex, nullptr, 0});
+    }
+    for (u8 i = 0; i < set.count; ++i) {
+      if (set.items[i].kind == CounterKind::Named) {
+        named.push_back({set.items[i], i, nullptr, 0});
+      }
+    }
+
+    if (!named.empty()) {
       kpep_config *config = nullptr;
       const int create_ret = api_.kpep_config_create(db_, &config);
       if (create_ret != 0 || config == nullptr) {
@@ -879,18 +951,38 @@ class Backend {
         return false;
       }
 
-      for (Counter counter : named_events) {
+      // Resolve every event and its slot mask, then add the most constrained
+      // events (fewest eligible slots) first. kpep allocates slots greedily in
+      // add-order, so without this a satisfiable set can spuriously conflict
+      // purely because of the order the caller listed counters (a wide-mask event
+      // can grab a slot a narrow-mask event needs). Ordering narrow-mask-first
+      // recovers from that automatically. The mask only affects ordering — the
+      // slot map still comes from kpep — so results stay correct regardless.
+      for (NamedEntry &entry : named) {
         kpep_event *event = nullptr;
-        const int db_ret = api_.kpep_db_event(db_, counter.name, &event);
+        const int db_ret = api_.kpep_db_event(db_, entry.counter.name, &event);
         if (db_ret != 0 || event == nullptr) {
-          error = std::string("unknown event: ") + (counter.name != nullptr ? counter.name : "");
+          error = std::string("unknown event: ") +
+                  (entry.counter.name != nullptr ? entry.counter.name : "");
           return false;
         }
+        entry.event = event;
+        entry.slot_count = __builtin_popcount(event->mask);
+      }
+      std::stable_sort(named.begin(), named.end(), [](const NamedEntry &a, const NamedEntry &b) {
+        return a.slot_count < b.slot_count;
+      });
+
+      for (NamedEntry &entry : named) {
+        kpep_event *event = entry.event;
         const int add_ret = api_.kpep_config_add_event(config, &event, 0, nullptr);
         if (add_ret != 0) {
           if (add_ret == KPEP_CONFIG_ERROR_CONFLICTING_EVENTS) {
-            error = std::string("conflicting events while building set: ") +
-                    CanonicalCounterSetKey(set);
+            error =
+                "conflicting events: one or more counters in this set compete for the same "
+                "physical PMU counter slot and cannot be measured together, even after "
+                "reordering. Split them across separate PERF_SCOPE/PerfMeasure calls. set: " +
+                CanonicalCounterSetKey(set);
           } else {
             error = "kpep_config_add_event failed: " + std::to_string(add_ret);
           }
@@ -898,7 +990,7 @@ class Backend {
         }
       }
 
-      std::vector<usize> map(named_events.size());
+      std::vector<usize> map(named.size());
       const int map_ret =
           api_.kpep_config_kpc_map(config, map.data(), map.size() * sizeof(map[0]));
       if (map_ret != 0) {
@@ -912,15 +1004,19 @@ class Backend {
         return false;
       }
 
-      for (usize i = 0; i < named_events.size(); ++i) {
+      // map[i] corresponds to the i-th event added, i.e. named[i] in sorted order.
+      for (usize i = 0; i < named.size(); ++i) {
         const usize slot = map[i];
         if (slot >= KPC_MAX_COUNTERS) {
           error = "event mapped beyond KPC_MAX_COUNTERS";
           return false;
         }
         used_slots[slot] = true;
-        program.counter_slot_for_requested[named_indices[i]] = static_cast<int>(slot);
-        program.counter_name_for_requested[named_indices[i]] = CounterName(named_events[i]);
+        if (named[i].set_index == kInjectedIndex) {
+          continue;  // transparently injected fixed counter: not caller-visible
+        }
+        program.counter_slot_for_requested[named[i].set_index] = static_cast<int>(slot);
+        program.counter_name_for_requested[named[i].set_index] = CounterName(named[i].counter);
       }
     }
 
@@ -938,7 +1034,11 @@ class Backend {
         ++next_raw_slot;
       }
       if (next_raw_slot >= static_cast<int>(program.active_count)) {
-        error = "too many simultaneous configurable counters in installed thread set";
+        error = "too many configurable counters: this core supports at most " +
+                std::to_string(program.active_count - program.fixed_count) +
+                " configurable counters at once (the fixed cycles and instructions counters "
+                "are free and do not count against this). Reduce the configurable counters or "
+                "split them across separate measurements.";
         return false;
       }
       program.regs[static_cast<usize>(next_raw_slot)] = counter.raw_config;
@@ -970,6 +1070,16 @@ class Backend {
     return inserted->second.valid ? &inserted->second : nullptr;
   }
 
+  // Actionable hint appended when the configurable PMU counters can't be claimed.
+  static std::string ConfigurablePmcHint() {
+    return std::string(
+        " (the configurable PMU counters could not be claimed: kpc_force_all_ctrs_set(1) was "
+        "rejected. Common causes: not running as root, another tool is holding the PMU "
+        "(Instruments, powermetrics, asitop, or a previous run), or a stuck PMU state. Try: run "
+        "with sudo, quit other profilers and retry; if it persists, reboot to clear the PMU. "
+        "Fixed counters such as CYCLES and INSTRUCTIONS still work without this.)");
+  }
+
   bool InstallProgram(ThreadState &state, const CounterSet &set, std::string &error) {
     if (set.count == 0) {
       state.installed_program = nullptr;
@@ -985,20 +1095,16 @@ class Backend {
       if (config_ret != 0) {
         error = "kpc_set_config failed: " + std::to_string(config_ret);
         if (!forced_all_counters_) {
-          error +=
-              " (kpc_force_all_ctrs_set(1) was rejected; configurable events may require a "
-              "blessed pid or a different PMU policy on this machine)";
+          error += ConfigurablePmcHint();
         }
         return false;
       }
     }
     if (api_.kpc_set_counting(program->classes) != 0 ||
         api_.kpc_set_thread_counting(program->classes) != 0) {
-      error = "failed to enable counting";
+      error = "failed to enable PMU counting";
       if (!forced_all_counters_) {
-        error +=
-            " (kpc_force_all_ctrs_set(1) was rejected; configurable events may require a "
-            "blessed pid or a different PMU policy on this machine)";
+        error += ConfigurablePmcHint();
       }
       return false;
     }
@@ -1024,7 +1130,11 @@ class Backend {
     }
     CounterSet widened = state.installed_set | requested;
     if (widened.overflow) {
-      error = "too many simultaneous configurable counters in installed thread set";
+      error = "these counters combined with the thread's already-installed counters exceed the "
+              "maximum of " +
+              std::to_string(PERF_MAX_SCOPE_EVENTS) +
+              " counters per thread; use fewer counters, or prime a smaller superset with "
+              "PerfPrimeThread before nested use";
       return false;
     }
     return InstallProgram(state, widened, error);
@@ -1508,6 +1618,9 @@ inline bool PrimeThread(CounterSet counters, std::string *error = nullptr) {
 
 }  // namespace perf
 
+// Re-export the perf:: public surface into the global namespace. MAINTENANCE:
+// keep this list in sync with the matching re-export block in the #else
+// (PERF_DISABLE) path below.
 using PerfScope = perf::PerfScope;
 using PerfPoint = perf::PerfPoint;
 using PerfPointDelta = perf::PerfPointDelta;
@@ -1529,7 +1642,6 @@ inline constexpr auto DTLB_MISS = perf::DTLB_MISS;
 inline constexpr auto ITLB_MISS = perf::ITLB_MISS;
 inline constexpr auto TLB_MISS = perf::TLB_MISS;
 inline constexpr auto L2_TLB_MISS = perf::L2_TLB_MISS;
-inline constexpr auto L2_MISS = perf::L2_MISS;
 inline constexpr auto L1I_CACHE_MISS = perf::L1I_CACHE_MISS;
 inline constexpr auto BRANCH_COND_MISS = perf::BRANCH_COND_MISS;
 inline constexpr auto BRANCH_INDIR_MISS = perf::BRANCH_INDIR_MISS;
@@ -1550,6 +1662,13 @@ inline bool PerfPrimeThread(PerfCounterSet counters, std::string *error = nullpt
 }
 
 #else
+
+// ----- PERF_DISABLE: no-op mirror of the entire public API -----
+// Every type, constant, and function in the active path above has a matching
+// no-op here so instrumented code compiles to nothing (on any platform, or when
+// counters are intentionally disabled). MAINTENANCE: keep both the stub block
+// and the global-namespace re-export block below in sync with the active path.
+// `make test-disable` compiles this path and fails if a symbol is missing.
 
 #include <cstdint>
 #include <initializer_list>
@@ -1593,7 +1712,6 @@ inline constexpr Counter DTLB_MISS{};
 inline constexpr Counter ITLB_MISS{};
 inline constexpr Counter TLB_MISS{};
 inline constexpr Counter L2_TLB_MISS{};
-inline constexpr Counter L2_MISS{};
 inline constexpr Counter L1I_CACHE_MISS{};
 inline constexpr Counter BRANCH_COND_MISS{};
 inline constexpr Counter BRANCH_INDIR_MISS{};
@@ -1685,7 +1803,6 @@ inline constexpr auto DTLB_MISS = perf::DTLB_MISS;
 inline constexpr auto ITLB_MISS = perf::ITLB_MISS;
 inline constexpr auto TLB_MISS = perf::TLB_MISS;
 inline constexpr auto L2_TLB_MISS = perf::L2_TLB_MISS;
-inline constexpr auto L2_MISS = perf::L2_MISS;
 inline constexpr auto L1I_CACHE_MISS = perf::L1I_CACHE_MISS;
 inline constexpr auto BRANCH_COND_MISS = perf::BRANCH_COND_MISS;
 inline constexpr auto BRANCH_INDIR_MISS = perf::BRANCH_INDIR_MISS;
