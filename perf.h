@@ -1,6 +1,12 @@
 #ifndef PERF_H_
 #define PERF_H_
 
+// Library version (semantic versioning). Always defined, even with PERF_DISABLE.
+#define PERF_VERSION_MAJOR 0
+#define PERF_VERSION_MINOR 1
+#define PERF_VERSION_PATCH 0
+#define PERF_VERSION "0.1.0"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -1296,8 +1302,12 @@ class Backend {
     std::ostream *out = nullptr;
     std::ofstream file;
     if (path == nullptr || path[0] == '\0') {
-      file.open("perf.jsonl", std::ios::out | std::ios::trunc);
-      out = &file;
+      // Least surprise: don't drop a file into the caller's working directory.
+      // Tell them how to capture the data instead.
+      std::cerr << "perf: " << snapshot.size()
+                << " scope aggregate(s) recorded but not written; set PERF_OUTPUT=<path> "
+                   "(or '-' for stdout) to capture them.\n";
+      return;
     } else if (std::string_view(path) == "-") {
       out = &std::cout;
     } else {
