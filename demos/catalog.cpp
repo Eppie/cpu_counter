@@ -1402,7 +1402,7 @@ const CounterDefinition kCounters[] = {
         "l2-tlb-miss",
         "L2 Data TLB Miss",
         "Second-level data-side TLB misses.",
-        "In this project `L2_MISS` is intentionally not treated as a generic L2 cache miss; it remains the data-side L2 TLB event.",
+        "Despite the `l2` name, this is the data-side L2 TLB event, not a generic L2 cache miss.",
         Group::TlbPageWalk,
         Tier::Stable,
         L2_TLB_MISS,

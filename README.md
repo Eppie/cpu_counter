@@ -7,16 +7,26 @@ This project now has two jobs:
 
 The library stays as one shipped header. The demo lab is built from the `demos/` subtree and uses the public library API only.
 
-If you want a focused reading path or a current issue snapshot, start with:
+For a deeper tour, see:
 
-- `docs/OFFLINE_GUIDE.md`
-- `docs/CURRENT_STATUS.md`
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — how the library and demo lab fit together, and a reading path for contributors
+- [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) — counters that are weak or hardware-sensitive, and what to expect off the reference machine
+
+## Requirements
+
+- **macOS on Apple Silicon.** `perf.h` is built on the private Apple `kperf` / `kperfdata` frameworks and Arm64 PMU events; it does not compile or run elsewhere.
+- A C++20 compiler. The stock `clang++` from the Xcode command line tools works; override `make CXX=...` for another toolchain.
+- `root` (or a blessed pid) to *program* counters. Building, `list`, `explain`, `summary`, and `diff` need no privilege.
+
+The library auto-selects the PMU event database for whatever Apple Silicon chip it runs on, so the counter constants are not tied to one generation. The **demo interpretations and tuning, however, were validated on an M4 Max** (P-core oriented). On other chips some experimental counters may be named differently or behave differently — see [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md).
+
+**Counter limits:** you can measure the two fixed counters (cycles, instructions) plus up to ~8 configurable counters at once, in any order — `perf.h` handles slot allocation, event ordering, and fixed-counter requirements for you, and fails with an actionable message if a set genuinely can't be programmed together. See [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md#counter-limits-and-conflicts) for the details.
 
 ## Caveat First
 
-- This project uses private Apple `kperf` / `kperfdata` APIs.
-- Programming counters still requires `root` or a blessed pid on this machine.
-- Some machines also reject `kpc_force_all_ctrs_set(1)` even under `sudo`; the library now treats that as best-effort and reports the later programming failure directly if configurable PMCs still cannot be installed.
+- This project uses private Apple `kperf` / `kperfdata` APIs. They are undocumented and can change between macOS releases; do not ship this in software you submit to the App Store.
+- Programming counters requires `root` or a blessed pid.
+- Some machines also reject `kpc_force_all_ctrs_set(1)` even under `sudo`; the library treats that as best-effort and reports the later programming failure directly if configurable PMCs still cannot be installed.
 - Without privilege, the binary still runs, but measured commands fail with a clear error instead of crashing.
 
 ## Build
@@ -268,7 +278,7 @@ The registry now covers the full 63-counter target list from the original resear
 | `l1-store-miss` | stable | L1D store misses | `random-page-write` | `hot-seq-write` | store-heavy cold-page pattern |
 | `dtlb-miss` | stable | first-level data TLB misses | `page-stride-read` | `hot-seq-read` | page-granular data access |
 | `itlb-miss` | stable | instruction TLB misses | `random-instruction-pages` | `hot-instruction-loop` | generated executable stubs |
-| `l2-tlb-miss` | stable | second-level data TLB misses | `page-stride-read` | `hot-seq-read` | this project treats `L2_MISS` as TLB, not generic L2 cache |
+| `l2-tlb-miss` | stable | second-level data TLB misses | `page-stride-read` | `hot-seq-read` | a TLB event (`L2_TLB_MISS_DATA`), not a generic L2 cache miss |
 | `l1i-cache-miss` | experimental | L1I demand misses | `random-instruction-pages` | `hot-instruction-loop` | more code-shape sensitive |
 | `l1-load-miss-nonspec` | experimental | nonspec load misses | `random-pointer-chase` | `hot-seq-read` | semantics are more implementation-specific |
 | `l1-store-miss-nonspec` | experimental | nonspec store misses | `random-page-write` | `hot-seq-write` | write-allocate effects can complicate reading |
@@ -373,10 +383,14 @@ The direct `PerfScope` constructor still exists for dynamic cases, but the macro
 
 ## Repo Layout
 
-- [perf.h](/Users/eppie/codex_projects/cpu_counter/perf.h): shipped single-header library
-- [main.cpp](/Users/eppie/codex_projects/cpu_counter/main.cpp): CLI demo runner
-- [demos/catalog.h](/Users/eppie/codex_projects/cpu_counter/demos/catalog.h): registry types and shared demo declarations
-- [demos/catalog.cpp](/Users/eppie/codex_projects/cpu_counter/demos/catalog.cpp): counter catalog and workload registry
-- [demos/workloads.cpp](/Users/eppie/codex_projects/cpu_counter/demos/workloads.cpp): curated microarchitecture workloads
-- [tests/api_compile.cpp](/Users/eppie/codex_projects/cpu_counter/tests/api_compile.cpp): public API smoke test
-- [tests/registry_check.cpp](/Users/eppie/codex_projects/cpu_counter/tests/registry_check.cpp): stable registry validation
+- [perf.h](perf.h): shipped single-header library
+- [main.cpp](main.cpp): CLI demo runner
+- [demos/catalog.h](demos/catalog.h): registry types and shared demo declarations
+- [demos/catalog.cpp](demos/catalog.cpp): counter catalog and workload registry
+- [demos/workloads.cpp](demos/workloads.cpp): curated microarchitecture workloads
+- [tests/api_compile.cpp](tests/api_compile.cpp): public API smoke test
+- [tests/registry_check.cpp](tests/registry_check.cpp): stable registry validation
+
+## License
+
+MIT. See [LICENSE](LICENSE).
