@@ -117,6 +117,7 @@ void HotLoop() {
 - `PerfPrimeThread(...)`
 - `PerfPoint`
 - `PerfMeasure(...)`
+- types: `PerfMeasurement` (result), `PerfCounterSet` (a `CYCLES | ...` set), `PerfCounter` (one counter). In the global namespace the types are Perf-prefixed; the unprefixed `perf::CounterSet` / `perf::Counter` live inside the library's namespace.
 - curated counter bundles: `CACHE_PROFILE`, `BRANCH_PROFILE`, `FRONTEND_PROFILE`, `EXECUTION_PROFILE`
 
 ### Explicit Measurement API
@@ -135,6 +136,16 @@ if (measurement.valid) {
 }
 ```
 
+You only need to *name* the set type when you factor a measured region out behind a helper; otherwise pass the bare `CYCLES | ...` expression straight in. The type is `PerfCounterSet` at global scope (`perf::CounterSet` inside the library):
+
+```cpp
+template <class F>
+void profile(const char* label, PerfCounterSet counters, F&& f) {
+  PerfMeasurement m = PerfMeasure(counters, std::forward<F>(f));
+  if (m.valid) { /* read m.Get(CYCLES), m.Get(L1_LOAD_MISS), ... */ }
+}
+```
+
 `PerfMeasurement` includes:
 
 - `valid`
@@ -145,7 +156,7 @@ if (measurement.valid) {
 - `count`
 - `set`
 - raw counter deltas in `values`
-- `Get(Counter)`
+- `Get(PerfCounter)`
 - `HasActiveConfigurableCounters()`
 
 ### Thread Priming
