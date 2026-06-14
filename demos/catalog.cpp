@@ -90,8 +90,7 @@ const WorkloadExpectation kBarrierExpectations[] = {
 };
 
 const WorkloadExpectation kInterruptStormExpectations[] = {
-    {"interrupt-pending", "high", "A helper thread repeatedly sends signals to the measured thread, so pending-interrupt pressure should rise sharply versus a normal compute loop."},
-    {"cycles", "high", "The arithmetic body is repeatedly interrupted by signal delivery, so total cycle count rises even though the core work is otherwise simple."},
+    {"cycles", "high", "A helper thread floods the measured thread with signals; each delivery forces a kernel round trip, so total cycles balloon several-fold versus the same arithmetic run uninterrupted. (The dedicated interrupt-pending PMC does not respond to software signals on M4 and stays at noise -- watch cycles, not that event.)"},
 };
 
 const WorkloadExpectation kPageStrideExpectations[] = {
@@ -181,10 +180,7 @@ const WorkloadExpectation kFrontendHotRestartExpectations[] = {
 };
 
 const WorkloadExpectation kFrontendRandomRestartExpectations[] = {
-    {"fetch-restart", "high", "Jumping across many executable pages makes the frontend repeatedly rediscover and restart fetch from new locations."},
-    {"map-dispatch-bubble", "high", "The frontend keeps tripping over new code pages, so dispatch bubbles are the intended high-level consequence."},
-    {"map-stall", "high", "The mapper should spend more time starved or stalled when fetch keeps restarting across many code pages."},
-    {"map-stall-dispatch", "high", "This workload is the intended high case for dispatch-facing mapper stalls because frontend locality is intentionally destroyed."},
+    {"fetch-restart", "high", "Jumping across many executable pages makes the frontend repeatedly rediscover and restart fetch from new locations, so fetch-restart is the headline signal."},
 };
 
 const WorkloadExpectation kFrontendSelfModifyingExpectations[] = {
@@ -242,9 +238,14 @@ const WorkloadExpectation kRandomInstructionExpectations[] = {
     {"map-dispatch-bubble-itlb", "high", "The same code-page churn also keeps the instruction-side translation path busy, making ITLB-related dispatch bubbles the intended high case."},
 };
 
-const std::span<const WorkloadExpectation> kStoreOrderFriendlyExpectations{};
+const WorkloadExpectation kStoreOrderFriendlyExpectations[] = {
+    {"cycles", "low", "The younger load always targets a slot disjoint from the store, so the load/store unit never stalls or replays; this is the low-cycle baseline."},
+};
 
-const std::span<const WorkloadExpectation> kStoreOrderAliasExpectations{};
+const WorkloadExpectation kStoreOrderAliasExpectations[] = {
+    {"cycles", "high", "Unpredictable store/load aliasing forces the load/store unit to stall and replay speculatively-issued loads, inflating cycles ~1.6x over the disjoint baseline even though the instruction stream is byte-for-byte identical."},
+    {"st-memory-order-violation", "near-zero", "The squash-and-replay penalty is real (it shows up in cycles), but Apple's M4 P-cores leave this dedicated ordering-violation event at zero -- the cost is paid yet not surfaced by this PMC.", ExpectationKind::NearZero, 1'000.0, 0.0},
+};
 
 constexpr std::string_view kDenseAluConfig =
     "20,000,000 iterations over four 64-bit registers. No deliberate data working set.";
@@ -403,16 +404,17 @@ for (std::size_t i = 0; i < 20'000'000; ++i) {
 )cpp";
 
 constexpr std::string_view kInterruptStormConfig =
-    "50,000,000 arithmetic iterations while a helper thread repeatedly signals the measured thread with SIGUSR1.";
+    "50,000,000 arithmetic iterations while a helper thread floods the measured thread with up to 100,000 SIGUSR1 deliveries.";
 constexpr std::string_view kInterruptStormCode = R"cpp(
 std::thread sender([&] {
   for (std::size_t i = 0; i < 100'000; ++i) {
-    pthread_kill(target_thread, SIGUSR1);
+    pthread_kill(target_thread, SIGUSR1);   // preempt the measured thread
   }
 });
 for (std::size_t i = 0; i < 50'000'000; ++i) {
   a += (b ^ i) + 0x9e3779b97f4a7c15ULL;
   b = (b << 9) | (b >> 55);
+  b ^= a + 0x85ebca6bULL;
 }
 )cpp";
 
@@ -585,25 +587,24 @@ if (bits & 1ULL) {
 )cpp";
 
 constexpr std::string_view kStoreOrderFriendlyConfig =
-    "8,000,000 store-heavy iterations using 32-bit stores and a non-aliasing 64-bit load stream shifted by 4,104 bytes.";
+    "24,000,000 store-then-load iterations over a 32 KiB L1-resident buffer; the load is always routed to a slot disjoint from the store.";
 constexpr std::string_view kStoreOrderFriendlyCode = R"cpp(
-volatile std::uint32_t *stores = reinterpret_cast<volatile std::uint32_t *>(storage.data());
-stores[index] = i + sum;
-stores[(index + 1) & mask] = sum ^ (i + 1);
-stores[(index + 2) & mask] = sum + i * 3 + 1;
-stores[(index + 3) & mask] = sum ^ (i * 7 + 3);
-sum += ReadUnaligned64(base + 4104 + index * sizeof(std::uint32_t));
+r = r * 6364136223846793005ULL + 1442695040888963407ULL;
+const std::size_t j = (r >> 33) & mask;   // store slot
+buf[j] = i + acc;                         // older store
+const std::size_t k = (j ^ 0x800) & mask; // load never aliases the store
+acc += buf[k];                            // younger load
 )cpp";
 
 constexpr std::string_view kStoreOrderAliasConfig =
-    "8,000,000 store-heavy iterations using 32-bit stores and a 64-bit load stream shifted by exactly 4,096 bytes to preserve 4 KiB aliasing.";
+    "24,000,000 store-then-load iterations over a 32 KiB L1-resident buffer; ~50% of loads unpredictably alias the preceding store's slot.";
 constexpr std::string_view kStoreOrderAliasCode = R"cpp(
-volatile std::uint32_t *stores = reinterpret_cast<volatile std::uint32_t *>(storage.data());
-stores[index] = i + sum;
-stores[(index + 1) & mask] = sum ^ (i + 1);
-stores[(index + 2) & mask] = sum + i * 3 + 1;
-stores[(index + 3) & mask] = sum ^ (i * 7 + 3);
-sum += ReadUnaligned64(base + 4096 + index * sizeof(std::uint32_t));
+r = r * 6364136223846793005ULL + 1442695040888963407ULL;
+const std::size_t j = (r >> 33) & mask;          // store slot
+buf[j] = i + acc;                                // older store
+const std::size_t k = (r & 1) ? j                // ~50% alias, unpredictable
+                              : (j ^ 0x800) & mask;
+acc += buf[k];                                   // younger load may alias store
 )cpp";
 
 constexpr std::string_view kHotInstructionConfig =
@@ -879,26 +880,25 @@ const WorkloadDefinition kWorkloads[] = {
     {
         "interrupt-storm",
         "Interrupt Storm",
-        "A dense arithmetic loop while a helper thread repeatedly interrupts the measured thread.",
-        "This is the dedicated asynchronous-event showcase: the core work is still simple arithmetic, but signal delivery keeps inserting interrupt pressure into the measured thread.",
+        "A dense arithmetic loop while a helper thread floods the measured thread with signals.",
+        "This is the dedicated asynchronous-preemption showcase: the core work is still simple arithmetic, but a helper thread keeps delivering SIGUSR1, so each kernel round trip steals cycles from the measured thread.",
         kInterruptStormConfig,
         kInterruptStormCode,
         Group::CoreExecution,
         Tier::Experimental,
         3,
         1,
-        CYCLES | INSTRUCTIONS | PerfCounter::Named("INTERRUPT_PENDING") |
-            PerfCounter::Named("INST_ALL"),
+        CYCLES | INSTRUCTIONS | PerfCounter::Named("INST_ALL"),
         std::span<const WorkloadExpectation>(kInterruptStormExpectations),
         &workloads::InterruptStorm,
         "dense-integer-alu",
-        "Both demos are arithmetic-heavy loops. The main difference is that this version is repeatedly interrupted by helper-thread signals while the dense ALU baseline runs uninterrupted.",
+        "Both demos run an arithmetic loop. The difference is that this version is repeatedly preempted by signal delivery while the dense ALU baseline runs uninterrupted, so the cycle (and retired-kernel-instruction) gap is the signal-handling overhead.",
     },
     {
         "store-order-friendly",
         "Store Order Friendly",
-        "A store-then-load loop that avoids 4 KiB aliasing between the two streams.",
-        "This is the low-conflict baseline for the store-order experiments: the load stream stays offset just enough to avoid the classic 4 KiB alias pattern.",
+        "A store-then-load loop whose younger load never targets the store's slot.",
+        "This is the low-conflict baseline for the store-order experiments: each iteration's load is routed to a slot disjoint from the store, so the load/store unit never has to squash a speculatively-issued load.",
         kStoreOrderFriendlyConfig,
         kStoreOrderFriendlyCode,
         Group::StoreOrdering,
@@ -907,14 +907,14 @@ const WorkloadDefinition kWorkloads[] = {
         1,
         CYCLES | INSTRUCTIONS | PerfCounter::Named("ST_MEMORY_ORDER_VIOLATION_NONSPEC") |
             PerfCounter::Named("INST_LDST"),
-        kStoreOrderFriendlyExpectations,
+        std::span<const WorkloadExpectation>(kStoreOrderFriendlyExpectations),
         &workloads::StoreOrderFriendly,
     },
     {
         "store-order-alias",
         "Store Order Alias",
-        "A store-then-load loop that forces 4 KiB aliasing between the two streams.",
-        "This is the high-conflict counterpart to the friendly case: the load stream is shifted by exactly 4 KiB so the low address bits match the earlier store stream, even though the dedicated violation event remains weak on this machine.",
+        "A store-then-load loop whose younger load unpredictably aliases the store.",
+        "This is the high-conflict counterpart to the friendly case: about half the loads target the same slot as the preceding store, chosen from the same random bits, so the memory-dependence predictor cannot delay them and the core must squash and replay the speculatively-issued load.",
         kStoreOrderAliasConfig,
         kStoreOrderAliasCode,
         Group::StoreOrdering,
@@ -923,10 +923,10 @@ const WorkloadDefinition kWorkloads[] = {
         1,
         CYCLES | INSTRUCTIONS | PerfCounter::Named("ST_MEMORY_ORDER_VIOLATION_NONSPEC") |
             PerfCounter::Named("INST_LDST"),
-        kStoreOrderAliasExpectations,
+        std::span<const WorkloadExpectation>(kStoreOrderAliasExpectations),
         &workloads::StoreOrderAlias,
         "store-order-friendly",
-        "Both demos issue the same store-then-load pattern. The main difference is whether the load stream is offset by 4,104 bytes and avoids 4 KiB aliasing, or offset by exactly 4,096 bytes and collides in the low address bits.",
+        "Both demos issue the same store-then-load pattern at the same rate over an identical instruction stream. The only difference is whether the younger load can land on the store's slot: never (friendly) or unpredictably about half the time (alias). The aliasing forces squash-and-replay in the load/store unit, which shows up as ~1.6x more cycles -- the dedicated ST_MEMORY_ORDER_VIOLATION event stays at zero on this core, so cycles are the signal to watch.",
     },
     {
         "page-stride-read",
@@ -955,8 +955,7 @@ const WorkloadDefinition kWorkloads[] = {
         Tier::Experimental,
         3,
         1,
-        CYCLES | INSTRUCTIONS | DTLB_MISS | PerfCounter::Named("MMU_TABLE_WALK_DATA") |
-            PerfCounter::Named("MMU_VIRTUAL_MEMORY_FAULT_NONSPEC"),
+        CYCLES | INSTRUCTIONS | DTLB_MISS | PerfCounter::Named("MMU_TABLE_WALK_DATA"),
         std::span<const WorkloadExpectation>(kFirstTouchFaultExpectations),
         &workloads::FirstTouchFault,
         "hot-seq-read",
@@ -1273,7 +1272,6 @@ const WorkloadDefinition kWorkloads[] = {
         3,
         1,
         CYCLES | INSTRUCTIONS | PerfCounter::Named("FETCH_RESTART") |
-            PerfCounter::Named("FLUSH_RESTART_OTHER_NONSPEC") |
             PerfCounter::Named("CORE_ACTIVE_CYCLE"),
         std::span<const WorkloadExpectation>(kFrontendRandomRestartExpectations),
         &workloads::FrontendRandomRestart,

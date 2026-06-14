@@ -657,6 +657,16 @@ namespace workloads {
 }
 
 [[gnu::noinline]] std::uint64_t InterruptStorm(DemoEnvironment &) {
+  // A helper thread floods the measured thread with SIGUSR1. Each delivered
+  // signal forces a kernel round trip (exception entry, handler, sigreturn) that
+  // inflates the measured thread's cycle count several-fold even though the user
+  // arithmetic body is unchanged -- a direct demonstration of asynchronous
+  // preemption cost.
+  //
+  // NOTE: this does NOT move the INTERRUPT_PENDING PMC. Software signals are
+  // delivered as ASTs on return-to-userspace, not via the hardware interrupt-
+  // pending line, so that event stays at noise on M4 (a cross-core TLB-shootdown
+  // redesign also failed to move it). The real, teachable signal here is cycles.
   struct sigaction action {};
   struct sigaction old_action {};
   action.sa_handler = &InterruptSignalHandler;
@@ -992,50 +1002,51 @@ namespace workloads {
   return sum;
 }
 
-[[gnu::noinline]] std::uint64_t StoreOrderFriendly(DemoEnvironment &) {
-  constexpr std::size_t kBaseWords = 1u << 15;
-  constexpr std::size_t kOffsetBytes = 4104;
-  constexpr std::size_t kMask = kBaseWords - 1;
-  constexpr std::size_t kIters = 8'000'000;
-  std::vector<std::uint8_t> storage(kBaseWords * sizeof(std::uint32_t) + kOffsetBytes + 16, 0);
-  volatile std::uint32_t *stores = reinterpret_cast<volatile std::uint32_t *>(storage.data());
-  auto *base = storage.data();
-  std::size_t index = 0;
-  std::uint64_t sum = 0;
+// Shared core for the store-order pair. Each iteration issues a store to an
+// unpredictable slot, then a younger load. When `allow_alias` is set, that load
+// targets the *same* slot as the store about half the time, but chosen from the
+// same random bits that pick the slot -- so the relationship is unlearnable and
+// the memory-dependence (store-set) predictor cannot reliably delay the load.
+// The load therefore speculatively issues ahead of the older aliasing store and,
+// when the alias actually materializes, the core must squash and replay it: a
+// ST_MEMORY_ORDER_VIOLATION. The friendly variant routes the load to a disjoint
+// slot every time, so there is nothing to mis-speculate.
+//
+// The buffer is a single L1-resident page set so miss latency does not swamp the
+// ordering signal, and the store address depends only on the fast LCG while the
+// store *data* depends on the slow load-carried accumulator -- the asymmetry that
+// lets the younger load run ahead of the store it depends on.
+[[gnu::noinline, gnu::flatten]] std::uint64_t StoreOrderViolationCore(bool allow_alias) {
+  constexpr std::size_t kWords = 1u << 12;  // 4096 * 8B = 32 KiB, stays in L1D
+  constexpr std::size_t kMask = kWords - 1;
+  constexpr std::size_t kAliasBit = 0x800;  // bit 11: in range, flips the slot
+  constexpr std::size_t kIters = 24'000'000;
+  std::vector<std::uint64_t> storage(kWords, 0);
+  std::uint64_t *buf = storage.data();
+  std::uint64_t r = 0x9e3779b97f4a7c15ULL;
+  std::uint64_t acc = 0;
   for (std::size_t i = 0; i < kIters; ++i) {
-    index = (((sum >> 7) + index * 1315423911ULL + 17ULL) & kMask) & ~std::size_t{1};
-    stores[index] = static_cast<std::uint32_t>(i + sum);
-    stores[(index + 1) & kMask] = static_cast<std::uint32_t>(sum ^ (i + 1));
-    stores[(index + 2) & kMask] = static_cast<std::uint32_t>(sum + i * 3 + 1);
-    stores[(index + 3) & kMask] = static_cast<std::uint32_t>(sum ^ (i * 7 + 3));
-    std::atomic_signal_fence(std::memory_order_seq_cst);
-    sum += ReadUnaligned64(base + kOffsetBytes + index * sizeof(std::uint32_t));
+    r = r * 6364136223846793005ULL + 1442695040888963407ULL;
+    const std::size_t j = static_cast<std::size_t>(r >> 33) & kMask;  // store slot
+    buf[j] = i + acc;                                                 // older store
+    std::size_t k;
+    if (allow_alias) {
+      k = (r & 1u) ? j : ((j ^ kAliasBit) & kMask);  // ~50% alias, unpredictable
+    } else {
+      k = (j ^ kAliasBit) & kMask;                   // never the store's slot
+    }
+    acc += buf[k];                                                   // younger load
   }
-  g_sink ^= sum;
-  return sum;
+  g_sink ^= acc;
+  return acc;
+}
+
+[[gnu::noinline]] std::uint64_t StoreOrderFriendly(DemoEnvironment &) {
+  return StoreOrderViolationCore(false);
 }
 
 [[gnu::noinline]] std::uint64_t StoreOrderAlias(DemoEnvironment &) {
-  constexpr std::size_t kBaseWords = 1u << 15;
-  constexpr std::size_t kOffsetBytes = 4096;
-  constexpr std::size_t kMask = kBaseWords - 1;
-  constexpr std::size_t kIters = 8'000'000;
-  std::vector<std::uint8_t> storage(kBaseWords * sizeof(std::uint32_t) + kOffsetBytes + 16, 0);
-  volatile std::uint32_t *stores = reinterpret_cast<volatile std::uint32_t *>(storage.data());
-  auto *base = storage.data();
-  std::size_t index = 0;
-  std::uint64_t sum = 0;
-  for (std::size_t i = 0; i < kIters; ++i) {
-    index = (((sum >> 7) + index * 1315423911ULL + 17ULL) & kMask) & ~std::size_t{1};
-    stores[index] = static_cast<std::uint32_t>(i + sum);
-    stores[(index + 1) & kMask] = static_cast<std::uint32_t>(sum ^ (i + 1));
-    stores[(index + 2) & kMask] = static_cast<std::uint32_t>(sum + i * 3 + 1);
-    stores[(index + 3) & kMask] = static_cast<std::uint32_t>(sum ^ (i * 7 + 3));
-    std::atomic_signal_fence(std::memory_order_seq_cst);
-    sum += ReadUnaligned64(base + kOffsetBytes + index * sizeof(std::uint32_t));
-  }
-  g_sink ^= sum;
-  return sum;
+  return StoreOrderViolationCore(true);
 }
 
 [[gnu::noinline]] std::uint64_t HotInstructionLoop(DemoEnvironment &state) {
