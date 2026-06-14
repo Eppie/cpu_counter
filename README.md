@@ -266,52 +266,13 @@ Each counter has:
 - curated low demo
 - validation rule
 
-### Current Stable Demos
+### Demo tiers
 
-Stable showcase workloads currently include:
+35 of the 39 demos are now `stable` — validated teaching pairs whose headline counter separates cleanly and reliably on the reference M4 (run `cpu_counter list demos --tier stable` for the full set). Only four remain `experimental`, each because its *named* counter cannot be made to fire on this silicon (see [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md)):
 
-- `dense-integer-alu`
-- `hot-seq-read`
-- `linear-pointer-chase`
-- `random-pointer-chase`
-- `hot-seq-write`
-- `random-page-write`
-- `page-stride-read`
-- `predictable-branch`
-- `unpredictable-branch`
-- `hot-instruction-loop`
-- `random-instruction-pages`
-
-Experimental showcase workloads currently include:
-
-- `scalar-stream-read`
-- `nt-stream-read`
-- `simd-stream-read`
-- `aligned-x64-load`
-- `cross-x64-load`
-- `aligned-page-load`
-- `cross-page-load`
-- `scalar-stream-write`
-- `nt-stream-write`
-- `simd-stream-write`
-- `uncontended-atomic-cas`
-- `contended-atomic-cas`
-- `barrier-loop`
-- `interrupt-storm`
-- `store-order-friendly`
-- `store-order-alias`
-- `first-touch-fault`
-- `aligned-x64-store`
-- `cross-x64-store`
-- `aligned-page-store`
-- `cross-page-store`
-- `simd-vector-alu`
-- `dispatch-int-alu`
-- `dispatch-memory-stream`
-- `dispatch-simd-alu`
-- `frontend-hot-restart`
-- `frontend-random-restart`
-- `frontend-self-modifying-restart`
+- `interrupt-storm` — `INTERRUPT_PENDING` counts only cycles where an interrupt is pending *because masked*, which EL0 cannot produce; the demo teaches asynchronous-preemption cost through cycles (~5x) instead.
+- `store-order-friendly` / `store-order-alias` — `ST_MEMORY_ORDER_VIOLATION` stays at zero (the aliasing causes forwarding replays, not architectural violations); the real ~1.6x penalty shows up in cycles.
+- `nt-stream-write` — `ST_NT_UOP` fires correctly, but its current contrast (`hot-seq-write`) also drives it, so the pair does not separate cleanly yet.
 
 ### Counter Support Table
 
@@ -333,34 +294,34 @@ The registry now covers the full 63-counter target list from the original resear
 | `l1-store-miss-nonspec` | experimental | nonspec store misses | `random-page-write` | `hot-seq-write` | write-allocate effects can complicate reading |
 | `inst-all` | experimental | aggregate retired instructions | `dense-integer-alu` | `random-pointer-chase` | PMU-event view of overall retired instructions |
 | `core-active-cycle` | experimental | cycles where the core stayed actively busy | `dispatch-int-alu` | `random-pointer-chase` | dense compute versus latency-stalled pointer chasing |
-| `interrupt-pending` | experimental | pending-interrupt pressure on the measured core | `interrupt-storm` | `dense-integer-alu` | driven by helper-thread signal delivery rather than background system noise |
+| `interrupt-pending` | experimental | pending-interrupt pressure on the measured core | `interrupt-storm` | `dense-integer-alu` | counts only masked-pending cycles; EL0 can't mask interrupts, so it stays at noise — the demo's real signal is cycles |
 | `inst-int-alu` | experimental | retired integer ALU instructions | `dense-integer-alu` | `hot-seq-read` | pure compute versus memory-heavy access |
 | `retire-uop` | experimental | retired micro-ops | `dispatch-int-alu` | `random-pointer-chase` | lower-level counterpart to instruction retirement |
 | `map-uop` | experimental | mapped micro-ops | `dispatch-int-alu` | `random-pointer-chase` | broad frontend-to-backend uop flow |
-| `map-int-uop` | experimental | mapped integer-class uops | `dispatch-int-alu` | `dispatch-simd-alu` | scalar integer mapping versus SIMD mapping |
-| `inst-simd-alu` | experimental | retired SIMD arithmetic instructions | `simd-vector-alu` | `dense-integer-alu` | vector-compute counterpart to scalar integer ALU |
-| `map-simd-uop` | experimental | mapped SIMD-class uops | `dispatch-simd-alu` | `dispatch-int-alu` | SIMD mapping versus scalar integer mapping |
-| `inst-simd-ld` | experimental | retired SIMD load instructions | `simd-stream-read` | `scalar-stream-read` | same stream, different load instruction class |
-| `inst-int-ld` | experimental | retired integer load instructions | `random-pointer-chase` | `dense-integer-alu` | good load-heavy versus register-only contrast |
-| `ld-nt-uop` | experimental | non-temporal load uops | `nt-stream-read` | `scalar-stream-read` | same stream, but explicitly requests the NT load path |
-| `inst-simd-st` | experimental | retired SIMD store instructions | `simd-stream-write` | `scalar-stream-write` | same stream, different store instruction class |
-| `atomic-succ` | experimental | successful atomic/exclusive ops | `uncontended-atomic-cas` | `dense-integer-alu` | direct atomic-success teaching counter |
-| `atomic-fail` | experimental | failed atomic/exclusive ops | `contended-atomic-cas` | `uncontended-atomic-cas` | retry-heavy compare-exchange under contention |
-| `inst-int-st` | experimental | retired integer store instructions | `random-page-write` | `dense-integer-alu` | clearest store-side trigger in the current lab |
+| `map-int-uop` | stable | mapped integer-class uops | `dispatch-int-alu` | `dispatch-simd-alu` | scalar integer mapping versus SIMD mapping |
+| `inst-simd-alu` | stable | retired SIMD arithmetic instructions | `simd-vector-alu` | `dense-integer-alu` | vector-compute counterpart to scalar integer ALU |
+| `map-simd-uop` | stable | mapped SIMD-class uops | `dispatch-simd-alu` | `dispatch-int-alu` | SIMD mapping versus scalar integer mapping |
+| `inst-simd-ld` | stable | retired SIMD load instructions | `simd-stream-read` | `scalar-stream-read` | same stream, different load instruction class |
+| `inst-int-ld` | stable | retired integer load instructions | `random-pointer-chase` | `dense-integer-alu` | good load-heavy versus register-only contrast |
+| `ld-nt-uop` | stable | non-temporal load uops | `nt-stream-read` | `scalar-stream-read` | same stream, but explicitly requests the NT load path |
+| `inst-simd-st` | stable | retired SIMD store instructions | `simd-stream-write` | `scalar-stream-write` | same stream, different store instruction class |
+| `atomic-succ` | stable | successful atomic/exclusive ops | `uncontended-atomic-cas` | `dense-integer-alu` | direct atomic-success teaching counter |
+| `atomic-fail` | stable | failed atomic/exclusive ops | `contended-atomic-cas` | `uncontended-atomic-cas` | retry-heavy compare-exchange under contention |
+| `inst-int-st` | stable | retired integer store instructions | `random-page-write` | `dense-integer-alu` | clearest store-side trigger in the current lab |
 | `st-nt-uop` | experimental | non-temporal store uops | `nt-stream-write` | `scalar-stream-write` | same stream, but explicitly requests the NT store path |
-| `st-memory-order-violation` | experimental | non-speculative store/load ordering violations | `store-order-alias` | `store-order-friendly` | experimental 4 KiB-alias stress pair |
+| `st-memory-order-violation` | experimental | non-speculative store/load ordering violations | `store-order-alias` | `store-order-friendly` | unpredictable aliasing costs ~1.6x cycles, but this architectural-violation event stays at zero on M4 — watch cycles |
 | `inst-ldst` | experimental | retired load/store instructions | `random-pointer-chase` | `dense-integer-alu` | broad memory-instruction mix signal |
-| `map-ldst-uop` | experimental | mapped load/store uops | `dispatch-memory-stream` | `dispatch-int-alu` | separates memory-stream mapping from scalar compute |
+| `map-ldst-uop` | stable | mapped load/store uops | `dispatch-memory-stream` | `dispatch-int-alu` | separates memory-stream mapping from scalar compute |
 | `ld-unit-uop` | experimental | load-unit micro-ops | `random-pointer-chase` | `dense-integer-alu` | often tracks load pressure more directly than retired instructions |
 | `st-unit-uop` | experimental | store-unit micro-ops | `random-page-write` | `dense-integer-alu` | store pressure teaching counter |
 | `l1d-writeback` | experimental | L1D writebacks | `random-page-write` | `hot-seq-write` | useful for dirty-line eviction behavior |
-| `inst-barrier` | experimental | retired barrier instructions | `barrier-loop` | `dense-integer-alu` | ordering-heavy versus straight compute |
+| `inst-barrier` | stable | retired barrier instructions | `barrier-loop` | `dense-integer-alu` | ordering-heavy versus straight compute |
 | `dtlb-access` | experimental | DTLB accesses | `page-stride-read` | `hot-seq-read` | shows translation activity before misses alone |
 | `dtlb-fill` | experimental | DTLB fills | `page-stride-read` | `hot-seq-read` | emphasizes refills of translation entries |
-| `mmu-table-walk-data` | experimental | data-side page table walks | `page-stride-read` | `hot-seq-read` | clearest real table-walk trigger in the lab |
-| `mmu-virtual-memory-fault` | experimental | data-side virtual-memory faults | `first-touch-fault` | `hot-seq-read` | deliberately faults in a fresh anonymous mapping |
+| `mmu-table-walk-data` | stable | data-side page table walks | `page-stride-read` | `hot-seq-read` | clearest real table-walk trigger in the lab |
+| `mmu-virtual-memory-fault` | experimental | data-side virtual-memory faults | `first-touch-fault` | `hot-seq-read` | stays at zero on M4 (demand faults don't register); the demo's real signals are `dtlb-miss` and `mmu-table-walk-data` |
 | `dtlb-miss-nonspec` | experimental | nonspec DTLB misses | `page-stride-read` | `hot-seq-read` | alternate view of the same sparse-page translation story |
-| `branch-cond-miss` | experimental | conditional branch mispredicts | `unpredictable-branch` | `predictable-branch` | branch-miss story limited to conditional branches |
+| `branch-cond-miss` | stable | conditional branch mispredicts | `unpredictable-branch` | `predictable-branch` | branch-miss story limited to conditional branches |
 | `map-rewind` | experimental | mapper rewind events | `unpredictable-branch` | `predictable-branch` | intended to show speculative work getting thrown away |
 | `inst-branch-cond` | experimental | retired conditional branches | `unpredictable-branch` | `dense-integer-alu` | branch-heavy versus mostly straight-line code |
 | `inst-branch-taken` | experimental | retired taken branches | `predictable-branch` | `dense-integer-alu` | biased-taken branch pattern is the clean high case |
@@ -370,8 +331,8 @@ The registry now covers the full 63-counter target list from the original resear
 | `branch-call-indir-miss` | experimental | indirect-call mispredicts | `random-instruction-pages` | `hot-instruction-loop` | changing function-pointer targets versus one stable target |
 | `branch-indir-miss` | experimental | indirect-branch mispredicts | `random-instruction-pages` | `hot-instruction-loop` | general indirect-target churn showcase |
 | `branch-ret-indir-miss` | experimental | return-side indirect-branch mispredicts | `random-instruction-pages` | `hot-instruction-loop` | best available return-target stress case in the lab |
-| `fetch-restart` | experimental | frontend fetch restart events | `frontend-random-restart` | `frontend-hot-restart` | code-page churn versus one hot stub |
-| `flush-restart-other` | experimental | non-branch frontend flush/restart events | `frontend-self-modifying-restart` | `frontend-hot-restart` | explicit code rewriting plus I-cache invalidation is a better probe than plain code-page churn |
+| `fetch-restart` | stable | frontend fetch restart events | `frontend-random-restart` | `frontend-hot-restart` | code-page churn versus one hot stub |
+| `flush-restart-other` | stable | non-branch frontend flush/restart events | `frontend-self-modifying-restart` | `frontend-hot-restart` | explicit code rewriting plus I-cache invalidation is a better probe than plain code-page churn |
 | `map-dispatch-bubble` | experimental | mapper/dispatch bubbles | `frontend-random-restart` | `frontend-hot-restart` | hot versus randomized code-page locality |
 | `map-dispatch-bubble-ic` | experimental | instruction-cache-driven dispatch bubbles | `random-instruction-pages` | `hot-instruction-loop` | explicit code-cache churn teaching case |
 | `map-dispatch-bubble-itlb` | experimental | instruction-TLB-driven dispatch bubbles | `random-instruction-pages` | `hot-instruction-loop` | explicit ITLB-churn teaching case |
@@ -380,8 +341,8 @@ The registry now covers the full 63-counter target list from the original resear
 | `l1i-tlb-fill` | experimental | instruction-side TLB fills | `random-instruction-pages` | `hot-instruction-loop` | code-page churn refill signal |
 | `l2-tlb-miss-instruction` | experimental | second-level instruction TLB misses | `random-instruction-pages` | `hot-instruction-loop` | instruction-side analogue of the data TLB story |
 | `mmu-table-walk-instruction` | experimental | instruction-side page walks | `random-instruction-pages` | `hot-instruction-loop` | frontend page-walk teaching counter |
-| `ldst-x64-uop` | experimental | 64-byte split load/store uops | `cross-x64-load` | `aligned-x64-load` | teaches 64B split accesses directly |
-| `ldst-xpg-uop` | experimental | cross-page load/store uops | `cross-page-load` | `aligned-page-load` | teaches page-spanning accesses directly |
+| `ldst-x64-uop` | stable | 64-byte split load/store uops | `cross-x64-load` | `aligned-x64-load` | teaches 64B split accesses directly |
+| `ldst-xpg-uop` | stable | cross-page load/store uops | `cross-page-load` | `aligned-page-load` | teaches page-spanning accesses directly |
 
 ## 3. Stability Tiers and Core-Type Caveats
 

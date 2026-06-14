@@ -73,27 +73,56 @@ than assuming the counter is broken.
   teaching examples. Some are structurally sound but machine-specific; others are
   genuinely weak on current hardware.
 
-## Counters that are weak or hardware-sensitive
+## Counters that are dead or unreachable from userspace on M4 (and why)
 
-These are the experimental cases most likely to disappoint on a given machine,
-and why. They remain in the catalog as research probes.
+Each of these has a *correct* trigger in the catalog and the event exists in this
+machine's kpep database (`as4-1`), yet it reads zero or noise. The reasons come
+from the reverse-engineered event descriptions (see links at the end) plus
+measured runs on the reference M4:
 
-- **`inst-barrier` (`barrier-loop`)** — separation depends on the barrier
-  instruction mix being counted distinctly from surrounding work. The demo adds
-  an `INST_ALL` companion so the low baseline still proves the PMU is live.
-- **`interrupt-pending` (`interrupt-storm`)** — driven by helper-thread signal
-  delivery, which is OS-sensitive. Whether it moves enough to be a reliable
-  teaching case varies by system load.
-- **`st-memory-order-violation` (`store-order-friendly` / `store-order-alias`)**
-  — a 4 KiB-alias store/load ordering stress pair. Whether this event fires at
-  all is highly core-specific.
-- **`ld-nt-uop` (`nt-stream-read`)** — uses explicit `ldnp` pair loads on Arm64.
-  Whether the event responds to `ldnp` depends on how narrowly the core defines
-  the non-temporal load path.
-- **`mmu-virtual-memory-fault` (`first-touch-fault`)** — faults pages in from a
-  fresh mapping using signal recovery and `mprotect`. Whether the event observes
-  user-space protection-fault-driven page materialization is uncertain on some
-  cores.
+- **`interrupt-pending` (`interrupt-storm`)** — the event is literally *"cycles
+  while an interrupt was pending **because it was masked**."* User code (EL0)
+  cannot mask interrupts, so there is never a masked-pending window to count.
+  Plain software signals (delivered as ASTs on return-to-userspace) read ~24, and
+  a cross-core TLB-shootdown IPI storm read **0** — both confirmed empirically. The
+  demo therefore teaches asynchronous-preemption cost through **cycles** (a real
+  ~5x blowup vs. the same loop uninterrupted) and keeps `interrupt-pending` only
+  as a documented zero probe.
+- **`st-memory-order-violation` (`store-order-alias` / `store-order-friendly`)** —
+  the event counts *"retired store uops that triggered memory order violations
+  with load uops,"* i.e. an architectural memory-consistency squash, which is
+  genuinely rare in single-threaded code. The redesigned pair uses unpredictable,
+  data-dependent store/load aliasing to provoke load/store-unit replays; that
+  penalty is **real and shows up as ~1.6x cycles** over an otherwise identical
+  instruction stream, but the replays are forwarding/disambiguation stalls rather
+  than architectural violations, so the dedicated PMC stays at zero. Cycles are the
+  signal; the event is kept as a documented zero probe.
+- **`mmu-virtual-memory-fault` (`first-touch-fault`)** — described as *"memory
+  accesses that reached retirement that triggered MMU virtual-memory faults."*
+  Demand-paging first touches are resolved by the kernel VM layer and do not
+  register as retirement-time MMU faults on M4 P-cores. The first-touch demo's
+  real, large signals are `dtlb-miss` and `mmu-table-walk-data` (which separate by
+  tens of thousands of x), so the fault event is not part of its claimed
+  expectations.
+
+## Counters that initially looked weak but are validated on M4
+
+Earlier drafts flagged these as uncertain; fresh measured runs prove they work,
+and the reverse-engineered descriptions explain why:
+
+- **`ld-nt-uop` / `st-nt-uop` (`nt-stream-read` / `nt-stream-write`)** — *"load /
+  store uops that executed with non-temporal hint."* Explicit `ldnp` / `stnp` pair
+  ops carry the hint, so they separate ~400,000x against the temporal baseline. (An
+  earlier `__builtin_nontemporal_load` version did **not** lower to `ldnp` and read
+  ~80 — the inline-asm rewrite is what fixed it.)
+- **`inst-barrier` (`barrier-loop`)** — *"retired **data** barrier instructions."*
+  `dmb ish` is a data barrier, so the count lands exactly on the 20,000,000 loop
+  trips, infinitely separated from the barrier-free baseline.
+- **`flush-restart-other` (`frontend-self-modifying-restart`)** — *"pipeline flush
+  and restarts **not** due to branch mispredictions or memory order violations."*
+  Rewriting live code forces true pipeline flushes (~200k counts, ~27,000x
+  separation). Plain code-page churn only triggers *fetch* restarts, which is why
+  `frontend-random-restart` headlines `fetch-restart` instead of this event.
 
 ## Runner policy notes
 
@@ -109,13 +138,25 @@ mind when interpreting results:
 - Compare-mode warnings fire only when the contrast workload expects the opposite
   direction, not when both workloads intentionally expect "high".
 
-## Open questions
+## Resolved questions
 
-Genuinely unresolved on the reference hardware:
+Previously open, now answered on the reference M4 — from measured runs combined
+with the reverse-engineered event table:
 
-- Is `interrupt-pending` inherently too OS-sensitive for a reliable demo?
-- Is `st-memory-order-violation` meaningful enough on current cores to deserve a
-  first-class demo?
-- Do `ldnp` / `stnp` map to the PMU's `LD_NT_UOP` / `ST_NT_UOP` definitions?
-- Does `MMU_VIRTUAL_MEMORY_FAULT_NONSPEC` observe user-space protection-fault
-  page materialization at all?
+- **Does `interrupt-pending` move from userspace?** No. It counts only cycles
+  where an interrupt is pending *because masked*, and EL0 cannot mask interrupts.
+  Neither signal storms nor TLB-shootdown IPIs reach it.
+- **Is `st-memory-order-violation` reachable single-threaded?** Not as the
+  dedicated event. Unpredictable store/load aliasing does cost ~1.6x cycles, but
+  that is a forwarding/replay stall, not the architectural ordering violation the
+  PMC counts.
+- **Do `ldnp` / `stnp` map to `LD_NT_UOP` / `ST_NT_UOP`?** Yes — they carry the
+  non-temporal hint and the events count them (~400,000x separation).
+- **Does `MMU_VIRTUAL_MEMORY_FAULT_NONSPEC` observe userspace demand faults?** No.
+  First-touch faulting drives `dtlb-miss` and `mmu-table-walk-data` instead.
+
+Event descriptions were cross-referenced against the community reverse-engineering
+at <https://github.com/jiegec/apple-pmu> (its `as4` table matches this machine's
+`as4-1` database) and <https://github.com/dougallj/applecpu>. The per-event "which
+ELx modes count" gating lives in `PMCR1_EL1`; the demo lab measures EL0 (user)
+activity, which is why the masked-interrupt event is structurally out of reach.
