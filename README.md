@@ -293,7 +293,7 @@ The registry now covers the full 63-counter target list from the original resear
 | `l1-load-miss-nonspec` | stable | nonspec load misses | `random-pointer-chase` | `hot-seq-read` | semantics are more implementation-specific |
 | `l1-store-miss-nonspec` | stable | nonspec store misses | `random-page-write` | `hot-seq-write` | write-allocate effects can complicate reading |
 | `inst-all` | stable | aggregate retired instructions | `dense-integer-alu` | `random-pointer-chase` | PMU-event view of overall retired instructions |
-| `core-active-cycle` | experimental | cycles where the core stayed actively busy | `dispatch-int-alu` | `random-pointer-chase` | dense compute versus latency-stalled pointer chasing |
+| `core-active-cycle` | stable | cycles where the core stayed actively busy | `random-pointer-chase` | `frontend-self-modifying-restart` | busy-waiting on misses counts as active (~95%); only idle/syscall time (self-modifying, ~11%) does not |
 | `interrupt-pending` | experimental | pending-interrupt pressure on the measured core | `interrupt-storm` | `dense-integer-alu` | counts only masked-pending cycles; EL0 can't mask interrupts, so it stays at noise — the demo's real signal is cycles |
 | `inst-int-alu` | stable | retired integer ALU instructions | `dense-integer-alu` | `hot-seq-read` | pure compute versus memory-heavy access |
 | `retire-uop` | stable | retired micro-ops | `dispatch-int-alu` | `random-pointer-chase` | lower-level counterpart to instruction retirement |
@@ -316,7 +316,7 @@ The registry now covers the full 63-counter target list from the original resear
 | `st-unit-uop` | stable | store-unit micro-ops | `random-page-write` | `dense-integer-alu` | store pressure teaching counter |
 | `l1d-writeback` | stable | L1D writebacks | `random-page-write` | `hot-seq-write` | useful for dirty-line eviction behavior |
 | `inst-barrier` | stable | retired barrier instructions | `barrier-loop` | `dense-integer-alu` | ordering-heavy versus straight compute |
-| `dtlb-access` | experimental | DTLB accesses | `page-stride-read` | `hot-seq-read` | shows translation activity before misses alone |
+| `dtlb-access` | stable | DTLB accesses | `hot-seq-read` | `dense-integer-alu` | an access count, not misses: every data access consults the DTLB, so memory-heavy vs register-only separates it |
 | `dtlb-fill` | stable | DTLB fills | `page-stride-read` | `hot-seq-read` | emphasizes refills of translation entries |
 | `mmu-table-walk-data` | stable | data-side page table walks | `page-stride-read` | `hot-seq-read` | clearest real table-walk trigger in the lab |
 | `mmu-virtual-memory-fault` | experimental | data-side virtual-memory faults | `first-touch-fault` | `hot-seq-read` | stays at zero on M4 (demand faults don't register); the demo's real signals are `dtlb-miss` and `mmu-table-walk-data` |
