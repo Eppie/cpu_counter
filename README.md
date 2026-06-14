@@ -272,7 +272,7 @@ Each counter has:
 
 - `interrupt-storm` — `INTERRUPT_PENDING` counts only cycles where an interrupt is pending *because masked*, which EL0 cannot produce; the demo teaches asynchronous-preemption cost through cycles (~5x) instead.
 - `store-order-friendly` / `store-order-alias` — `ST_MEMORY_ORDER_VIOLATION` stays at zero (the aliasing causes forwarding replays, not architectural violations); the real ~1.6x penalty shows up in cycles.
-- `nt-stream-write` — `ST_NT_UOP` fires correctly, but its current contrast (`hot-seq-write`) also drives it, so the pair does not separate cleanly yet.
+- `nt-stream-write` — `ST_NT_UOP` is not non-temporal-specific on M4: it counts ~all scalar store uops (≈ `inst-int-st`), so a `stnp` stream cannot be separated from a plain-store baseline. Its load-side twin `ld-nt-uop` *is* `ldnp`-specific and is stable.
 
 ### Counter Support Table
 
@@ -308,7 +308,7 @@ The registry now covers the full 63-counter target list from the original resear
 | `atomic-succ` | stable | successful atomic/exclusive ops | `uncontended-atomic-cas` | `dense-integer-alu` | direct atomic-success teaching counter |
 | `atomic-fail` | stable | failed atomic/exclusive ops | `contended-atomic-cas` | `uncontended-atomic-cas` | retry-heavy compare-exchange under contention |
 | `inst-int-st` | stable | retired integer store instructions | `random-page-write` | `dense-integer-alu` | clearest store-side trigger in the current lab |
-| `st-nt-uop` | experimental | non-temporal store uops | `nt-stream-write` | `scalar-stream-write` | same stream, but explicitly requests the NT store path |
+| `st-nt-uop` | experimental | non-temporal store uops | `nt-stream-write` | `hot-seq-write` | counts ~all scalar store uops on M4 (≈ `inst-int-st`), so it does not isolate the NT store path — unlike the `ldnp`-specific `ld-nt-uop` |
 | `st-memory-order-violation` | experimental | non-speculative store/load ordering violations | `store-order-alias` | `store-order-friendly` | unpredictable aliasing costs ~1.6x cycles, but this architectural-violation event stays at zero on M4 — watch cycles |
 | `inst-ldst` | experimental | retired load/store instructions | `random-pointer-chase` | `dense-integer-alu` | broad memory-instruction mix signal |
 | `map-ldst-uop` | stable | mapped load/store uops | `dispatch-memory-stream` | `dispatch-int-alu` | separates memory-stream mapping from scalar compute |

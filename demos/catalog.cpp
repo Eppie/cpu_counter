@@ -61,7 +61,7 @@ const WorkloadExpectation kScalarStreamWriteExpectations[] = {
 };
 
 const WorkloadExpectation kNtStreamWriteExpectations[] = {
-    {"st-nt-uop", "high", "This stream explicitly requests non-temporal stores, so the non-temporal store-uop counter is the main signal to watch."},
+    {"st-nt-uop", "high", "Explicit stnp pair stores light this up -- but on M4 P-cores so do ordinary scalar stores, so st-nt-uop just tracks scalar store uops (about equal to inst-int-st here) and does not isolate the non-temporal path; see docs/LIMITATIONS.md."},
     {"inst-int-st", "high", "The body is still scalar and store-heavy, so scalar store retirement should remain visible."},
 };
 
@@ -1615,8 +1615,8 @@ const CounterDefinition kCounters[] = {
     {
         "st-nt-uop",
         "Non-Temporal Store Uops",
-        "Store-side uops that use the non-temporal path.",
-        "The non-temporal stream-write demo keeps the footprint fixed and changes only the store path, which is the cleanest teaching case available here.",
+        "Nominally store-side uops on the non-temporal path; on M4 P-cores it counts roughly all scalar store uops.",
+        "Unlike ld-nt-uop (which is ldnp-specific), this fires for ordinary scalar stores too, so it does not isolate the non-temporal path and is effectively redundant with inst-int-st on this core; kept as a probe.",
         Group::StoreOrdering,
         Tier::Experimental,
         PerfCounter::Named("ST_NT_UOP"),

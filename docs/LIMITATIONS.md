@@ -104,17 +104,24 @@ measured runs on the reference M4:
   real, large signals are `dtlb-miss` and `mmu-table-walk-data` (which separate by
   tens of thousands of x), so the fault event is not part of its claimed
   expectations.
+- **`st-nt-uop` (`nt-stream-write`)** — *not dead, but non-discriminating.* Unlike
+  its load-side twin `ld-nt-uop` (which is `ldnp`-specific and separates ~340,000x),
+  `ST_NT_UOP` increments roughly once per scalar store **regardless of the
+  non-temporal hint**: a `stnp` stream and a plain-store loop both read ≈ their
+  `INST_INT_ST` count (~33M vs ~31M, a 1.07x "separation"). On M4 P-cores it tracks
+  store-unit uops broadly, so it cannot isolate the non-temporal store path and is
+  effectively redundant with `inst-int-st`. The demo is kept as a probe.
 
 ## Counters that initially looked weak but are validated on M4
 
 Earlier drafts flagged these as uncertain; fresh measured runs prove they work,
 and the reverse-engineered descriptions explain why:
 
-- **`ld-nt-uop` / `st-nt-uop` (`nt-stream-read` / `nt-stream-write`)** — *"load /
-  store uops that executed with non-temporal hint."* Explicit `ldnp` / `stnp` pair
-  ops carry the hint, so they separate ~400,000x against the temporal baseline. (An
-  earlier `__builtin_nontemporal_load` version did **not** lower to `ldnp` and read
-  ~80 — the inline-asm rewrite is what fixed it.)
+- **`ld-nt-uop` (`nt-stream-read`)** — *"load uops that executed with non-temporal
+  hint."* Explicit `ldnp` pair loads carry the hint, so it separates ~340,000x
+  against the temporal baseline. (An earlier `__builtin_nontemporal_load` version
+  did **not** lower to `ldnp` and read ~80 — the inline-asm rewrite is what fixed
+  it.) Its store-side twin `st-nt-uop` does **not** behave the same way — see below.
 - **`inst-barrier` (`barrier-loop`)** — *"retired **data** barrier instructions."*
   `dmb ish` is a data barrier, so the count lands exactly on the 20,000,000 loop
   trips, infinitely separated from the barrier-free baseline.
