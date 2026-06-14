@@ -289,15 +289,15 @@ The registry now covers the full 63-counter target list from the original resear
 | `dtlb-miss` | stable | first-level data TLB misses | `page-stride-read` | `hot-seq-read` | page-granular data access |
 | `itlb-miss` | stable | instruction TLB misses | `random-instruction-pages` | `hot-instruction-loop` | generated executable stubs |
 | `l2-tlb-miss` | stable | second-level data TLB misses | `page-stride-read` | `hot-seq-read` | a TLB event (`L2_TLB_MISS_DATA`), not a generic L2 cache miss |
-| `l1i-cache-miss` | experimental | L1I demand misses | `random-instruction-pages` | `hot-instruction-loop` | more code-shape sensitive |
-| `l1-load-miss-nonspec` | experimental | nonspec load misses | `random-pointer-chase` | `hot-seq-read` | semantics are more implementation-specific |
-| `l1-store-miss-nonspec` | experimental | nonspec store misses | `random-page-write` | `hot-seq-write` | write-allocate effects can complicate reading |
-| `inst-all` | experimental | aggregate retired instructions | `dense-integer-alu` | `random-pointer-chase` | PMU-event view of overall retired instructions |
+| `l1i-cache-miss` | stable | L1I demand misses | `random-instruction-pages` | `hot-instruction-loop` | more code-shape sensitive |
+| `l1-load-miss-nonspec` | stable | nonspec load misses | `random-pointer-chase` | `hot-seq-read` | semantics are more implementation-specific |
+| `l1-store-miss-nonspec` | stable | nonspec store misses | `random-page-write` | `hot-seq-write` | write-allocate effects can complicate reading |
+| `inst-all` | stable | aggregate retired instructions | `dense-integer-alu` | `random-pointer-chase` | PMU-event view of overall retired instructions |
 | `core-active-cycle` | experimental | cycles where the core stayed actively busy | `dispatch-int-alu` | `random-pointer-chase` | dense compute versus latency-stalled pointer chasing |
 | `interrupt-pending` | experimental | pending-interrupt pressure on the measured core | `interrupt-storm` | `dense-integer-alu` | counts only masked-pending cycles; EL0 can't mask interrupts, so it stays at noise — the demo's real signal is cycles |
-| `inst-int-alu` | experimental | retired integer ALU instructions | `dense-integer-alu` | `hot-seq-read` | pure compute versus memory-heavy access |
-| `retire-uop` | experimental | retired micro-ops | `dispatch-int-alu` | `random-pointer-chase` | lower-level counterpart to instruction retirement |
-| `map-uop` | experimental | mapped micro-ops | `dispatch-int-alu` | `random-pointer-chase` | broad frontend-to-backend uop flow |
+| `inst-int-alu` | stable | retired integer ALU instructions | `dense-integer-alu` | `hot-seq-read` | pure compute versus memory-heavy access |
+| `retire-uop` | stable | retired micro-ops | `dispatch-int-alu` | `random-pointer-chase` | lower-level counterpart to instruction retirement |
+| `map-uop` | stable | mapped micro-ops | `dispatch-int-alu` | `random-pointer-chase` | broad frontend-to-backend uop flow |
 | `map-int-uop` | stable | mapped integer-class uops | `dispatch-int-alu` | `dispatch-simd-alu` | scalar integer mapping versus SIMD mapping |
 | `inst-simd-alu` | stable | retired SIMD arithmetic instructions | `simd-vector-alu` | `dense-integer-alu` | vector-compute counterpart to scalar integer ALU |
 | `map-simd-uop` | stable | mapped SIMD-class uops | `dispatch-simd-alu` | `dispatch-int-alu` | SIMD mapping versus scalar integer mapping |
@@ -310,37 +310,37 @@ The registry now covers the full 63-counter target list from the original resear
 | `inst-int-st` | stable | retired integer store instructions | `random-page-write` | `dense-integer-alu` | clearest store-side trigger in the current lab |
 | `st-nt-uop` | experimental | non-temporal store uops | `nt-stream-write` | `hot-seq-write` | counts ~all scalar store uops on M4 (≈ `inst-int-st`), so it does not isolate the NT store path — unlike the `ldnp`-specific `ld-nt-uop` |
 | `st-memory-order-violation` | experimental | non-speculative store/load ordering violations | `store-order-alias` | `store-order-friendly` | unpredictable aliasing costs ~1.6x cycles, but this architectural-violation event stays at zero on M4 — watch cycles |
-| `inst-ldst` | experimental | retired load/store instructions | `random-pointer-chase` | `dense-integer-alu` | broad memory-instruction mix signal |
+| `inst-ldst` | stable | retired load/store instructions | `random-pointer-chase` | `dense-integer-alu` | broad memory-instruction mix signal |
 | `map-ldst-uop` | stable | mapped load/store uops | `dispatch-memory-stream` | `dispatch-int-alu` | separates memory-stream mapping from scalar compute |
-| `ld-unit-uop` | experimental | load-unit micro-ops | `random-pointer-chase` | `dense-integer-alu` | often tracks load pressure more directly than retired instructions |
-| `st-unit-uop` | experimental | store-unit micro-ops | `random-page-write` | `dense-integer-alu` | store pressure teaching counter |
-| `l1d-writeback` | experimental | L1D writebacks | `random-page-write` | `hot-seq-write` | useful for dirty-line eviction behavior |
+| `ld-unit-uop` | stable | load-unit micro-ops | `random-pointer-chase` | `dense-integer-alu` | often tracks load pressure more directly than retired instructions |
+| `st-unit-uop` | stable | store-unit micro-ops | `random-page-write` | `dense-integer-alu` | store pressure teaching counter |
+| `l1d-writeback` | stable | L1D writebacks | `random-page-write` | `hot-seq-write` | useful for dirty-line eviction behavior |
 | `inst-barrier` | stable | retired barrier instructions | `barrier-loop` | `dense-integer-alu` | ordering-heavy versus straight compute |
 | `dtlb-access` | experimental | DTLB accesses | `page-stride-read` | `hot-seq-read` | shows translation activity before misses alone |
-| `dtlb-fill` | experimental | DTLB fills | `page-stride-read` | `hot-seq-read` | emphasizes refills of translation entries |
+| `dtlb-fill` | stable | DTLB fills | `page-stride-read` | `hot-seq-read` | emphasizes refills of translation entries |
 | `mmu-table-walk-data` | stable | data-side page table walks | `page-stride-read` | `hot-seq-read` | clearest real table-walk trigger in the lab |
 | `mmu-virtual-memory-fault` | experimental | data-side virtual-memory faults | `first-touch-fault` | `hot-seq-read` | stays at zero on M4 (demand faults don't register); the demo's real signals are `dtlb-miss` and `mmu-table-walk-data` |
-| `dtlb-miss-nonspec` | experimental | nonspec DTLB misses | `page-stride-read` | `hot-seq-read` | alternate view of the same sparse-page translation story |
+| `dtlb-miss-nonspec` | stable | nonspec DTLB misses | `page-stride-read` | `hot-seq-read` | alternate view of the same sparse-page translation story |
 | `branch-cond-miss` | stable | conditional branch mispredicts | `unpredictable-branch` | `predictable-branch` | branch-miss story limited to conditional branches |
-| `map-rewind` | experimental | mapper rewind events | `unpredictable-branch` | `predictable-branch` | intended to show speculative work getting thrown away |
+| `map-rewind` | stable | mapper rewind events | `unpredictable-branch` | `predictable-branch` | intended to show speculative work getting thrown away |
 | `inst-branch-cond` | experimental | retired conditional branches | `unpredictable-branch` | `dense-integer-alu` | branch-heavy versus mostly straight-line code |
 | `inst-branch-taken` | experimental | retired taken branches | `predictable-branch` | `dense-integer-alu` | biased-taken branch pattern is the clean high case |
-| `inst-branch-call` | experimental | retired call branches | `hot-instruction-loop` | `dense-integer-alu` | direct way to expose repeated stub calls |
-| `inst-branch-ret` | experimental | retired return branches | `hot-instruction-loop` | `dense-integer-alu` | pairs naturally with the same stub-call loop |
-| `inst-branch-indir` | experimental | retired indirect branches | `hot-instruction-loop` | `dense-integer-alu` | function-pointer call is the teaching case |
-| `branch-call-indir-miss` | experimental | indirect-call mispredicts | `random-instruction-pages` | `hot-instruction-loop` | changing function-pointer targets versus one stable target |
-| `branch-indir-miss` | experimental | indirect-branch mispredicts | `random-instruction-pages` | `hot-instruction-loop` | general indirect-target churn showcase |
+| `inst-branch-call` | stable | retired call branches | `hot-instruction-loop` | `dense-integer-alu` | direct way to expose repeated stub calls |
+| `inst-branch-ret` | stable | retired return branches | `hot-instruction-loop` | `dense-integer-alu` | pairs naturally with the same stub-call loop |
+| `inst-branch-indir` | stable | retired indirect branches | `hot-instruction-loop` | `dense-integer-alu` | function-pointer call is the teaching case |
+| `branch-call-indir-miss` | stable | indirect-call mispredicts | `random-instruction-pages` | `hot-instruction-loop` | changing function-pointer targets versus one stable target |
+| `branch-indir-miss` | stable | indirect-branch mispredicts | `random-instruction-pages` | `hot-instruction-loop` | general indirect-target churn showcase |
 | `branch-ret-indir-miss` | experimental | return-side indirect-branch mispredicts | `random-instruction-pages` | `hot-instruction-loop` | best available return-target stress case in the lab |
 | `fetch-restart` | stable | frontend fetch restart events | `frontend-random-restart` | `frontend-hot-restart` | code-page churn versus one hot stub |
 | `flush-restart-other` | stable | non-branch frontend flush/restart events | `frontend-self-modifying-restart` | `frontend-hot-restart` | explicit code rewriting plus I-cache invalidation is a better probe than plain code-page churn |
-| `map-dispatch-bubble` | experimental | mapper/dispatch bubbles | `frontend-random-restart` | `frontend-hot-restart` | hot versus randomized code-page locality |
-| `map-dispatch-bubble-ic` | experimental | instruction-cache-driven dispatch bubbles | `random-instruction-pages` | `hot-instruction-loop` | explicit code-cache churn teaching case |
-| `map-dispatch-bubble-itlb` | experimental | instruction-TLB-driven dispatch bubbles | `random-instruction-pages` | `hot-instruction-loop` | explicit ITLB-churn teaching case |
-| `map-stall` | experimental | mapper stall events | `frontend-random-restart` | `frontend-hot-restart` | frontend-locality contrast for mapper stalls |
-| `map-stall-dispatch` | experimental | dispatch-facing mapper stalls | `frontend-random-restart` | `frontend-hot-restart` | same hot-versus-randomized frontend pair |
-| `l1i-tlb-fill` | experimental | instruction-side TLB fills | `random-instruction-pages` | `hot-instruction-loop` | code-page churn refill signal |
-| `l2-tlb-miss-instruction` | experimental | second-level instruction TLB misses | `random-instruction-pages` | `hot-instruction-loop` | instruction-side analogue of the data TLB story |
-| `mmu-table-walk-instruction` | experimental | instruction-side page walks | `random-instruction-pages` | `hot-instruction-loop` | frontend page-walk teaching counter |
+| `map-dispatch-bubble` | stable | mapper/dispatch bubbles | `frontend-random-restart` | `frontend-hot-restart` | hot versus randomized code-page locality |
+| `map-dispatch-bubble-ic` | stable | instruction-cache-driven dispatch bubbles | `random-instruction-pages` | `hot-instruction-loop` | explicit code-cache churn teaching case |
+| `map-dispatch-bubble-itlb` | stable | instruction-TLB-driven dispatch bubbles | `random-instruction-pages` | `hot-instruction-loop` | explicit ITLB-churn teaching case |
+| `map-stall` | stable | mapper stall events | `frontend-random-restart` | `frontend-hot-restart` | frontend-locality contrast for mapper stalls |
+| `map-stall-dispatch` | stable | dispatch-facing mapper stalls | `frontend-random-restart` | `frontend-hot-restart` | same hot-versus-randomized frontend pair |
+| `l1i-tlb-fill` | stable | instruction-side TLB fills | `random-instruction-pages` | `hot-instruction-loop` | code-page churn refill signal |
+| `l2-tlb-miss-instruction` | stable | second-level instruction TLB misses | `random-instruction-pages` | `hot-instruction-loop` | instruction-side analogue of the data TLB story |
+| `mmu-table-walk-instruction` | stable | instruction-side page walks | `random-instruction-pages` | `hot-instruction-loop` | frontend page-walk teaching counter |
 | `ldst-x64-uop` | stable | 64-byte split load/store uops | `cross-x64-load` | `aligned-x64-load` | teaches 64B split accesses directly |
 | `ldst-xpg-uop` | stable | cross-page load/store uops | `cross-page-load` | `aligned-page-load` | teaches page-spanning accesses directly |
 
