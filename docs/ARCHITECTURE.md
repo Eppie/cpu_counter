@@ -30,9 +30,12 @@ The header is organized in three layers.
   runner uses it.
 
 Counters are `perf::Counter` values combined with `operator|` into a
-`CounterSet`. Public constants (`CYCLES`, `L1_LOAD_MISS`, …) and curated bundles
-(`CACHE_PROFILE`, `BRANCH_PROFILE`, `FRONTEND_PROFILE`, `EXECUTION_PROFILE`)
-build those sets at compile time.
+`perf::CounterSet`. Public constants (`CYCLES`, `L1_LOAD_MISS`, …) and curated
+bundles (`CACHE_PROFILE`, `BRANCH_PROFILE`, `FRONTEND_PROFILE`,
+`EXECUTION_PROFILE`) build those sets at compile time. The global re-exports are
+Perf-prefixed to avoid dropping short names into the user's namespace, so outside
+`perf::` these types are named `PerfCounter` and `PerfCounterSet` (the constants
+stay unprefixed).
 
 ### 2. Thread state and priming
 
