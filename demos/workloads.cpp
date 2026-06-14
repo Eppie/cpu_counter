@@ -470,6 +470,36 @@ namespace workloads {
   return g_sink;
 }
 
+// A long straight-line integer body with no conditionals: the only branch is
+// the loop back-edge, so it retires tens of millions of instructions for ~1
+// conditional/taken branch per iteration. This is the low-branch baseline that
+// gives inst-branch-cond / inst-branch-taken a clean contrast (every other loop
+// in the lab branches once per element, leaving no near-branchless reference).
+[[gnu::noinline]] std::uint64_t BranchlessArithmetic(DemoEnvironment &) {
+  std::uint64_t a = 0x12345678ULL;
+  std::uint64_t b = 0x9abcdef0ULL;
+  std::uint64_t c = 0x55aa55aaULL;
+  std::uint64_t d = 0xf0f0f0f0ULL;
+  constexpr std::size_t kIters = 1'000'000;
+  for (std::size_t i = 0; i < kIters; ++i) {
+    const std::uint64_t x = static_cast<std::uint64_t>(i);
+    a += (b ^ x) + 0x9e3779b97f4a7c15ULL;
+    b = (b << 7) | (b >> 57);
+    c ^= a + d;
+    d += (c << 3) ^ b;
+    a ^= c + (d >> 2);
+    b -= a ^ 0x0123456789abcdefULL;
+    c += (b << 5) | (b >> 59);
+    d ^= a + c * 3ULL;
+    a += (d ^ b) + x;
+    b ^= (c << 11) | (c >> 53);
+    c -= a + 0x9e3779b9ULL;
+    d += (b ^ a) * 5ULL;
+  }
+  g_sink ^= (a + b + c + d);
+  return a + b + c + d;
+}
+
 [[gnu::noinline]] std::uint64_t HotSequentialRead(DemoEnvironment &state) {
   volatile const std::uint32_t *ring = state.hot_ring.data();
   std::uint32_t index = 0;

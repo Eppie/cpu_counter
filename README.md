@@ -323,8 +323,8 @@ The registry now covers the full 63-counter target list from the original resear
 | `dtlb-miss-nonspec` | stable | nonspec DTLB misses | `page-stride-read` | `hot-seq-read` | alternate view of the same sparse-page translation story |
 | `branch-cond-miss` | stable | conditional branch mispredicts | `unpredictable-branch` | `predictable-branch` | branch-miss story limited to conditional branches |
 | `map-rewind` | stable | mapper rewind events | `unpredictable-branch` | `predictable-branch` | intended to show speculative work getting thrown away |
-| `inst-branch-cond` | experimental | retired conditional branches | `unpredictable-branch` | `dense-integer-alu` | branch-heavy versus mostly straight-line code |
-| `inst-branch-taken` | experimental | retired taken branches | `predictable-branch` | `dense-integer-alu` | biased-taken branch pattern is the clean high case |
+| `inst-branch-cond` | stable | retired conditional branches | `unpredictable-branch` | `dense-integer-alu` | branch-heavy versus mostly straight-line code |
+| `inst-branch-taken` | stable | retired taken branches | `predictable-branch` | `dense-integer-alu` | biased-taken branch pattern is the clean high case |
 | `inst-branch-call` | stable | retired call branches | `hot-instruction-loop` | `dense-integer-alu` | direct way to expose repeated stub calls |
 | `inst-branch-ret` | stable | retired return branches | `hot-instruction-loop` | `dense-integer-alu` | pairs naturally with the same stub-call loop |
 | `inst-branch-indir` | stable | retired indirect branches | `hot-instruction-loop` | `dense-integer-alu` | function-pointer call is the teaching case |

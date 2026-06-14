@@ -170,6 +170,7 @@ const CounterDefinition *FindCounter(std::string_view name);
 namespace workloads {
 
 std::uint64_t DenseIntegerAlu(DemoEnvironment &state);
+std::uint64_t BranchlessArithmetic(DemoEnvironment &state);
 std::uint64_t HotSequentialRead(DemoEnvironment &state);
 std::uint64_t ScalarStreamRead(DemoEnvironment &state);
 std::uint64_t SimdStreamRead(DemoEnvironment &state);

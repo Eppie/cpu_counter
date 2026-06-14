@@ -5,6 +5,12 @@
 namespace demo {
 namespace {
 
+const WorkloadExpectation kBranchlessArithExpectations[] = {
+    {"inst-branch-cond", "low", "The body has no conditionals; the only conditional branch is the loop back-edge, so this counter stays near one-per-iteration -- tens of times below any per-element branch loop."},
+    {"inst-branch-taken", "low", "Likewise the only taken branch is the loop back-edge, so taken-branch retirement stays very low for the instruction count."},
+    {"branches", "low", "Almost the entire instruction stream is straight-line arithmetic, so total retired branches stay low."},
+};
+
 const WorkloadExpectation kDenseAluExpectations[] = {
     {"cycles", "low", "The loop stays in registers and avoids long-latency miss penalties, so total cycle count stays comparatively low."},
     {"instructions", "approx", "The current clang build emits about 14 loop-body instructions per iteration, so 20,000,000 iterations predict about 280,000,000 retired instructions.", ExpectationKind::ApproximateValue, 280'000'000.0, 0.01},
@@ -246,6 +252,18 @@ const WorkloadExpectation kStoreOrderAliasExpectations[] = {
     {"cycles", "high", "Unpredictable store/load aliasing forces the load/store unit to stall and replay speculatively-issued loads, inflating cycles ~1.6x over the disjoint baseline even though the instruction stream is byte-for-byte identical."},
     {"st-memory-order-violation", "near-zero", "The squash-and-replay penalty is real (it shows up in cycles), but Apple's M4 P-cores leave this dedicated ordering-violation event at zero -- the cost is paid yet not surfaced by this PMC.", ExpectationKind::NearZero, 1'000.0, 0.0},
 };
+
+constexpr std::string_view kBranchlessArithConfig =
+    "1,000,000 iterations of a 12-statement straight-line integer body; the only branch is the loop back-edge.";
+constexpr std::string_view kBranchlessArithCode = R"cpp(
+for (std::size_t i = 0; i < 1'000'000; ++i) {   // the only branch in the kernel
+  a += (b ^ i) + 0x9e3779b97f4a7c15ULL;
+  b = (b << 7) | (b >> 57);
+  c ^= a + d;
+  d += (c << 3) ^ b;
+  // ... 8 more straight-line ops, no conditionals ...
+}
+)cpp";
 
 constexpr std::string_view kDenseAluConfig =
     "20,000,000 iterations over four 64-bit registers. No deliberate data working set.";
@@ -642,6 +660,22 @@ const WorkloadDefinition kWorkloads[] = {
             PerfCounter::Named("INST_INT_ALU"),
         std::span<const WorkloadExpectation>(kDenseAluExpectations),
         &workloads::DenseIntegerAlu,
+    },
+    {
+        "branchless-arith",
+        "Branchless Arithmetic",
+        "A long straight-line arithmetic loop whose only branch is the loop back-edge.",
+        "Use this as the near-branchless baseline: it retires tens of millions of instructions with about one conditional/taken branch per iteration, which is what gives the conditional- and taken-branch counters a clean low contrast.",
+        kBranchlessArithConfig,
+        kBranchlessArithCode,
+        Group::BranchControl,
+        Tier::Stable,
+        3,
+        1,
+        CYCLES | INSTRUCTIONS | BRANCHES | PerfCounter::Named("INST_BRANCH_COND") |
+            PerfCounter::Named("INST_BRANCH_TAKEN"),
+        std::span<const WorkloadExpectation>(kBranchlessArithExpectations),
+        &workloads::BranchlessArithmetic,
     },
     {
         "hot-seq-read",
@@ -1822,10 +1856,10 @@ const CounterDefinition kCounters[] = {
         "Retired conditional branch instructions.",
         "Branch-heavy loops are the obvious trigger; straight-line ALU code is the low case.",
         Group::BranchControl,
-        Tier::Experimental,
+        Tier::Stable,
         PerfCounter::Named("INST_BRANCH_COND"),
         "unpredictable-branch",
-        "dense-integer-alu",
+        "branchless-arith",
         {2.0, 100},
     },
     {
@@ -1834,10 +1868,10 @@ const CounterDefinition kCounters[] = {
         "Retired taken branches.",
         "The biased branch workload is almost always taken, making it a good high case.",
         Group::BranchControl,
-        Tier::Experimental,
+        Tier::Stable,
         PerfCounter::Named("INST_BRANCH_TAKEN"),
         "predictable-branch",
-        "dense-integer-alu",
+        "branchless-arith",
         {2.0, 100},
     },
     {
